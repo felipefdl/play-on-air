@@ -168,11 +168,11 @@ impl Bridge {
     let Some(mut active) = removed else {
       return;
     };
-    if let Err(err) = active.cast.stop_active() {
-      tracing::warn!(%device_id, error = %err, "Cast STOP on session end failed");
-    }
+    // Always stop LiveWav HTTP first so underrun ends even if Cast STOP hangs.
     active.media.shutdown();
-    tracing::info!(%device_id, "bridge session ended (Cast STOP + media dropped)");
+    // Best-effort Cast STOP with timeout; never block the AirPlay lifecycle path.
+    active.cast.stop_active_best_effort(Duration::from_secs(2));
+    tracing::info!(%device_id, "bridge session ended (media dropped; Cast STOP best-effort)");
   }
 
   fn handle_volume(&self, device_id: &str, volume_db: f32) {

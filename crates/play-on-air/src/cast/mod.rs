@@ -369,6 +369,7 @@ impl CastController {
     let cmd = self.prepare_pause(session);
     let _wire = cmd.to_media_message_body(0);
     self.with_device(|device| {
+      connect_media_transport(device, transport_id)?;
       drop(
         device
           .media
@@ -385,6 +386,7 @@ impl CastController {
     let cmd = self.prepare_play(session);
     let _wire = cmd.to_media_message_body(0);
     self.with_device(|device| {
+      connect_media_transport(device, transport_id)?;
       drop(
         device
           .media
@@ -401,6 +403,7 @@ impl CastController {
     let cmd = self.prepare_stop(session);
     let _wire = cmd.to_media_message_body(0);
     self.with_device(|device| {
+      connect_media_transport(device, transport_id)?;
       drop(
         device
           .media
@@ -413,12 +416,54 @@ impl CastController {
 
   /// Stop the active session (if any) and clear it.
   pub fn stop_active(&mut self) -> Result<()> {
-    let Some(session) = self.active.clone() else {
+    let Some(session) = self.active.take() else {
       return Ok(());
     };
-    let result = self.stop(&session.transport_id, session.media_session_id);
-    self.active = None;
-    result
+    self.stop(&session.transport_id, session.media_session_id)
+  }
+
+  /// Best-effort stop of the active session with a wall-clock timeout.
+  ///
+  /// Clears `active` immediately so callers never re-use a stale session. Network
+  /// STOP runs on a worker thread so a blocked `rust_cast` receive cannot hang
+  /// the bridge (media HTTP is shut down independently by the bridge).
+  pub fn stop_active_best_effort(&mut self, timeout: std::time::Duration) {
+    let Some(session) = self.active.take() else {
+      return;
+    };
+    let host = self.host.clone();
+    let port = self.port;
+    let transport_id = session.transport_id.clone();
+    let media_session_id = session.media_session_id;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      let mut ctl = Self::new(host, port);
+      let result = ctl.stop(&transport_id, media_session_id);
+      drop(tx.send(result));
+    });
+
+    match rx.recv_timeout(timeout) {
+      Ok(Ok(())) => {
+        tracing::debug!(%session.transport_id, media_session_id, "Cast STOP ok");
+      },
+      Ok(Err(err)) => {
+        tracing::warn!(error = %err, "Cast STOP failed");
+      },
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        tracing::warn!(
+          %session.transport_id,
+          media_session_id,
+          timeout_ms = timeout.as_millis(),
+          "Cast STOP timed out; abandoning worker"
+        );
+        // Detach worker; do not join (it may still be blocked in rust_cast).
+        drop(worker);
+      },
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        tracing::warn!("Cast STOP worker disconnected before reply");
+      },
+    }
   }
 
   /// Pause the active session when present.
@@ -446,6 +491,29 @@ impl CastController {
       .map_err(|err| Error::Cast(format!("connect {}:{}: {err}", self.host, self.port)))?;
     f(&device)
   }
+}
+
+/// Destinations that must be CONNECT'd before media play/pause/stop on a fresh TCP session.
+///
+/// Order matches `connect_and_load`: platform receiver first, then the app transport.
+pub const fn media_command_connect_destinations(transport_id: &str) -> [&str; 2] {
+  ["receiver-0", transport_id]
+}
+
+/// CONNECT `receiver-0` and `transport_id` so media-channel commands get replies.
+fn connect_media_transport(device: &rust_cast::CastDevice<'_>, transport_id: &str) -> Result<()> {
+  for dest in media_command_connect_destinations(transport_id) {
+    device
+      .connection
+      .connect(dest)
+      .map_err(|err| Error::Cast(format!("connection channel to {dest}: {err}")))?;
+  }
+  // Keep-alive after CONNECT so some receivers stay ready for media commands.
+  device
+    .heartbeat
+    .ping()
+    .map_err(|err| Error::Cast(format!("heartbeat after media transport connect: {err}")))?;
+  Ok(())
 }
 
 #[cfg(test)]
@@ -575,5 +643,21 @@ mod tests {
   fn stop_active_without_session_is_ok() {
     let mut ctl = CastController::new("127.0.0.1", 8009);
     ctl.stop_active().expect("noop");
+  }
+
+  #[test]
+  fn media_command_connect_destinations_order() {
+    let dests = media_command_connect_destinations("web-1");
+    assert_eq!(dests[0], "receiver-0");
+    assert_eq!(dests[1], "web-1");
+  }
+
+  #[test]
+  fn stop_active_best_effort_clears_session_without_device() {
+    let mut ctl = CastController::new("127.0.0.1", 9);
+    // Inject a fake active session; stop will fail to connect (port 9 closed) but must clear.
+    ctl.active = Some(MediaSessionRef::new("transport-x", 7));
+    ctl.stop_active_best_effort(std::time::Duration::from_millis(500));
+    assert!(ctl.active_session().is_none());
   }
 }
