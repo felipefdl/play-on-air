@@ -72,6 +72,25 @@ const fn is_advertiseable_v4(ip: Ipv4Addr) -> bool {
   !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() && !ip.is_broadcast()
 }
 
+/// Resolve `hostname` (often `uuid.local`) to an IPv4 string, if possible.
+pub fn resolve_host_ipv4(hostname: &str) -> Option<String> {
+  use std::net::ToSocketAddrs;
+  let host = hostname.trim().trim_end_matches('.');
+  if host.is_empty() {
+    return None;
+  }
+  if let Ok(v4) = host.parse::<Ipv4Addr>() {
+    return Some(v4.to_string());
+  }
+  let addrs = (host, 0_u16).to_socket_addrs().ok()?;
+  for addr in addrs {
+    if let IpAddr::V4(v4) = addr.ip() {
+      return Some(v4.to_string());
+    }
+  }
+  None
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

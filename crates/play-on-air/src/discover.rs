@@ -5,7 +5,6 @@
 //! works for AirPlay ads; discovery alone uses the CLI that matches the OS.
 
 use std::io::{BufRead, BufReader};
-use std::net::ToSocketAddrs;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -288,12 +287,14 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
     .cloned()
     .filter(|s| !s.is_empty())
     .unwrap_or_else(|| instance.replace('-', " "));
-  let host = resolve_cast_host(&info.hostname);
+  let hostname = info.hostname.trim_end_matches('.').to_owned();
+  let host = resolve_cast_host(&hostname);
   let port = if info.port == 0 { 8009 } else { info.port };
   Device {
     id,
     name,
     host,
+    hostname,
     port,
     last_seen: Instant::now(),
   }
@@ -358,29 +359,15 @@ fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
 }
 
 /// Prefer a resolved IPv4 address; fall back to hostname for Cast control.
-fn resolve_cast_host(hostname: &str) -> String {
-  let host = hostname.trim_end_matches('.');
-  if host.is_empty() {
-    return "127.0.0.1".to_owned();
-  }
-  if let Ok(addrs) = (host, 0_u16).to_socket_addrs() {
-    let mut ipv4 = None;
-    let mut any = None;
-    for addr in addrs {
-      if addr.is_ipv4() && ipv4.is_none() {
-        ipv4 = Some(addr.ip().to_string());
-      } else if any.is_none() {
-        any = Some(addr.ip().to_string());
-      }
+pub fn resolve_cast_host(hostname: &str) -> String {
+  crate::net::resolve_host_ipv4(hostname).unwrap_or_else(|| {
+    let host = hostname.trim_end_matches('.');
+    if host.is_empty() {
+      "127.0.0.1".to_owned()
+    } else {
+      host.to_owned()
     }
-    if let Some(v4) = ipv4 {
-      return v4;
-    }
-    if let Some(ip) = any {
-      return ip;
-    }
-  }
-  host.to_owned()
+  })
 }
 
 #[cfg(test)]

@@ -159,7 +159,7 @@ impl Bridge {
       sample_rate: stream_rate,
     });
 
-    let mut cast = CastController::new(device.host.clone(), device.port);
+    let mut cast = CastController::new(device.host.clone(), device.port).with_hostname(device.hostname.clone());
     // BUFFERED progressive file works on Nest/Home; LIVE often sits silent.
     let request = MediaLoadRequest::wav(stream_url.clone(), CastStreamKind::Buffered).with_title(device.name.clone());
 
@@ -312,6 +312,7 @@ mod tests {
       id: "dev-1".to_owned(),
       name: "Test".to_owned(),
       host: "127.0.0.1".to_owned(),
+      hostname: "test.local".to_owned(),
       port: 9,
       last_seen: Instant::now(),
     });

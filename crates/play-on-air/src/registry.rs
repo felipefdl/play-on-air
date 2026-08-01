@@ -12,8 +12,10 @@ pub struct Device {
   pub id: String,
   /// Advertised friendly name.
   pub name: String,
-  /// Resolved host or IP for Cast control.
+  /// Preferred IPv4 (or host string) for Cast control.
   pub host: String,
+  /// mDNS hostname (e.g. `uuid.local`) for re-resolution before connect.
+  pub hostname: String,
   /// Cast port (usually 8009).
   pub port: u16,
   /// Last time this device was seen via mDNS.
@@ -114,6 +116,7 @@ mod tests {
       id: id.to_owned(),
       name: name.to_owned(),
       host: "192.168.1.10".to_owned(),
+      hostname: "speaker.local".to_owned(),
       port: 8009,
       last_seen: Instant::now(),
     }

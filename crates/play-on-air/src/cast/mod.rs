@@ -215,6 +215,8 @@ pub fn media_session_id_from_status(status: &Status) -> Result<i32> {
 pub struct CastController {
   /// Device host or IP.
   pub host: String,
+  /// Optional mDNS hostname for re-resolution on connect retry.
+  pub hostname: Option<String>,
   /// Cast port (typically 8009).
   pub port: u16,
   /// Last built load request (for introspection / tests).
@@ -234,12 +236,35 @@ impl CastController {
   pub fn new(host: impl Into<String>, port: u16) -> Self {
     Self {
       host: host.into(),
+      hostname: None,
       port,
       last_load: None,
       last_volume: None,
       last_transport: None,
       active: None,
       heartbeat_stop: None,
+    }
+  }
+
+  /// Attach an mDNS hostname used to refresh `host` before connect retries.
+  pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+    let h = hostname.into();
+    if !h.is_empty() {
+      self.hostname = Some(h);
+    }
+    self
+  }
+
+  /// Refresh `host` from `hostname` when resolution yields an IPv4 address.
+  pub fn refresh_host(&mut self) {
+    let Some(hn) = self.hostname.as_ref() else {
+      return;
+    };
+    if let Some(ip) = crate::net::resolve_host_ipv4(hn)
+      && ip != self.host
+    {
+      tracing::info!(old = %self.host, new = %ip, hostname = %hn, "refreshed Cast host IP");
+      self.host = ip;
     }
   }
 
@@ -307,11 +332,12 @@ impl CastController {
   /// Connect to the device, launch default media receiver, load media, and store the session.
   ///
   /// Returns the active session (transport id + media session id) needed for play/pause/stop.
+  ///
+  /// Retries on transient network errors (Nest sleep / intermittent "No route to host").
   pub fn connect_and_load(&mut self, request: MediaLoadRequest) -> Result<ActiveCastSession> {
     let media = self.prepare_load(request);
-    let host = self.host.clone();
     let port = self.port;
-    let session = self.with_device(|device| {
+    let session = self.with_device_retry(|device| {
       device
         .connection
         .connect("receiver-0")
@@ -343,7 +369,7 @@ impl CastController {
 
     self.active = Some(session.clone());
     tracing::info!(
-      host = %host,
+      host = %self.host,
       port,
       transport_id = %session.transport_id,
       media_session_id = session.media_session_id,
@@ -569,6 +595,52 @@ impl CastController {
       .map_err(|err| Error::Cast(format!("connect {}:{}: {err}", self.host, self.port)))?;
     f(&device)
   }
+
+  /// Like [`Self::with_device`], but refreshes DNS and retries transient link errors.
+  fn with_device_retry<F, T>(&mut self, mut f: F) -> Result<T>
+  where
+    F: FnMut(&rust_cast::CastDevice<'_>) -> Result<T>,
+  {
+    const ATTEMPTS: u32 = 5;
+    let mut last_err: Option<Error> = None;
+    for attempt in 1..=ATTEMPTS {
+      self.refresh_host();
+      match self.with_device(&mut f) {
+        Ok(v) => return Ok(v),
+        Err(err) => {
+          let retriable = is_retriable_cast_error(&err);
+          tracing::warn!(
+            attempt,
+            max = ATTEMPTS,
+            host = %self.host,
+            retriable,
+            error = %err,
+            "Cast connect attempt failed"
+          );
+          last_err = Some(err);
+          if !retriable || attempt == ATTEMPTS {
+            break;
+          }
+          std::thread::sleep(std::time::Duration::from_millis(300 * u64::from(attempt)));
+        },
+      }
+    }
+    Err(last_err.unwrap_or_else(|| Error::Cast("Cast connect failed with no error detail".to_owned())))
+  }
+}
+
+/// True when a Cast error is worth retrying (Wi‑Fi / Nest sleep / transient route).
+fn is_retriable_cast_error(err: &Error) -> bool {
+  let msg = err.to_string().to_ascii_lowercase();
+  msg.contains("no route to host")
+    || msg.contains("host is down")
+    || msg.contains("network is unreachable")
+    || msg.contains("timed out")
+    || msg.contains("timeout")
+    || msg.contains("connection refused")
+    || msg.contains("connection reset")
+    || msg.contains("broken pipe")
+    || msg.contains("temporarily unavailable")
 }
 
 /// Destinations that must be CONNECT'd before media play/pause/stop on a fresh TCP session.
@@ -833,5 +905,13 @@ mod tests {
     ctl.set_active_for_test(MediaSessionRef::new("transport-x", 7));
     ctl.stop_active_best_effort(std::time::Duration::from_millis(500));
     assert!(ctl.active_session().is_none());
+  }
+
+  #[test]
+  fn retriable_cast_error_detects_no_route() {
+    let err = Error::Cast("connect 192.168.1.171:8009: No route to host (os error 65)".to_owned());
+    assert!(is_retriable_cast_error(&err));
+    let hard = Error::Cast("media load: Invalid request".to_owned());
+    assert!(!is_retriable_cast_error(&hard));
   }
 }
