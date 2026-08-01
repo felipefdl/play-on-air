@@ -37,7 +37,7 @@ struct ActiveSession {
 /// then timed best-effort Cast STOP. Media must not wait on STOP success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEndStep {
-  /// Shut down the local LiveWav HTTP server (stop underrun immediately).
+  /// Shut down the local `LiveWav` HTTP server (stop underrun immediately).
   MediaShutdown,
   /// Best-effort Cast STOP with timeout (may fail or time out).
   CastStopBestEffort,
@@ -204,12 +204,12 @@ impl Bridge {
 /// Run shipped teardown order for one active session.
 fn end_active_session(active: ActiveSession) {
   let ActiveSession { media, mut cast } = active;
-  let mut media = Some(media);
+  let mut media_handle = Some(media);
   for step in session_end_steps() {
     match step {
       SessionEndStep::MediaShutdown => {
         // Always stop LiveWav HTTP first so underrun ends even if Cast STOP hangs.
-        if let Some(handle) = media.take() {
+        if let Some(handle) = media_handle.take() {
           handle.shutdown();
         }
       },
