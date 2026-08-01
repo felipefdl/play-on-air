@@ -1,13 +1,15 @@
 //! Session bridge: AirPlay PCM → continuous lossless WAV HTTP → Cast LIVE load.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use crate::airplay::AirPlaySessionEvent;
+use crate::airplay::{AirPlaySessionEvent, airplay_db_to_cast_linear};
 use crate::audio::{PcmRing, encode_pcm_i16_to_flac};
 use crate::cast::{CastController, CastStreamKind, MediaLoadRequest};
 use crate::error::{Error, Result};
@@ -23,12 +25,25 @@ const PREBUFFER_POLL: Duration = Duration::from_millis(20);
 /// Frames copied for the FLAC quality-path snapshot at session start.
 const SNAPSHOT_FRAMES: usize = 2048;
 
-/// Orchestrates media HTTP + Cast load when an AirPlay session starts.
-#[derive(Debug)]
+/// One live bridge session for a device.
+struct ActiveSession {
+  media: MediaServerHandle,
+  cast: CastController,
+}
+
+/// Orchestrates media HTTP + Cast load for AirPlay lifecycle events.
 pub struct Bridge {
   registry: Arc<DeviceRegistry>,
-  /// Active media servers keyed by device id (held for lifetime of session).
-  media: parking_lot::Mutex<std::collections::HashMap<String, MediaServerHandle>>,
+  sessions: Mutex<HashMap<String, ActiveSession>>,
+}
+
+impl std::fmt::Debug for Bridge {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Bridge")
+      .field("registry", &self.registry)
+      .field("active_sessions", &self.sessions.lock().len())
+      .finish()
+  }
 }
 
 impl Bridge {
@@ -36,7 +51,7 @@ impl Bridge {
   pub fn new(registry: Arc<DeviceRegistry>) -> Self {
     Self {
       registry,
-      media: parking_lot::Mutex::new(std::collections::HashMap::new()),
+      sessions: Mutex::new(HashMap::new()),
     }
   }
 
@@ -47,30 +62,55 @@ impl Bridge {
     rings: Arc<dyn RingLookup>,
   ) {
     while let Some(event) = events.recv().await {
-      if let Err(err) = self.handle_session_start(&event, Arc::clone(&rings)).await {
-        tracing::error!(
-          device_id = %event.device_id,
-          error = %err,
-          "failed to start Cast bridge session"
-        );
+      match event {
+        AirPlaySessionEvent::Started { device_id, sample_rate, channels } => {
+          if let Err(err) = self
+            .handle_session_start(&device_id, sample_rate, channels, Arc::clone(&rings))
+            .await
+          {
+            tracing::error!(%device_id, error = %err, "failed to start Cast bridge session");
+          }
+        },
+        AirPlaySessionEvent::Ended { device_id } => {
+          self.handle_session_end(&device_id);
+        },
+        AirPlaySessionEvent::Volume { device_id, volume_db } => {
+          self.handle_volume(&device_id, volume_db);
+        },
       }
     }
   }
 
-  async fn handle_session_start(&self, event: &AirPlaySessionEvent, rings: Arc<dyn RingLookup>) -> Result<()> {
+  async fn handle_session_start(
+    &self,
+    device_id: &str,
+    sample_rate: u32,
+    channels: u16,
+    rings: Arc<dyn RingLookup>,
+  ) -> Result<()> {
+    // Tear down any previous session for this device first.
+    self.handle_session_end(device_id);
+
     let device = self
       .registry
-      .get(&event.device_id)
-      .ok_or_else(|| Error::Bridge(format!("unknown device {}", event.device_id)))?;
+      .get(device_id)
+      .ok_or_else(|| Error::Bridge(format!("unknown device {device_id}")))?;
 
     let ring = rings
-      .ring_for(&event.device_id)
-      .ok_or_else(|| Error::Bridge(format!("no PCM ring for {}", event.device_id)))?;
+      .ring_for(device_id)
+      .ok_or_else(|| Error::Bridge(format!("no PCM ring for {device_id}")))?;
 
-    let channels = event.channels.max(1);
-    let sample_rate = event.sample_rate.max(1);
+    // Prefer the ring's actual channel layout (rebuilt in `audio_init`).
+    let stream_channels = ring.channels().max(1).min(channels.max(1));
+    let stream_rate = sample_rate.max(1);
 
-    // 1. Prebuffer wait so Cast LIVE pull does not start on silence only.
+    if ring.channels() != stream_channels {
+      return Err(Error::Bridge(format!(
+        "channel mismatch: ring={} event={stream_channels}",
+        ring.channels()
+      )));
+    }
+
     for _ in 0..PREBUFFER_POLLS {
       if ring.available_frames() >= PREBUFFER_FRAMES {
         break;
@@ -82,48 +122,67 @@ impl Bridge {
       return Err(Error::Bridge("no PCM available at session start".to_owned()));
     }
 
-    // 2. Exercise FLAC quality path on a non-destructive prebuffer snapshot.
-    verify_flac_snapshot(&ring, channels, sample_rate);
+    verify_flac_snapshot(&ring, stream_channels, stream_rate);
 
-    // 3. Start media server with LAN-reachable advertise host.
     let host = advertise_host_ip();
     let media = MediaServer::start(&host).await?;
     let stream_url = media.stream_url();
 
-    // 4. Prefer continuous LiveWav (lossless) as the Cast LIVE path.
     media.set_content(MediaContent::LiveWav {
       ring: Arc::clone(&ring),
-      channels,
-      sample_rate,
+      channels: stream_channels,
+      sample_rate: stream_rate,
     });
 
-    {
-      let mut guard = self.media.lock();
-      // Drop any previous session media for this device.
-      drop(guard.insert(event.device_id.clone(), media));
-    }
-
-    // 5. Cast load LIVE WAV; media handle kept for session lifetime in `self.media`.
     let mut cast = CastController::new(device.host.clone(), device.port);
     let request = MediaLoadRequest::wav(stream_url, CastStreamKind::Live).with_title(device.name.clone());
 
     match cast.connect_and_load(request) {
-      Ok(()) => {
+      Ok(session) => {
         tracing::info!(
-          device_id = %event.device_id,
+          %device_id,
           cast = %device.host,
+          transport_id = %session.transport_id,
+          media_session_id = session.media_session_id,
           "bridge session Cast LIVE WAV load ok"
         );
+        {
+          let mut guard = self.sessions.lock();
+          drop(guard.insert(device_id.to_owned(), ActiveSession { media, cast }));
+        }
         Ok(())
       },
       Err(err) => {
-        tracing::warn!(
-          device_id = %event.device_id,
-          error = %err,
-          "Cast load failed (device may be offline)"
-        );
+        media.shutdown();
+        tracing::warn!(%device_id, error = %err, "Cast load failed (device may be offline)");
         Err(err)
       },
+    }
+  }
+
+  fn handle_session_end(&self, device_id: &str) {
+    let removed = {
+      let mut guard = self.sessions.lock();
+      guard.remove(device_id)
+    };
+    let Some(mut active) = removed else {
+      return;
+    };
+    if let Err(err) = active.cast.stop_active() {
+      tracing::warn!(%device_id, error = %err, "Cast STOP on session end failed");
+    }
+    active.media.shutdown();
+    tracing::info!(%device_id, "bridge session ended (Cast STOP + media dropped)");
+  }
+
+  fn handle_volume(&self, device_id: &str, volume_db: f32) {
+    let level = airplay_db_to_cast_linear(volume_db);
+    let result = {
+      let mut guard = self.sessions.lock();
+      guard.get_mut(device_id).map(|session| session.cast.set_volume(level))
+    };
+    if let Some(Err(err)) = result {
+      tracing::debug!(%device_id, error = %err, "Cast volume sync failed");
     }
   }
 }
@@ -147,8 +206,6 @@ fn verify_flac_snapshot(ring: &PcmRing, channels: u16, sample_rate: u32) {
 }
 
 /// Pop up to `max_frames` from `ring` and encode a finite FLAC body.
-///
-/// Unit-test helper and secondary static-FLAC path without network I/O.
 pub fn encode_session_snapshot_flac(
   ring: &PcmRing,
   channels: u16,

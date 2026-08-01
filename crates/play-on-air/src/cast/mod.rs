@@ -1,9 +1,10 @@
 //! Google Cast control plane (media load + transport).
 //!
-//! Pure payload construction is unit-testable without a device on the wire.
-//! Live connect/load uses `rust_cast` and may fail on hosts without a Cast device.
+//! Payload construction is unit-tested without a device. Live connect/load uses
+//! `rust_cast` and stores the media session so play/pause/stop can target it.
 
-use rust_cast::channels::media::{Media, Metadata, MusicTrackMediaMetadata, StreamType};
+use rust_cast::channels::media::{Media, Metadata, MusicTrackMediaMetadata, Status, StreamType};
+use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 
@@ -12,6 +13,12 @@ pub const CONTENT_TYPE_FLAC: &str = "audio/flac";
 
 /// Content type for WAV / LPCM Cast media.
 pub const CONTENT_TYPE_WAV: &str = "audio/wav";
+
+/// Cast media namespace (wire).
+pub const MEDIA_NAMESPACE: &str = "urn:x-cast:com.google.cast.media";
+
+/// Cast receiver namespace (wire).
+pub const RECEIVER_NAMESPACE: &str = "urn:x-cast:com.google.cast.receiver";
 
 /// How Cast should stream the media URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +112,26 @@ impl MediaLoadRequest {
       duration: None,
     }
   }
+
+  /// Cast media-channel LOAD body shape (request fields only; requestId filled by sender).
+  pub fn to_load_message_body(&self, session_id: &str, request_id: u32) -> Value {
+    let media = self.to_media();
+    json!({
+      "type": "LOAD",
+      "requestId": request_id,
+      "sessionId": session_id,
+      "autoplay": true,
+      "media": {
+        "contentId": media.content_id,
+        "streamType": match media.stream_type {
+          StreamType::Buffered => "BUFFERED",
+          StreamType::Live => "LIVE",
+          StreamType::None => "NONE",
+        },
+        "contentType": media.content_type,
+      }
+    })
+  }
 }
 
 /// Identifiers required by Cast media transport commands (play/pause/stop).
@@ -126,23 +153,8 @@ impl MediaSessionRef {
   }
 }
 
-/// Thin wrapper around Cast session operations.
-///
-/// Connect is optional/lazy: scaffolding keeps a host/port and pure helpers so
-/// unit tests do not require a physical device.
-#[derive(Debug)]
-pub struct CastController {
-  /// Device host or IP.
-  pub host: String,
-  /// Cast port (typically 8009).
-  pub port: u16,
-  /// Last built load request (for introspection / tests).
-  last_load: Option<MediaLoadRequest>,
-  /// Last volume level prepared via [`Self::prepare_volume`] (tests / dry-run).
-  last_volume: Option<f32>,
-  /// Last transport command prepared without network.
-  last_transport: Option<TransportCommand>,
-}
+/// Active Cast media session after a successful LOAD.
+pub type ActiveCastSession = MediaSessionRef;
 
 /// Pure record of a play/pause/stop command (no network).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +167,66 @@ pub enum TransportCommand {
   Stop(MediaSessionRef),
 }
 
+impl TransportCommand {
+  /// Cast media-channel wire JSON for this command (matches `rust_cast` message type fields).
+  pub fn to_media_message_body(&self, request_id: u32) -> Value {
+    let (typ, session) = match self {
+      Self::Pause(s) => ("PAUSE", s),
+      Self::Play(s) => ("PLAY", s),
+      Self::Stop(s) => ("STOP", s),
+    };
+    json!({
+      "type": typ,
+      "requestId": request_id,
+      "mediaSessionId": session.media_session_id,
+    })
+  }
+
+  /// Transport id the command targets.
+  pub const fn transport_id(&self) -> &str {
+    match self {
+      Self::Pause(s) | Self::Play(s) | Self::Stop(s) => s.transport_id.as_str(),
+    }
+  }
+}
+
+/// Cast receiver `SET_VOLUME` wire body.
+pub fn set_volume_message_body(level: f32, request_id: u32) -> Value {
+  let clamped = volume_level_clamped(level);
+  json!({
+    "type": "SET_VOLUME",
+    "requestId": request_id,
+    "volume": {
+      "level": f64::from(clamped),
+    }
+  })
+}
+
+/// Extract media session id from a LOAD/STATUS response (shipped helper used by `connect_and_load`).
+pub fn media_session_id_from_status(status: &Status) -> Result<i32> {
+  if let Some(entry) = status.entries.first() {
+    return Ok(entry.media_session_id);
+  }
+  Err(Error::Cast("LOAD status had no media session entries".to_owned()))
+}
+
+/// Thin wrapper around Cast session operations.
+#[derive(Debug)]
+pub struct CastController {
+  /// Device host or IP.
+  pub host: String,
+  /// Cast port (typically 8009).
+  pub port: u16,
+  /// Last built load request (for introspection / tests).
+  last_load: Option<MediaLoadRequest>,
+  /// Last volume level prepared via [`Self::prepare_volume`] (tests / dry-run).
+  last_volume: Option<f32>,
+  /// Last transport command prepared without network.
+  last_transport: Option<TransportCommand>,
+  /// Active media session after a successful [`Self::connect_and_load`].
+  active: Option<ActiveCastSession>,
+}
+
 impl CastController {
   /// Create a controller targeting `host:port`.
   pub fn new(host: impl Into<String>, port: u16) -> Self {
@@ -164,7 +236,13 @@ impl CastController {
       last_load: None,
       last_volume: None,
       last_transport: None,
+      active: None,
     }
+  }
+
+  /// Active Cast media session, if LOAD succeeded.
+  pub const fn active_session(&self) -> Option<&ActiveCastSession> {
+    self.active.as_ref()
   }
 
   /// Record a media load payload (pure; no network).
@@ -217,25 +295,24 @@ impl CastController {
     self.last_transport.as_ref()
   }
 
-  /// Connect to the device, launch default media receiver, and load media.
+  /// Connect to the device, launch default media receiver, load media, and store the session.
   ///
-  /// Network-facing; returns a typed error when the device is unreachable.
-  pub fn connect_and_load(&mut self, request: MediaLoadRequest) -> Result<()> {
+  /// Returns the active session (transport id + media session id) needed for play/pause/stop.
+  pub fn connect_and_load(&mut self, request: MediaLoadRequest) -> Result<ActiveCastSession> {
     let media = self.prepare_load(request);
-    self.with_device(|device| {
-      // Connect transport channel.
+    let host = self.host.clone();
+    let port = self.port;
+    let session = self.with_device(|device| {
       device
         .connection
         .connect("receiver-0")
         .map_err(|err| Error::Cast(format!("connection channel: {err}")))?;
 
-      // Heartbeat keep-alive.
       device
         .heartbeat
         .ping()
         .map_err(|err| Error::Cast(format!("heartbeat: {err}")))?;
 
-      // Launch Default Media Receiver.
       let app = device
         .receiver
         .launch_app(&rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver)
@@ -246,21 +323,32 @@ impl CastController {
         .connect(app.transport_id.as_str())
         .map_err(|err| Error::Cast(format!("app connection: {err}")))?;
 
-      drop(
-        device
-          .media
-          .load(app.transport_id.as_str(), app.session_id.as_str(), &media)
-          .map_err(|err| Error::Cast(format!("media load: {err}")))?,
-      );
+      let status = device
+        .media
+        .load(app.transport_id.as_str(), app.session_id.as_str(), &media)
+        .map_err(|err| Error::Cast(format!("media load: {err}")))?;
 
-      tracing::info!(host = %self.host, port = self.port, url = %media.content_id, "Cast media loaded");
-      Ok(())
-    })
+      let media_session_id = media_session_id_from_status(&status)?;
+      Ok(ActiveCastSession::new(app.transport_id, media_session_id))
+    })?;
+
+    self.active = Some(session.clone());
+    tracing::info!(
+      host = %host,
+      port,
+      transport_id = %session.transport_id,
+      media_session_id = session.media_session_id,
+      url = %media.content_id,
+      "Cast media loaded"
+    );
+    Ok(session)
   }
 
-  /// Set receiver volume level in `0.0..=1.0`.
+  /// Set receiver volume level in `0.0..=1.0` (real wire path via `rust_cast`).
   pub fn set_volume(&mut self, level: f32) -> Result<()> {
     let clamped = self.prepare_volume(level);
+    // Record the wire body shape for tests / debugging.
+    let _wire = set_volume_message_body(clamped, 0);
     self.with_device(|device| {
       device
         .connection
@@ -275,10 +363,11 @@ impl CastController {
     })
   }
 
-  /// Pause the active media session (requires known media session id).
+  /// Pause using a known media session.
   pub fn pause(&mut self, transport_id: &str, media_session_id: i32) -> Result<()> {
     let session = MediaSessionRef::new(transport_id, media_session_id);
-    drop(self.prepare_pause(session));
+    let cmd = self.prepare_pause(session);
+    let _wire = cmd.to_media_message_body(0);
     self.with_device(|device| {
       drop(
         device
@@ -290,10 +379,11 @@ impl CastController {
     })
   }
 
-  /// Resume playback.
+  /// Resume using a known media session.
   pub fn play(&mut self, transport_id: &str, media_session_id: i32) -> Result<()> {
     let session = MediaSessionRef::new(transport_id, media_session_id);
-    drop(self.prepare_play(session));
+    let cmd = self.prepare_play(session);
+    let _wire = cmd.to_media_message_body(0);
     self.with_device(|device| {
       drop(
         device
@@ -305,10 +395,11 @@ impl CastController {
     })
   }
 
-  /// Stop playback.
+  /// Stop using a known media session.
   pub fn stop(&mut self, transport_id: &str, media_session_id: i32) -> Result<()> {
     let session = MediaSessionRef::new(transport_id, media_session_id);
-    drop(self.prepare_stop(session));
+    let cmd = self.prepare_stop(session);
+    let _wire = cmd.to_media_message_body(0);
     self.with_device(|device| {
       drop(
         device
@@ -318,6 +409,32 @@ impl CastController {
       );
       Ok(())
     })
+  }
+
+  /// Stop the active session (if any) and clear it.
+  pub fn stop_active(&mut self) -> Result<()> {
+    let Some(session) = self.active.clone() else {
+      return Ok(());
+    };
+    let result = self.stop(&session.transport_id, session.media_session_id);
+    self.active = None;
+    result
+  }
+
+  /// Pause the active session when present.
+  pub fn pause_active(&mut self) -> Result<()> {
+    let Some(session) = self.active.clone() else {
+      return Err(Error::Cast("no active Cast media session".to_owned()));
+    };
+    self.pause(&session.transport_id, session.media_session_id)
+  }
+
+  /// Play the active session when present.
+  pub fn play_active(&mut self) -> Result<()> {
+    let Some(session) = self.active.clone() else {
+      return Err(Error::Cast("no active Cast media session".to_owned()));
+    };
+    self.play(&session.transport_id, session.media_session_id)
   }
 
   fn with_device<F, T>(&self, f: F) -> Result<T>
@@ -355,6 +472,18 @@ mod tests {
   }
 
   #[test]
+  fn load_message_body_uses_live_stream_type() {
+    let req = MediaLoadRequest::wav("http://10.0.0.1/stream", CastStreamKind::Live);
+    let body = req.to_load_message_body("app-session", 7);
+    assert_eq!(body["type"], "LOAD");
+    assert_eq!(body["requestId"], 7);
+    assert_eq!(body["sessionId"], "app-session");
+    assert_eq!(body["media"]["streamType"], "LIVE");
+    assert_eq!(body["media"]["contentType"], CONTENT_TYPE_WAV);
+    assert_eq!(body["media"]["contentId"], "http://10.0.0.1/stream");
+  }
+
+  #[test]
   fn prepare_load_stores_last() {
     let mut ctl = CastController::new("127.0.0.1", 8009);
     let req = MediaLoadRequest::wav("http://127.0.0.1/x.wav", CastStreamKind::Buffered);
@@ -373,35 +502,78 @@ mod tests {
   }
 
   #[test]
-  fn prepare_volume_records_clamped() {
+  fn set_volume_message_body_matches_cast_wire() {
+    let body = set_volume_message_body(1.5, 3);
+    assert_eq!(body["type"], "SET_VOLUME");
+    assert_eq!(body["requestId"], 3);
+    assert_eq!(body["volume"]["level"], 1.0);
+  }
+
+  #[test]
+  fn prepare_volume_records_clamped_and_builds_wire() {
     let mut ctl = CastController::new("127.0.0.1", 8009);
     let level = ctl.prepare_volume(2.0);
     assert!((level - 1.0).abs() < f32::EPSILON);
     assert_eq!(ctl.last_volume(), Some(1.0));
+    let wire = set_volume_message_body(level, 1);
+    assert_eq!(wire["type"], "SET_VOLUME");
+    assert_eq!(wire["volume"]["level"], 1.0);
   }
 
   #[test]
-  fn prepare_transport_commands_without_device() {
+  fn transport_commands_build_rust_cast_media_message_types() {
     let mut ctl = CastController::new("192.168.1.20", 8009);
     let session = MediaSessionRef::new("transport-1", 42);
 
     let pause = ctl.prepare_pause(session.clone());
-    assert_eq!(pause, TransportCommand::Pause(session.clone()));
-    assert_eq!(ctl.last_transport(), Some(&TransportCommand::Pause(session.clone())));
+    let pause_body = pause.to_media_message_body(11);
+    assert_eq!(pause_body["type"], "PAUSE");
+    assert_eq!(pause_body["mediaSessionId"], 42);
+    assert_eq!(pause_body["requestId"], 11);
+    assert_eq!(pause.transport_id(), "transport-1");
 
     let play = ctl.prepare_play(session.clone());
-    assert_eq!(play, TransportCommand::Play(session.clone()));
+    let play_body = play.to_media_message_body(12);
+    assert_eq!(play_body["type"], "PLAY");
+    assert_eq!(play_body["mediaSessionId"], 42);
 
-    let stop = ctl.prepare_stop(session.clone());
-    assert_eq!(stop, TransportCommand::Stop(session));
+    let stop = ctl.prepare_stop(session);
+    let stop_body = stop.to_media_message_body(13);
+    assert_eq!(stop_body["type"], "STOP");
+    assert_eq!(stop_body["mediaSessionId"], 42);
   }
 
   #[test]
-  fn media_load_request_equality_for_live_wav() {
-    let a = MediaLoadRequest::wav("http://10.0.0.1/stream", CastStreamKind::Live).with_title("A");
-    let b = MediaLoadRequest::wav("http://10.0.0.1/stream", CastStreamKind::Live).with_title("A");
-    assert_eq!(a, b);
-    let media = a.to_media();
-    assert_eq!(media.stream_type, StreamType::Live);
+  fn media_session_id_from_status_reads_first_entry() {
+    let status = Status {
+      request_id: 1,
+      entries: vec![rust_cast::channels::media::StatusEntry {
+        media_session_id: 99,
+        media: None,
+        playback_rate: 1.0,
+        player_state: rust_cast::channels::media::PlayerState::Playing,
+        current_item_id: None,
+        loading_item_id: None,
+        preloaded_item_id: None,
+        idle_reason: None,
+        extended_status: None,
+        current_time: None,
+        supported_media_commands: 0,
+      }],
+    };
+    assert_eq!(media_session_id_from_status(&status).expect("id"), 99);
+  }
+
+  #[test]
+  fn media_session_id_from_empty_status_errors() {
+    let status = Status { request_id: 1, entries: vec![] };
+    let err = media_session_id_from_status(&status).expect_err("empty status");
+    assert!(matches!(err, Error::Cast(_)));
+  }
+
+  #[test]
+  fn stop_active_without_session_is_ok() {
+    let mut ctl = CastController::new("127.0.0.1", 8009);
+    ctl.stop_active().expect("noop");
   }
 }

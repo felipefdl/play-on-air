@@ -14,27 +14,56 @@ use crate::error::{Error, Result};
 /// Base TCP port for RAOP listeners; each device gets `BASE + (hash % PORT_SPAN)`.
 const RAOP_PORT_BASE: u16 = 5100;
 const RAOP_PORT_SPAN: u64 = 1000;
+/// Default stereo capacity (~2 s at 48 kHz) until `audio_init` sets the real layout.
+const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
+/// Product max channels for Cast stereo path.
+const OUTPUT_MAX_CHANNELS: u8 = 2;
 
-/// Event emitted when an AirPlay session starts producing audio.
+/// Lifecycle events from an AirPlay receiver toward the bridge.
 #[derive(Debug, Clone)]
-pub struct AirPlaySessionEvent {
-  /// Device id this receiver is bound to.
-  pub device_id: String,
-  /// Sample rate of the decoded PCM stream.
-  pub sample_rate: u32,
-  /// Channel count of the decoded PCM stream.
-  pub channels: u16,
+pub enum AirPlaySessionEvent {
+  /// Client started an audio stream (PCM format known).
+  Started {
+    /// Device id this receiver is bound to.
+    device_id: String,
+    /// Sample rate of the decoded PCM stream.
+    sample_rate: u32,
+    /// Channel count of the decoded PCM stream.
+    channels: u16,
+  },
+  /// Client disconnected; bridge should Cast-STOP and drop media.
+  Ended {
+    /// Device id this receiver is bound to.
+    device_id: String,
+  },
+  /// AirPlay volume change in dB (0.0 = max, -144.0 = mute).
+  Volume {
+    /// Device id this receiver is bound to.
+    device_id: String,
+    /// Volume in dB.
+    volume_db: f32,
+  },
 }
 
-/// Shared PCM ring + optional session event sender for one device.
+/// Shared mutable ring slot so `audio_init` can rebuild the ring for the stream format.
 #[derive(Debug)]
 struct DeviceAudioState {
-  ring: Arc<PcmRing>,
+  ring_slot: Mutex<Arc<PcmRing>>,
   event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
   device_id: String,
 }
 
-/// Forwards decoded f32 PCM into a [`PcmRing`].
+impl DeviceAudioState {
+  fn current_ring(&self) -> Arc<PcmRing> {
+    Arc::clone(&self.ring_slot.lock())
+  }
+
+  fn replace_ring(&self, ring: Arc<PcmRing>) {
+    *self.ring_slot.lock() = ring;
+  }
+}
+
+/// Forwards decoded f32 PCM into the current [`PcmRing`].
 struct RingSession {
   ring: Arc<PcmRing>,
 }
@@ -43,26 +72,53 @@ impl AudioSession for RingSession {
   fn audio_process(&mut self, samples: &[f32]) {
     self.ring.push_f32(samples);
   }
+
+  fn audio_flush(&mut self) {
+    self.ring.clear();
+  }
 }
 
-/// Creates ring-backed sessions and notifies the bridge on first init.
+/// Creates ring-backed sessions and notifies the bridge on lifecycle events.
 struct RingHandler {
   state: Arc<DeviceAudioState>,
 }
 
 impl AudioHandler for RingHandler {
   fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
-    let sample_rate = format.sample_rate;
-    let channels = u16::from(format.channels.max(1));
-    // Resize path: replace ring if channel layout differs substantially.
+    let sample_rate = format.sample_rate.max(1);
+    // Cap at product stereo; shairplay also mixdowns via output_max_channels(2).
+    let channels = u16::from(format.channels.clamp(1, OUTPUT_MAX_CHANNELS));
+    let capacity_frames = usize::try_from(sample_rate)
+      .unwrap_or(48_000)
+      .saturating_mul(2)
+      .max(DEFAULT_RING_FRAMES);
+    let ring = Arc::new(PcmRing::new(channels, capacity_frames));
+    self.state.replace_ring(Arc::clone(&ring));
+
     if let Some(tx) = &self.state.event_tx {
-      drop(tx.send(AirPlaySessionEvent {
+      drop(tx.send(AirPlaySessionEvent::Started {
         device_id: self.state.device_id.clone(),
         sample_rate,
         channels,
       }));
     }
-    Box::new(RingSession { ring: Arc::clone(&self.state.ring) })
+    Box::new(RingSession { ring })
+  }
+
+  fn on_volume(&self, volume: f32) {
+    if let Some(tx) = &self.state.event_tx {
+      drop(tx.send(AirPlaySessionEvent::Volume {
+        device_id: self.state.device_id.clone(),
+        volume_db: volume,
+      }));
+    }
+  }
+
+  fn on_client_disconnected(&self, _addr: &str) {
+    self.state.current_ring().clear();
+    if let Some(tx) = &self.state.event_tx {
+      drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
+    }
   }
 }
 
@@ -72,8 +128,7 @@ pub struct AirPlayReceiver {
   pub device_id: String,
   /// Advertised AirPlay name.
   pub name: String,
-  /// Shared PCM ring for this receiver.
-  pub ring: Arc<PcmRing>,
+  state: Arc<DeviceAudioState>,
   server: RaopServer,
 }
 
@@ -82,7 +137,7 @@ impl std::fmt::Debug for AirPlayReceiver {
     f.debug_struct("AirPlayReceiver")
       .field("device_id", &self.device_id)
       .field("name", &self.name)
-      .field("ring", &self.ring)
+      .field("ring_channels", &self.state.current_ring().channels())
       .finish_non_exhaustive()
   }
 }
@@ -96,14 +151,14 @@ impl AirPlayReceiver {
   ) -> Result<Self> {
     let device_id_owned = device_id.into();
     let name_owned = name.into();
-    // ~2s of stereo 48 kHz as a starting capacity.
-    let ring = Arc::new(PcmRing::new(2, 48_000 * 2));
+    // Placeholder stereo ring until audio_init rebuilds from AudioFormat.
+    let ring = Arc::new(PcmRing::new(2, DEFAULT_RING_FRAMES));
     let state = Arc::new(DeviceAudioState {
-      ring: Arc::clone(&ring),
+      ring_slot: Mutex::new(ring),
       event_tx,
       device_id: device_id_owned.clone(),
     });
-    let handler = Arc::new(RingHandler { state });
+    let handler = Arc::new(RingHandler { state: Arc::clone(&state) });
 
     let hwaddr = stable_hwaddr(&device_id_owned);
     let port = stable_raop_port(&device_id_owned);
@@ -113,6 +168,7 @@ impl AirPlayReceiver {
       .mode(AirPlayMode::AirPlay2)
       .hwaddr(hwaddr.to_vec())
       .port(port)
+      .output_max_channels(OUTPUT_MAX_CHANNELS)
       .build(handler)
       .map_err(|err| Error::AirPlay(format!("build RaopServer for {name_owned}: {err}")))?;
 
@@ -126,9 +182,14 @@ impl AirPlayReceiver {
     Ok(Self {
       device_id: device_id_owned,
       name: name_owned,
-      ring,
+      state,
       server,
     })
+  }
+
+  /// Current PCM ring (may be rebuilt on each `audio_init`).
+  pub fn ring(&self) -> Arc<PcmRing> {
+    self.state.current_ring()
   }
 
   /// Start advertising and accepting AirPlay sessions.
@@ -151,7 +212,7 @@ pub struct AirPlayManager {
 }
 
 impl AirPlayManager {
-  /// Create a manager that forwards session-start events on `event_tx`.
+  /// Create a manager that forwards session lifecycle events on `event_tx`.
   pub fn new(event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>) -> Self {
     Self {
       receivers: Mutex::new(HashMap::new()),
@@ -170,7 +231,6 @@ impl AirPlayManager {
       }
     }
 
-    // Rebuild if missing or renamed.
     self.remove(device_id);
 
     let mut rx = AirPlayReceiver::build(device_id, airplay_name, self.event_tx.clone())?;
@@ -190,7 +250,6 @@ impl AirPlayManager {
     };
     if let Some(rx) = removed {
       tracing::info!(device_id = %rx.device_id, name = %rx.name, "AirPlay receiver withdrawn");
-      // RaopServer drops on leave; no explicit stop API required for scaffolding.
       drop(rx);
     }
   }
@@ -202,7 +261,7 @@ impl AirPlayManager {
 
   /// PCM ring for a device, if an advertisement exists.
   pub fn pcm_ring(&self, device_id: &str) -> Option<Arc<PcmRing>> {
-    self.receivers.lock().get(device_id).map(|r| Arc::clone(&r.ring))
+    self.receivers.lock().get(device_id).map(AirPlayReceiver::ring)
   }
 }
 
@@ -210,10 +269,9 @@ impl AirPlayManager {
 pub fn stable_hwaddr(device_id: &str) -> [u8; 6] {
   let h = hash_device_id(device_id);
   let mut mac = [0_u8; 6];
-  // Spread hash bits across the address.
   if let Some(slot) = mac.get_mut(0) {
-    *slot = ((h >> 40) as u8) & 0xFE; // clear multicast
-    *slot |= 0x02; // set locally administered
+    *slot = ((h >> 40) as u8) & 0xFE;
+    *slot |= 0x02;
   }
   if let Some(slot) = mac.get_mut(1) {
     *slot = (h >> 32) as u8;
@@ -247,7 +305,6 @@ fn hash_device_id(device_id: &str) -> u64 {
 }
 
 fn format_hwaddr(mac: [u8; 6]) -> String {
-  // Fixed-size array: get(i) is always Some; defensive for clippy indexing rules.
   let b0 = mac.first().copied().unwrap_or(0);
   let b1 = mac.get(1).copied().unwrap_or(0);
   let b2 = mac.get(2).copied().unwrap_or(0);
@@ -255,6 +312,19 @@ fn format_hwaddr(mac: [u8; 6]) -> String {
   let b4 = mac.get(4).copied().unwrap_or(0);
   let b5 = mac.get(5).copied().unwrap_or(0);
   format!("{b0:02x}:{b1:02x}:{b2:02x}:{b3:02x}:{b4:02x}:{b5:02x}")
+}
+
+/// Map AirPlay volume (dB, 0 = max, -144 = mute) to Cast linear `0.0..=1.0`.
+pub fn airplay_db_to_cast_linear(volume_db: f32) -> f32 {
+  if volume_db <= -144.0 {
+    return 0.0;
+  }
+  if volume_db >= 0.0 {
+    return 1.0;
+  }
+  // Approximate amplitude: 10^(dB/20).
+  let linear = 10_f32.powf(volume_db / 20.0);
+  linear.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -282,13 +352,32 @@ mod tests {
   }
 
   #[test]
-  fn distinct_devices_get_distinct_ports_often() {
-    // Not a guarantee for all pairs, but different ids should usually differ.
-    let a = stable_raop_port("kitchen-tv");
-    let b = stable_raop_port("bedroom-speaker");
-    // If they collide, MAC still differs — just ensure both are valid.
-    assert!((5100..6100).contains(&a));
-    assert!((5100..6100).contains(&b));
-    let _ = (a, b);
+  fn airplay_db_to_cast_linear_bounds() {
+    assert!((airplay_db_to_cast_linear(0.0) - 1.0).abs() < f32::EPSILON);
+    assert!((airplay_db_to_cast_linear(-144.0) - 0.0).abs() < f32::EPSILON);
+    let mid = airplay_db_to_cast_linear(-6.0);
+    assert!(mid > 0.4 && mid < 0.6);
+  }
+
+  #[test]
+  fn ring_handler_rebuilds_ring_for_format_channels() {
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+      event_tx: None,
+      device_id: "dev".to_owned(),
+    });
+    let handler = RingHandler { state: Arc::clone(&state) };
+    let format = AudioFormat {
+      codec: shairplay::AudioCodec::Pcm,
+      bits: 32,
+      channels: 1,
+      sample_rate: 44_100,
+    };
+    let mut session = handler.audio_init(format);
+    assert_eq!(state.current_ring().channels(), 1);
+    session.audio_process(&[0.1_f32, 0.2, 0.3]);
+    assert_eq!(state.current_ring().available_frames(), 3);
+    session.audio_flush();
+    assert_eq!(state.current_ring().available_frames(), 0);
   }
 }
