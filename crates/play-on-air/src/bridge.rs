@@ -28,8 +28,12 @@ const PREBUFFER_POLL: Duration = Duration::from_millis(50);
 const SNAPSHOT_FRAMES: usize = 2048;
 /// How long the main `run` loop waits for per-device workers after the event channel closes.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long teardown waits for an in-flight blocking Cast LOAD to finish.
-const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long teardown waits for the rollover async task after cancel/abort.
+const ROLLOVER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long teardown waits for an in-flight blocking Cast LOAD.
+///
+/// Cast pool `COMMAND_TIMEOUT` is 20s; keep margin so a slow LOAD is joined instead of detached.
+const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How Cast volume is applied after a progressive WAV LOAD.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -381,12 +385,24 @@ impl Bridge {
     // Mark dead first so an in-flight or just-finishing LOAD will STOP.
     active.session_alive.store(false, Ordering::Release);
 
-    // Stop scheduling new re-LOADs, then join any blocking LOAD already running.
+    // Stop scheduling new re-LOADs. Join the rollover task *before* taking
+    // `inflight_load` so a spawn that was about to publish either published or
+    // the task died before publish — never leave a detached blocking LOAD.
     if let Some(tx) = active.rollover_cancel {
       let _cancelled = tx.send(());
     }
     if let Some(task) = active.rollover_task {
       task.abort();
+      match tokio::time::timeout(ROLLOVER_TASK_JOIN_TIMEOUT, task).await {
+        Ok(Ok(())) => {},
+        Ok(Err(err)) if err.is_cancelled() => {},
+        Ok(Err(err)) => {
+          tracing::warn!(%device_id, error = %err, "rollover re-LOAD loop task panicked");
+        },
+        Err(_) => {
+          tracing::warn!(%device_id, "rollover re-LOAD loop join timed out");
+        },
+      }
     }
     let inflight = active.inflight_load.lock().take();
     if let Some(handle) = inflight {
@@ -487,9 +503,7 @@ async fn device_worker_loop(
 /// Returns `Ok(true)` when enough (or any) PCM is ready to start Cast load.
 async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn RingLookup) -> Result<bool> {
   for _ in 0..PREBUFFER_POLLS {
-    let still_current = rings
-      .ring_for(device_id)
-      .is_some_and(|current| Arc::ptr_eq(&current, ring));
+    let still_current = rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, ring));
     if !still_current {
       tracing::info!(%device_id, "session restarted during prebuffer; skipping stale start");
       return Ok(false);
@@ -563,22 +577,29 @@ fn spawn_rollover_reload_loop(
           let alive = Arc::clone(&session_alive);
           // Result channel lets this loop observe LOAD while `inflight_load` stays joinable by teardown.
           let (result_tx, result_rx) = oneshot::channel();
-          let load_task = tokio::task::spawn_blocking(move || {
-            let result = cast_load_buffered_wav(
-              &load_pool,
-              &id,
-              url,
-              title,
-              LoadVolumePolicy::Rollover { last_volume },
-            );
-            // Late LOAD after teardown: stop so playback cannot revive against a dead HTTP server.
-            if !alive.load(Ordering::Acquire) {
-              load_pool.stop_best_effort(&id, Duration::from_secs(2));
-            }
-            let _sent = result_tx.send(result);
-          });
+          // Publish under the same lock as the alive re-check so teardown cannot
+          // take `None` in a spawn→store gap while LOAD keeps running detached.
           {
-            *inflight_load.lock() = Some(load_task);
+            let mut slot = inflight_load.lock();
+            if !session_alive.load(Ordering::Acquire) {
+              tracing::debug!(%device_id, "skipping LiveWav rollover re-LOAD; session ended before spawn");
+              break;
+            }
+            let load_task = tokio::task::spawn_blocking(move || {
+              let result = cast_load_buffered_wav(
+                &load_pool,
+                &id,
+                url,
+                title,
+                LoadVolumePolicy::Rollover { last_volume },
+              );
+              // Late LOAD after teardown: stop so playback cannot revive against a dead HTTP server.
+              if !alive.load(Ordering::Acquire) {
+                load_pool.stop_best_effort(&id, Duration::from_secs(2));
+              }
+              let _sent = result_tx.send(result);
+            });
+            *slot = Some(load_task);
           }
           let load_result = result_rx.await;
           // Clear our slot if teardown has not already taken the JoinHandle.
@@ -865,6 +886,80 @@ mod tests {
     assert!(!session_alive.load(Ordering::Acquire));
     assert!(inflight_load.lock().is_none(), "inflight load handle must be taken and joined");
     assert!(bridge.sessions.lock().is_empty());
+  }
+
+  /// Rollover parks on cancel while a blocking LOAD sits in `inflight_load`.
+  /// Teardown must abort+join the async task, then take and join the LOAD handle
+  /// (not drop it on a short timeout).
+  #[tokio::test]
+  async fn session_end_joins_rollover_task_then_inflight_load() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let pool = Arc::new(CastPool::new());
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+
+    let session_alive = Arc::new(AtomicBool::new(true));
+    let inflight_load = Arc::new(Mutex::new(None));
+    let load_finished = Arc::new(AtomicBool::new(false));
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+    let inflight_for_task = Arc::clone(&inflight_load);
+    let finished_flag = Arc::clone(&load_finished);
+    let task = tokio::spawn(async move {
+      // Mirror production: publish blocking LOAD, then await (result / cancel).
+      let done = Arc::clone(&finished_flag);
+      let handle = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        done.store(true, Ordering::Release);
+      });
+      *inflight_for_task.lock() = Some(handle);
+      // Park until cancel or abort (like `result_rx.await` mid-LOAD).
+      match cancel_rx.await {
+        Ok(()) | Err(_) => {},
+      }
+    });
+
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert(
+        "dev-join-order".to_owned(),
+        ActiveSession {
+          media,
+          device_id: "dev-join-order".to_owned(),
+          pool,
+          rollover_cancel: Some(cancel_tx),
+          rollover_task: Some(task),
+          session_alive: Arc::clone(&session_alive),
+          last_volume_linear: Arc::new(Mutex::new(None)),
+          inflight_load: Arc::clone(&inflight_load),
+        },
+      ));
+    }
+
+    // Ensure the rollover task has published before teardown.
+    let wait_start = Instant::now();
+    while inflight_load.lock().is_none() && wait_start.elapsed() < Duration::from_secs(2) {
+      sleep(Duration::from_millis(5)).await;
+    }
+    assert!(inflight_load.lock().is_some(), "rollover task must publish inflight LOAD");
+
+    bridge.handle_session_end("dev-join-order").await;
+    assert!(!session_alive.load(Ordering::Acquire));
+    assert!(
+      load_finished.load(Ordering::Acquire),
+      "teardown must join inflight blocking LOAD after joining rollover task"
+    );
+    assert!(inflight_load.lock().is_none());
+    assert!(bridge.sessions.lock().is_empty());
+  }
+
+  #[test]
+  fn inflight_load_join_timeout_covers_cast_command_timeout() {
+    // Cast pool COMMAND_TIMEOUT is 20s; teardown must not drop the JoinHandle earlier.
+    assert!(
+      INFLIGHT_LOAD_JOIN_TIMEOUT >= Duration::from_secs(25),
+      "INFLIGHT_LOAD_JOIN_TIMEOUT={INFLIGHT_LOAD_JOIN_TIMEOUT:?} must be >= 25s (Cast cmd 20s + margin)"
+    );
   }
 
   #[tokio::test]
