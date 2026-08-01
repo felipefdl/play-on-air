@@ -9,6 +9,7 @@ use tokio::time::sleep;
 
 use crate::airplay::{AirPlayManager, AirPlaySessionEvent};
 use crate::bridge::Bridge;
+use crate::cast::CastPool;
 use crate::config::Config;
 use crate::discover::Discovery;
 use crate::error::Result;
@@ -43,7 +44,8 @@ impl App {
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
-    let bridge = Arc::new(Bridge::new(Arc::clone(&registry)));
+    let cast_pool = Arc::new(CastPool::new());
+    let bridge = Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)));
 
     let discovery = Discovery::new(Arc::clone(&registry));
     let discovery_handle = discovery.spawn(shutdown.clone());
@@ -57,12 +59,13 @@ impl App {
     };
 
     let mut maintain_shutdown = shutdown.clone();
+    let maintain_pool = Arc::clone(&cast_pool);
     let maintain = tokio::spawn(async move {
       loop {
         if *maintain_shutdown.borrow() {
           break;
         }
-        if let Err(err) = maintain_airplay(&registry, &config, &airplay).await {
+        if let Err(err) = maintain_airplay(&registry, &config, &airplay, &maintain_pool).await {
           tracing::error!(error = %err, "AirPlay maintain loop error");
         }
         tokio::select! {
@@ -74,10 +77,11 @@ impl App {
           }
         }
       }
-      // Withdraw all AirPlay ads on shutdown.
+      // Withdraw all AirPlay ads and warm Cast workers on shutdown.
       for id in airplay.active_ids() {
         airplay.remove(&id);
       }
+      maintain_pool.shutdown();
     });
 
     // Wait for shutdown signal (already driven by caller updating the watch).
@@ -92,6 +96,7 @@ impl App {
     drop(maintain.await);
     discovery_handle.abort();
     bridge_task.abort();
+    cast_pool.shutdown();
     Ok(())
   }
 }
@@ -100,13 +105,19 @@ fn coerce_rings(manager: Arc<AirPlayManager>) -> Arc<dyn crate::bridge::RingLook
   manager
 }
 
-/// Reconcile AirPlay advertisements with the current registry and config.
-async fn maintain_airplay(registry: &DeviceRegistry, config: &Config, airplay: &AirPlayManager) -> Result<()> {
+/// Reconcile AirPlay advertisements and warm Cast workers with the registry/config.
+async fn maintain_airplay(
+  registry: &DeviceRegistry,
+  config: &Config,
+  airplay: &AirPlayManager,
+  cast_pool: &CastPool,
+) -> Result<()> {
   // Drop devices that never received ServiceRemoved but stopped advertising.
   let expired = registry.expire_stale(DEFAULT_STALE_TTL);
   for dev in &expired {
     tracing::info!(id = %dev.id, name = %dev.name, "expired stale Chromecast");
     airplay.remove(&dev.id);
+    cast_pool.remove(&dev.id);
   }
 
   let devices = registry.list();
@@ -126,11 +137,21 @@ async fn maintain_airplay(registry: &DeviceRegistry, config: &Config, airplay: &
         "failed to advertise AirPlay 2 receiver"
       );
     }
+    // Warm Cast TCP while idle so LOAD during AirPlay does not dial fresh.
+    cast_pool.ensure(device);
   }
 
   for active in airplay.active_ids() {
     if !desired.contains(&active) {
       airplay.remove(&active);
+      cast_pool.remove(&active);
+    }
+  }
+
+  // Drop warm workers for devices no longer desired (e.g. newly hidden).
+  for id in cast_pool.device_ids() {
+    if !desired.contains(&id) {
+      cast_pool.remove(&id);
     }
   }
 

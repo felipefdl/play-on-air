@@ -2,6 +2,13 @@
 //!
 //! Payload construction is unit-tested without a device. Live connect/load uses
 //! `rust_cast` and stores the media session so play/pause/stop can target it.
+//!
+//! Prefer [`CastPool`] for production: it keeps a warm TCP control plane per device
+//! so AirPlay sessions avoid dialing Nest during the AP2 black-hole window.
+
+mod pool;
+
+pub use pool::CastPool;
 
 use rust_cast::channels::media::{Media, Metadata, MusicTrackMediaMetadata, Status, StreamType};
 use serde_json::{Value, json};
@@ -590,9 +597,19 @@ impl CastController {
   where
     F: FnOnce(&rust_cast::CastDevice<'_>) -> Result<T>,
   {
-    // Chromecasts often present self-signed certs on the LAN.
-    let device = rust_cast::CastDevice::connect_without_host_verification(self.host.as_str(), self.port)
+    // `rust_cast` dials with an unbound `TcpStream::connect`, which on
+    // multi-homed Macs can pick the wrong NIC while AirPlay is active
+    // (`No route to host`). Pre-connect with source bind + localhost relay so
+    // rust_cast only talks to 127.0.0.1; TLS still terminates on the Nest.
+    let (relay_host, relay_port) = crate::net::spawn_cast_connect_relay(self.host.as_str(), self.port)
       .map_err(|err| Error::Cast(format!("connect {}:{}: {err}", self.host, self.port)))?;
+    let device = rust_cast::CastDevice::connect_without_host_verification(relay_host.as_str(), relay_port)
+      .map_err(|err| {
+        Error::Cast(format!(
+          "connect {}:{} (via local relay {relay_host}:{relay_port}): {err}",
+          self.host, self.port
+        ))
+      })?;
     f(&device)
   }
 
@@ -630,6 +647,9 @@ impl CastController {
               error = %err,
               "Cast connect attempt failed"
             );
+            // Per-interface probe so the log shows which source IP still works
+            // while AirPlay is active (unbound default route may not).
+            crate::net::probe_cast_reachability(self.host.as_str(), self.port);
             last_err = Some(err);
             if !retriable {
               // Hard protocol error: stop trying other hosts this attempt.

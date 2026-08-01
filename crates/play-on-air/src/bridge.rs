@@ -11,7 +11,7 @@ use tokio::time::sleep;
 
 use crate::airplay::{AirPlaySessionEvent, airplay_db_to_cast_linear};
 use crate::audio::{PcmRing, encode_pcm_i16_to_flac};
-use crate::cast::{CastController, CastStreamKind, MediaLoadRequest};
+use crate::cast::{CastPool, CastStreamKind, MediaLoadRequest};
 use crate::error::{Error, Result};
 use crate::media::{MediaContent, MediaServer, MediaServerHandle};
 use crate::net::advertise_host_for_peer;
@@ -28,7 +28,8 @@ const SNAPSHOT_FRAMES: usize = 2048;
 /// One live bridge session for a device.
 struct ActiveSession {
   media: MediaServerHandle,
-  cast: CastController,
+  device_id: String,
+  pool: Arc<CastPool>,
 }
 
 /// Ordered teardown steps for an active bridge session.
@@ -51,6 +52,7 @@ pub const fn session_end_steps() -> [SessionEndStep; 2] {
 /// Orchestrates media HTTP + Cast load for AirPlay lifecycle events.
 pub struct Bridge {
   registry: Arc<DeviceRegistry>,
+  cast_pool: Arc<CastPool>,
   sessions: Mutex<HashMap<String, ActiveSession>>,
 }
 
@@ -58,16 +60,18 @@ impl std::fmt::Debug for Bridge {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Bridge")
       .field("registry", &self.registry)
+      .field("cast_pool", &self.cast_pool)
       .field("active_sessions", &self.sessions.lock().len())
       .finish()
   }
 }
 
 impl Bridge {
-  /// Create a bridge over the shared device registry.
-  pub fn new(registry: Arc<DeviceRegistry>) -> Self {
+  /// Create a bridge over the shared device registry and warm Cast pool.
+  pub fn new(registry: Arc<DeviceRegistry>, cast_pool: Arc<CastPool>) -> Self {
     Self {
       registry,
+      cast_pool,
       sessions: Mutex::new(HashMap::new()),
     }
   }
@@ -159,18 +163,27 @@ impl Bridge {
       sample_rate: stream_rate,
     });
 
-    let mut cast = CastController::new(device.host.clone(), device.port).with_hostname(device.hostname.clone());
     // BUFFERED progressive file works on Nest/Home; LIVE often sits silent.
-    let request = MediaLoadRequest::wav(stream_url.clone(), CastStreamKind::Buffered).with_title(device.name.clone());
+    // LOAD on the warm Cast control plane (no new TCP unless worker reconnects).
+    let pool = Arc::clone(&self.cast_pool);
+    let load_device_id = device_id.to_owned();
+    let cast_name = device.name.clone();
+    let load_url = stream_url.clone();
+    let load_result = tokio::task::spawn_blocking(move || {
+      let request =
+        MediaLoadRequest::wav(load_url, CastStreamKind::Buffered).with_title(cast_name);
+      let session = pool.load(&load_device_id, request)?;
+      // Nest device volume is independent of AirPlay; raise receiver volume.
+      if let Err(err) = pool.set_volume(&load_device_id, 1.0) {
+        tracing::debug!(error = %err, "post-load Cast volume set failed");
+      }
+      Ok::<_, Error>(session)
+    })
+    .await
+    .map_err(|err| Error::Bridge(format!("Cast load task join: {err}")))?;
 
-    match cast.connect_and_load(request) {
+    match load_result {
       Ok(session) => {
-        // Nest device volume is independent of AirPlay; raise receiver volume.
-        if let Err(err) = cast.set_volume(1.0) {
-          tracing::debug!(error = %err, "post-load Cast volume set failed");
-        }
-        // Keep control-plane heartbeats so some receivers do not idle-kill.
-        cast.spawn_heartbeat_keep_alive(Duration::from_secs(4));
         tracing::info!(
           %device_id,
           cast = %device.host,
@@ -181,7 +194,14 @@ impl Bridge {
         );
         {
           let mut guard = self.sessions.lock();
-          drop(guard.insert(device_id.to_owned(), ActiveSession { media, cast }));
+          drop(guard.insert(
+            device_id.to_owned(),
+            ActiveSession {
+              media,
+              device_id: device_id.to_owned(),
+              pool: Arc::clone(&self.cast_pool),
+            },
+          ));
         }
         Ok(())
       },
@@ -207,11 +227,12 @@ impl Bridge {
 
   fn handle_volume(&self, device_id: &str, volume_db: f32) {
     let level = airplay_db_to_cast_linear(volume_db);
-    let result = {
-      let mut guard = self.sessions.lock();
-      guard.get_mut(device_id).map(|session| session.cast.set_volume(level))
-    };
-    if let Some(Err(err)) = result {
+    // Volume only applies while a bridge session is active for this device.
+    let has_session = self.sessions.lock().contains_key(device_id);
+    if !has_session {
+      return;
+    }
+    if let Err(err) = self.cast_pool.set_volume(device_id, level) {
       tracing::debug!(%device_id, error = %err, "Cast volume sync failed");
     }
   }
@@ -219,7 +240,11 @@ impl Bridge {
 
 /// Run shipped teardown order for one active session.
 fn end_active_session(active: ActiveSession) {
-  let ActiveSession { media, mut cast } = active;
+  let ActiveSession {
+    media,
+    device_id,
+    pool,
+  } = active;
   let mut media_handle = Some(media);
   for step in session_end_steps() {
     match step {
@@ -230,8 +255,8 @@ fn end_active_session(active: ActiveSession) {
         }
       },
       SessionEndStep::CastStopBestEffort => {
-        // Best-effort Cast STOP with timeout; never block the AirPlay lifecycle path.
-        cast.stop_active_best_effort(Duration::from_secs(2));
+        // Best-effort Cast STOP with timeout; keep warm TCP for the next play.
+        pool.stop_best_effort(&device_id, Duration::from_secs(2));
       },
     }
   }
@@ -293,7 +318,6 @@ impl RingLookup for crate::airplay::AirPlayManager {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::cast::MediaSessionRef;
   use crate::registry::Device;
   use std::time::{Duration, Instant};
 
@@ -316,21 +340,28 @@ mod tests {
       port: 9,
       last_seen: Instant::now(),
     });
-    let bridge = Bridge::new(Arc::clone(&registry));
+    let pool = Arc::new(CastPool::new());
+    let bridge = Bridge::new(Arc::clone(&registry), Arc::clone(&pool));
 
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let health_url = format!("{}/health", media.base_url);
     assert!(http_get_status_ok(&health_url).await, "media must be up before end");
 
-    let mut cast = CastController::new("127.0.0.1", 9);
-    cast.set_active_for_test(MediaSessionRef::new("web-1", 3));
     {
       let mut guard = bridge.sessions.lock();
-      drop(guard.insert("dev-1".to_owned(), ActiveSession { media, cast }));
+      drop(guard.insert(
+        "dev-1".to_owned(),
+        ActiveSession {
+          media,
+          device_id: "dev-1".to_owned(),
+          pool: Arc::clone(&pool),
+        },
+      ));
     }
 
     let start = Instant::now();
     // Shipped path: session_end_steps() → MediaShutdown then timed CastStopBestEffort.
+    // No warm worker → STOP is an immediate no-op (must not hang).
     bridge.handle_session_end("dev-1");
     let elapsed = start.elapsed();
     assert!(
