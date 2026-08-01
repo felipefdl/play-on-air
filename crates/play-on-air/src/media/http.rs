@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -57,6 +58,11 @@ pub enum MediaContent {
 #[derive(Clone)]
 struct AppState {
   content: Arc<RwLock<MediaContent>>,
+  /// Bumped per `LiveWav` GET so the newest request supersedes older bodies.
+  ///
+  /// Cast clients sometimes probe `/stream` and then issue the real request;
+  /// two live bodies popping the same ring would split frames between them.
+  live_generation: Arc<AtomicU64>,
 }
 
 /// Running media server handle with public base URL.
@@ -119,7 +125,10 @@ impl MediaServer {
       .map_err(|err| Error::Media(format!("local_addr failed: {err}")))?;
 
     let content = Arc::new(RwLock::new(MediaContent::Empty));
-    let state = AppState { content: Arc::clone(&content) };
+    let state = AppState {
+      content: Arc::clone(&content),
+      live_generation: Arc::new(AtomicU64::new(0)),
+    };
 
     let app = Router::new()
       .route("/stream", get(serve_stream))
@@ -166,12 +175,24 @@ async fn serve_stream(State(state): State<AppState>) -> Response {
       }
       response
     },
-    MediaContent::LiveWav { ring, channels, sample_rate } => live_wav_response(ring, channels, sample_rate),
+    MediaContent::LiveWav { ring, channels, sample_rate } => {
+      let generation = state.live_generation.fetch_add(1, Ordering::AcqRel) + 1;
+      if generation > 1 {
+        tracing::info!(generation, "new LiveWav request supersedes previous body");
+      }
+      live_wav_response(ring, channels, sample_rate, Arc::clone(&state.live_generation), generation)
+    },
     MediaContent::Empty => (StatusCode::NO_CONTENT, "no stream").into_response(),
   }
 }
 
-fn live_wav_response(ring: Arc<PcmRing>, channels: u16, sample_rate: u32) -> Response {
+fn live_wav_response(
+  ring: Arc<PcmRing>,
+  channels: u16,
+  sample_rate: u32,
+  live_generation: Arc<AtomicU64>,
+  generation: u64,
+) -> Response {
   let ch = channels.max(1);
   let rate = sample_rate.max(1);
   let header = match continuous_wav_header(ch, rate) {
@@ -191,7 +212,7 @@ fn live_wav_response(ring: Arc<PcmRing>, channels: u16, sample_rate: u32) -> Res
     "Cast client pulling LiveWav stream"
   );
 
-  let stream = live_wav_byte_stream(ring, ch, header, preroll_frames);
+  let stream = live_wav_byte_stream(ring, ch, header, preroll_frames, live_generation, generation);
   let mut response = Body::from_stream(stream).into_response();
   drop(
     response
@@ -226,6 +247,8 @@ fn live_wav_byte_stream(
   channels: u16,
   header: [u8; 44],
   preroll_frames: usize,
+  live_generation: Arc<AtomicU64>,
+  generation: u64,
 ) -> impl stream::Stream<Item = std::result::Result<Bytes, Infallible>> + Send {
   let header_bytes = Bytes::copy_from_slice(&header);
   let initial = LiveStreamState {
@@ -234,9 +257,15 @@ fn live_wav_byte_stream(
     preroll_frames_left: preroll_frames,
     i16_buf: Vec::with_capacity(LIVE_CHUNK_FRAMES.saturating_mul(usize::from(channels))),
     channels,
+    live_generation,
+    generation,
   };
 
   stream::unfold(initial, |mut live| async move {
+    if live.is_superseded() {
+      return None;
+    }
+
     if let Some(hdr) = live.header.take() {
       return Some((Ok(hdr), live));
     }
@@ -250,6 +279,11 @@ fn live_wav_byte_stream(
     }
 
     loop {
+      // Re-check inside the underrun loop so a superseded body stops pulling
+      // (and stops sleeping) instead of stealing frames from the new request.
+      if live.is_superseded() {
+        return None;
+      }
       let frames = live.ring.pop_i16(LIVE_CHUNK_FRAMES, &mut live.i16_buf);
       if frames == 0 {
         // Brief underrun: keep the HTTP body open for Cast progressive pull.
@@ -268,6 +302,15 @@ struct LiveStreamState {
   preroll_frames_left: usize,
   i16_buf: Vec<i16>,
   channels: u16,
+  live_generation: Arc<AtomicU64>,
+  generation: u64,
+}
+
+impl LiveStreamState {
+  /// True when a newer `/stream` GET owns the ring, so this body must end.
+  fn is_superseded(&self) -> bool {
+    self.live_generation.load(Ordering::Acquire) != self.generation
+  }
 }
 
 fn i16_slice_to_le_bytes(samples: &[i16]) -> Bytes {
@@ -325,6 +368,46 @@ mod tests {
     assert_eq!(&body[0..4], b"RIFF");
     assert_eq!(&body[8..12], b"WAVE");
     assert_eq!(&body[36..40], b"data");
+    handle.shutdown();
+  }
+
+  #[tokio::test]
+  async fn second_live_get_ends_first_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let ring = Arc::new(PcmRing::new(2, 4096));
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveWav { ring, channels: 2, sample_rate: 48_000 });
+
+    let host_port = format!("127.0.0.1:{}", handle.addr.port());
+    let req = format!("GET /stream HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+
+    let mut first = TcpStream::connect(&host_port).await.expect("connect first");
+    first.write_all(req.as_bytes()).await.expect("write first");
+    let mut prefix = [0_u8; 1024];
+    let n = first.read(&mut prefix).await.expect("read first prefix");
+    assert!(n > 0, "first stream must produce bytes");
+
+    let mut second = TcpStream::connect(&host_port).await.expect("connect second");
+    second.write_all(req.as_bytes()).await.expect("write second");
+    let mut second_prefix = [0_u8; 1024];
+    let m = second.read(&mut second_prefix).await.expect("read second prefix");
+    assert!(m > 0, "second stream must produce bytes");
+
+    // The superseded first body must terminate (EOF or reset) instead of
+    // continuing to pull PCM from the shared ring.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async move {
+      let mut sink = [0_u8; 8192];
+      loop {
+        match first.read(&mut sink).await {
+          Ok(0) | Err(_) => break,
+          Ok(_) => {},
+        }
+      }
+    })
+    .await;
+    assert!(ended.is_ok(), "superseded LiveWav body must end");
     handle.shutdown();
   }
 
