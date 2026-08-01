@@ -39,7 +39,7 @@ hide = true
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:
 
-`ghcr.io/felipefdl/play-on-air:0.1.4`
+`ghcr.io/felipefdl/play-on-air:0.1.5`
 
 Architectures: `amd64`, `aarch64`.
 

@@ -21,7 +21,9 @@ const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
 /// No PCM for this long ⇒ treat AirPlay playout as paused (Cast PAUSE).
-const PAUSE_IDLE: Duration = Duration::from_millis(250);
+///
+/// Keep this well above normal packet jitter so we do not thrash PAUSE/PLAY mid-track.
+const PAUSE_IDLE: Duration = Duration::from_millis(750);
 /// Pause-watch poll cadence.
 const PAUSE_POLL: Duration = Duration::from_millis(50);
 

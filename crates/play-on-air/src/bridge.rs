@@ -38,8 +38,10 @@ const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How Cast volume is applied after a progressive WAV LOAD.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LoadVolumePolicy {
-  /// Initial session start: force receiver volume to full (Nest device volume is independent).
-  InitialFull,
+  /// Initial session start: leave the Cast device volume unchanged.
+  ///
+  /// Forcing 1.0 overwrote the speaker's current level every stream start.
+  PreserveDevice,
   /// Content-Length rollover re-LOAD: re-apply last AirPlay linear volume, or skip if unknown.
   Rollover { last_volume: Option<f32> },
 }
@@ -47,7 +49,7 @@ enum LoadVolumePolicy {
 /// Resolve the linear volume to set after LOAD, if any.
 const fn volume_after_load(policy: LoadVolumePolicy) -> Option<f32> {
   match policy {
-    LoadVolumePolicy::InitialFull => Some(1.0),
+    LoadVolumePolicy::PreserveDevice => None,
     LoadVolumePolicy::Rollover { last_volume } => last_volume,
   }
 }
@@ -319,7 +321,7 @@ impl Bridge {
     let cast_name = device.name.clone();
     let load_url = stream_url.clone();
     let load_result = tokio::task::spawn_blocking(move || {
-      cast_load_buffered_wav(&pool, &load_device_id, load_url, cast_name, LoadVolumePolicy::InitialFull)
+      cast_load_buffered_wav(&pool, &load_device_id, load_url, cast_name, LoadVolumePolicy::PreserveDevice)
     })
     .await
     .map_err(|err| Error::Bridge(format!("Cast load task join: {err}")))?;
@@ -782,8 +784,8 @@ mod tests {
   }
 
   #[test]
-  fn volume_after_load_initial_full_rollover_preserves_or_skips() {
-    assert_eq!(volume_after_load(LoadVolumePolicy::InitialFull), Some(1.0));
+  fn volume_after_load_preserve_device_and_rollover() {
+    assert_eq!(volume_after_load(LoadVolumePolicy::PreserveDevice), None);
     assert_eq!(volume_after_load(LoadVolumePolicy::Rollover { last_volume: None }), None);
     assert_eq!(
       volume_after_load(LoadVolumePolicy::Rollover { last_volume: Some(0.42) }),
@@ -1074,7 +1076,8 @@ mod tests {
     bridge.handle_volume("dev-vol", 0.0).await;
     let stored = *last_volume_linear.lock();
     assert_eq!(stored, Some(1.0));
-    // Rollover policy must re-apply that level, not force 1.0 only via InitialFull.
+    // Initial load must not force full volume; rollover re-applies last AirPlay level.
+    assert_eq!(volume_after_load(LoadVolumePolicy::PreserveDevice), None);
     assert_eq!(volume_after_load(LoadVolumePolicy::Rollover { last_volume: stored }), Some(1.0));
     assert_eq!(
       volume_after_load(LoadVolumePolicy::Rollover { last_volume: Some(0.25) }),

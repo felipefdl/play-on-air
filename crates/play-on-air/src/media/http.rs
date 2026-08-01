@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -24,10 +24,15 @@ use crate::error::{Error, Result};
 
 /// Frames requested per `LiveWav` chunk (~21 ms at 48 kHz).
 const LIVE_CHUNK_FRAMES: usize = 1024;
-/// Sleep when the PCM ring underruns so the HTTP body stays open.
+/// Sleep when the PCM ring underruns so the HTTP body stays open without injecting silence.
 const LIVE_UNDERRUN_SLEEP: Duration = Duration::from_millis(5);
-/// Silence frames prepended so Nest/Chromecast can buffer before real PCM.
-const SILENCE_PREROLL_FRAMES: usize = 24_000; // ~0.5 s at 48 kHz; scaled by rate in stream
+/// Optional silence frames prepended before real PCM.
+///
+/// Keep at 0: the bridge already prebuffers real PCM before Cast LOAD. A long silence
+/// preroll was played by Nest as the start of the track (half-second mute / cut).
+const SILENCE_PREROLL_FRAMES: usize = 0;
+/// How far ahead of wall-clock realtime Nest may pull (keeps a cushion without draining the ring).
+const LIVE_LEAD: Duration = Duration::from_millis(750);
 /// Content-Length matches continuous WAV data size + 44-byte header (avoids chunked TE).
 pub(crate) const LIVE_CONTENT_LENGTH: u64 = (u32::MAX / 2) as u64 + 44;
 /// Stop serving this many bytes before [`LIVE_CONTENT_LENGTH`] so hyper never hits the hard cap.
@@ -301,7 +306,6 @@ fn live_wav_response(
     },
   };
 
-  // ~0.5 s of silence at the stream sample rate (Nest needs a buffer burst).
   let preroll_frames = silence_preroll_frames(rate);
   let threshold = live_body_threshold(max_body_bytes);
   tracing::info!(
@@ -316,6 +320,7 @@ fn live_wav_response(
   let stream = live_wav_byte_stream(
     ring,
     ch,
+    rate,
     header,
     preroll_frames,
     live_generation,
@@ -354,15 +359,22 @@ pub(crate) fn live_body_threshold(max_body_bytes: u64) -> u64 {
   capped.saturating_sub(margin).max(44)
 }
 
-/// ~0.5 s of silence frames at `sample_rate`.
+/// Silence frames at `sample_rate` (0 when [`SILENCE_PREROLL_FRAMES`] is 0).
 fn silence_preroll_frames(sample_rate: u32) -> usize {
+  if SILENCE_PREROLL_FRAMES == 0 {
+    return 0;
+  }
   // Scale default 48 kHz constant to the stream rate.
-  let base = u64::try_from(SILENCE_PREROLL_FRAMES).unwrap_or(24_000);
-  let n = (base * u64::from(sample_rate)) / 48_000;
-  usize::try_from(n).unwrap_or(SILENCE_PREROLL_FRAMES).max(1024)
+  let base = u64::try_from(SILENCE_PREROLL_FRAMES).unwrap_or(0);
+  let n = (base * u64::from(sample_rate.max(1))) / 48_000;
+  usize::try_from(n).unwrap_or(SILENCE_PREROLL_FRAMES)
 }
 
-/// Progressive async stream: WAV header, silence preroll, then PCM from the ring.
+/// Progressive async stream: WAV header, silence preroll, then paced PCM from the ring.
+///
+/// Nest BUFFERED pull can drain the ring faster than AirPlay fills it. We must **not**
+/// inject silence on underrun (that becomes constant audible cuts). Instead: wait for
+/// real PCM, and pace emission so Nest stays at most [`LIVE_LEAD`] ahead of realtime.
 #[expect(
   clippy::too_many_arguments,
   reason = "stream state is assembled once; splitting would obscure the data path"
@@ -370,6 +382,7 @@ fn silence_preroll_frames(sample_rate: u32) -> usize {
 fn live_wav_byte_stream(
   ring: Arc<PcmRing>,
   channels: u16,
+  sample_rate: u32,
   header: [u8; 44],
   preroll_frames: usize,
   live_generation: Arc<AtomicU64>,
@@ -385,9 +398,12 @@ fn live_wav_byte_stream(
     preroll_frames_left: preroll_frames,
     i16_buf: Vec::with_capacity(LIVE_CHUNK_FRAMES.saturating_mul(usize::from(channels))),
     channels,
+    sample_rate: sample_rate.max(1),
     live_generation,
     generation,
     bytes_sent: 0,
+    frames_emitted: 0,
+    pace_origin: None,
     threshold,
     bytes_served,
     rollover,
@@ -403,7 +419,7 @@ fn live_wav_byte_stream(
     }
 
     if let Some(hdr) = live.header.take() {
-      return Some(live.emit_chunk(hdr));
+      return Some(live.emit_chunk(hdr, 0));
     }
 
     if live.preroll_frames_left > 0 {
@@ -416,53 +432,45 @@ fn live_wav_byte_stream(
       }
       live.preroll_frames_left = live.preroll_frames_left.saturating_sub(n);
       let silence = vec![0_i16; samples];
-      return Some(live.emit_chunk(i16_slice_to_le_bytes(&silence)));
+      // Preroll silence does not start the realtime pace clock — Nest should buffer it fast.
+      return Some(live.emit_chunk(i16_slice_to_le_bytes(&silence), 0));
     }
 
-    // Re-check before pop so a superseded body stops instead of stealing frames.
-    if live.is_superseded() {
-      return None;
-    }
-    if live.bytes_sent >= live.threshold {
-      live.signal_rollover();
-      return None;
-    }
-    // Budget frames *before* pop so we never drop already-popped PCM at the cap.
-    let remaining = live.threshold.saturating_sub(live.bytes_sent);
-    let bytes_per_frame = u64::from(live.channels).saturating_mul(2);
-    if bytes_per_frame == 0 {
-      return None;
-    }
-    let max_frames_fit = usize::try_from(remaining / bytes_per_frame).unwrap_or(0);
-    if max_frames_fit == 0 {
-      live.signal_rollover();
-      return None;
-    }
-    let want_frames = LIVE_CHUNK_FRAMES.min(max_frames_fit);
-    let frames = live.ring.pop_i16(want_frames, &mut live.i16_buf);
-    if frames == 0 {
-      // Nest progressive pull underruns if the body stalls. Feed silence so the
-      // Cast buffer keeps filling while AirPlay is paused or briefly late.
-      // Pace with a short sleep so we do not spin when the client is idle.
-      let samples = want_frames.saturating_mul(usize::from(live.channels));
-      let chunk_bytes = samples.saturating_mul(2) as u64;
-      if live.bytes_sent.saturating_add(chunk_bytes) > live.threshold {
-        live.signal_rollover();
-        return None;
-      }
-      sleep(LIVE_UNDERRUN_SLEEP).await;
+    loop {
+      // Re-check so a superseded body stops instead of stealing frames.
       if live.is_superseded() {
         return None;
       }
-      let silence = vec![0_i16; samples];
-      return Some(live.emit_chunk(i16_slice_to_le_bytes(&silence)));
+      if live.bytes_sent >= live.threshold {
+        live.signal_rollover();
+        return None;
+      }
+      // Budget frames *before* pop so we never drop already-popped PCM at the cap.
+      let remaining = live.threshold.saturating_sub(live.bytes_sent);
+      let bytes_per_frame = u64::from(live.channels).saturating_mul(2);
+      if bytes_per_frame == 0 {
+        return None;
+      }
+      let max_frames_fit = usize::try_from(remaining / bytes_per_frame).unwrap_or(0);
+      if max_frames_fit == 0 {
+        live.signal_rollover();
+        return None;
+      }
+      let want_frames = LIVE_CHUNK_FRAMES.min(max_frames_fit);
+      let frames = live.ring.pop_i16(want_frames, &mut live.i16_buf);
+      if frames == 0 {
+        // Wait for real PCM. Injecting silence here caused constant Nest Mini cuts.
+        sleep(LIVE_UNDERRUN_SLEEP).await;
+        continue;
+      }
+      // After pop: if a newer GET owns the ring, drop this chunk (unavoidable on supersede).
+      if live.is_superseded() {
+        return None;
+      }
+      live.pace_realtime(frames).await;
+      let chunk = i16_slice_to_le_bytes(&live.i16_buf);
+      return Some(live.emit_chunk(chunk, frames));
     }
-    // After pop: if a newer GET owns the ring, drop this chunk (unavoidable on supersede).
-    if live.is_superseded() {
-      return None;
-    }
-    let chunk = i16_slice_to_le_bytes(&live.i16_buf);
-    Some(live.emit_chunk(chunk))
   })
 }
 
@@ -472,9 +480,14 @@ struct LiveStreamState {
   preroll_frames_left: usize,
   i16_buf: Vec<i16>,
   channels: u16,
+  sample_rate: u32,
   live_generation: Arc<AtomicU64>,
   generation: u64,
   bytes_sent: u64,
+  /// PCM frames emitted after silence preroll (used for realtime pacing).
+  frames_emitted: u64,
+  /// Wall clock when the first real PCM frame was paced.
+  pace_origin: Option<Instant>,
   threshold: u64,
   bytes_served: Arc<AtomicU64>,
   rollover: Arc<RolloverSignal>,
@@ -496,10 +509,30 @@ impl LiveStreamState {
     self.rollover.signal();
   }
 
-  fn emit_chunk(mut self, chunk: Bytes) -> (std::result::Result<Bytes, Infallible>, Self) {
+  /// Hold Nest pull so it stays at most [`LIVE_LEAD`] ahead of wall-clock audio time.
+  ///
+  /// Without pacing, BUFFERED progressive download drains the ring in milliseconds,
+  /// then underruns forever (or used to inject silence = constant cuts).
+  async fn pace_realtime(&mut self, next_frames: usize) {
+    let origin = *self.pace_origin.get_or_insert_with(Instant::now);
+    let rate = u64::from(self.sample_rate.max(1));
+    let total_after = self.frames_emitted.saturating_add(u64::try_from(next_frames).unwrap_or(0));
+    let audio_ms = total_after.saturating_mul(1000) / rate;
+    let due = origin + Duration::from_millis(audio_ms);
+    let wake_at = due.checked_sub(LIVE_LEAD).unwrap_or(origin);
+    let now = Instant::now();
+    if wake_at > now {
+      sleep(wake_at.saturating_duration_since(now)).await;
+    }
+  }
+
+  fn emit_chunk(mut self, chunk: Bytes, pcm_frames: usize) -> (std::result::Result<Bytes, Infallible>, Self) {
     let n = chunk.len() as u64;
     self.bytes_sent = self.bytes_sent.saturating_add(n);
     self.bytes_served.store(self.bytes_sent, Ordering::Release);
+    if pcm_frames > 0 {
+      self.frames_emitted = self.frames_emitted.saturating_add(u64::try_from(pcm_frames).unwrap_or(0));
+    }
     (Ok(chunk), self)
   }
 }
@@ -606,11 +639,13 @@ mod tests {
     let rollover = Arc::new(RolloverSignal::default());
     let header = continuous_wav_header(2, 48_000).expect("header");
     let threshold = live_body_threshold(800);
+    // Explicit silence preroll so an empty ring still ends at the tiny threshold.
     let stream = live_wav_byte_stream(
       ring,
       2,
+      48_000,
       header,
-      silence_preroll_frames(48_000),
+      4_096,
       live_generation,
       1,
       threshold,
@@ -661,6 +696,7 @@ mod tests {
     let stream = live_wav_byte_stream(
       Arc::clone(&ring),
       2,
+      48_000,
       header,
       0, // no silence preroll — exercise real PCM near the cap
       live_generation,
@@ -688,8 +724,10 @@ mod tests {
   #[tokio::test]
   async fn live_wav_http_with_tiny_cap_signals_rollover() {
     let ring = Arc::new(PcmRing::new(2, 4_096));
+    // Fill the ring so the body can progress without relying on silence preroll.
+    ring.push_f32(&[0.0; 4_096 * 2]);
     let handle = MediaServer::start("127.0.0.1").await.expect("start");
-    // Tiny cap so preroll silence alone ends the body without multi-hour runtime.
+    // Tiny cap so a short progressive body ends without multi-hour runtime.
     handle.set_max_body_bytes(800);
     handle.set_content(MediaContent::LiveWav { ring, channels: 2, sample_rate: 48_000 });
 

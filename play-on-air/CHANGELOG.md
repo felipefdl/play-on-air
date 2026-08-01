@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Volume: do not force Cast receiver to 100% on stream start; leave device volume alone.
+- LiveWav: stop injecting silence on underrun (was constant Nest Mini cuts); wait for real PCM.
+- LiveWav: pace progressive pull so Nest cannot drain the ring faster than AirPlay fills it.
+- LiveWav: drop 0.5s silence preroll (Nest was playing it as the start of the track).
+- Pause idle window increased to 750ms to avoid PAUSE/PLAY thrash on short gaps.
+
 ## 0.1.4
 
 - Pause/resume: detect AirPlay playout idle and issue Cast PAUSE/PLAY (snappier stop).
