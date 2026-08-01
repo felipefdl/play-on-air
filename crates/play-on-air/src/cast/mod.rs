@@ -225,6 +225,8 @@ pub struct CastController {
   last_transport: Option<TransportCommand>,
   /// Active media session after a successful [`Self::connect_and_load`].
   active: Option<ActiveCastSession>,
+  /// Optional background heartbeat task (stopped on drop / stop_active).
+  heartbeat_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CastController {
@@ -237,6 +239,7 @@ impl CastController {
       last_volume: None,
       last_transport: None,
       active: None,
+      heartbeat_stop: None,
     }
   }
 
@@ -445,10 +448,55 @@ impl CastController {
 
   /// Stop the active session (if any) and clear it.
   pub fn stop_active(&mut self) -> Result<()> {
+    self.stop_heartbeat();
     let Some(session) = self.active.take() else {
       return Ok(());
     };
     self.stop(&session.transport_id, session.media_session_id)
+  }
+
+  /// Stop background heartbeats (if any).
+  pub fn stop_heartbeat(&mut self) {
+    if let Some(flag) = self.heartbeat_stop.take() {
+      flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+  }
+
+  /// Spawn a best-effort heartbeat loop so some receivers do not idle-disconnect.
+  ///
+  /// Uses a separate TCP session (`receiver-0` PING). Safe to call after LOAD.
+  pub fn spawn_heartbeat_keep_alive(&mut self, interval: std::time::Duration) {
+    self.stop_heartbeat();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    self.heartbeat_stop = Some(std::sync::Arc::clone(&stop));
+    let host = self.host.clone();
+    let port = self.port;
+    drop(std::thread::spawn(move || {
+      while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let ctl = Self::new(host.clone(), port);
+        if let Err(err) = ctl.with_device(|device| {
+          device
+            .connection
+            .connect("receiver-0")
+            .map_err(|e| Error::Cast(format!("heartbeat connect: {e}")))?;
+          device
+            .heartbeat
+            .ping()
+            .map_err(|e| Error::Cast(format!("heartbeat ping: {e}")))?;
+          Ok(())
+        }) {
+          tracing::debug!(error = %err, "Cast heartbeat ping failed");
+        }
+        // Sleep in 200 ms slices so stop is responsive.
+        let steps = (interval.as_millis() / 200).max(1);
+        for _ in 0..steps {
+          if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+          }
+          std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+      }
+    }));
   }
 
   /// Best-effort stop of the active session with a wall-clock timeout.
@@ -457,6 +505,7 @@ impl CastController {
   /// STOP runs on a worker thread so a blocked `rust_cast` receive cannot hang
   /// the bridge (media HTTP is shut down independently by the bridge).
   pub fn stop_active_best_effort(&mut self, timeout: std::time::Duration) {
+    self.stop_heartbeat();
     let Some(session) = self.active.take() else {
       return;
     };

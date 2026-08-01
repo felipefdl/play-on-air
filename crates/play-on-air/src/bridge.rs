@@ -14,14 +14,14 @@ use crate::audio::{PcmRing, encode_pcm_i16_to_flac};
 use crate::cast::{CastController, CastStreamKind, MediaLoadRequest};
 use crate::error::{Error, Result};
 use crate::media::{MediaContent, MediaServer, MediaServerHandle};
-use crate::net::advertise_host_ip;
+use crate::net::advertise_host_for_peer;
 use crate::registry::DeviceRegistry;
 
-/// Frames to wait for before starting Cast load.
-const PREBUFFER_FRAMES: usize = 1024;
-/// Max prebuffer poll iterations (~1 s at 20 ms).
-const PREBUFFER_POLLS: u32 = 50;
-const PREBUFFER_POLL: Duration = Duration::from_millis(20);
+/// Frames to wait for before starting Cast load (~0.5 s at 44.1/48 kHz).
+const PREBUFFER_FRAMES: usize = 24_000;
+/// Max prebuffer poll iterations (~3 s at 50 ms).
+const PREBUFFER_POLLS: u32 = 60;
+const PREBUFFER_POLL: Duration = Duration::from_millis(50);
 /// Frames copied for the FLAC quality-path snapshot at session start.
 const SNAPSHOT_FRAMES: usize = 2048;
 
@@ -141,9 +141,17 @@ impl Bridge {
 
     verify_flac_snapshot(&ring, stream_channels, stream_rate);
 
-    let host = advertise_host_ip();
+    // Route media URL via the interface that can reach this Cast device.
+    let host = advertise_host_for_peer(&device.host);
     let media = MediaServer::start(&host).await?;
     let stream_url = media.stream_url();
+    tracing::info!(
+      %device_id,
+      cast = %device.host,
+      %stream_url,
+      frames = ring.available_frames(),
+      "starting Cast progressive WAV bridge"
+    );
 
     media.set_content(MediaContent::LiveWav {
       ring: Arc::clone(&ring),
@@ -152,16 +160,24 @@ impl Bridge {
     });
 
     let mut cast = CastController::new(device.host.clone(), device.port);
-    let request = MediaLoadRequest::wav(stream_url, CastStreamKind::Live).with_title(device.name.clone());
+    // BUFFERED progressive file works on Nest/Home; LIVE often sits silent.
+    let request = MediaLoadRequest::wav(stream_url.clone(), CastStreamKind::Buffered).with_title(device.name.clone());
 
     match cast.connect_and_load(request) {
       Ok(session) => {
+        // Nest device volume is independent of AirPlay; raise receiver volume.
+        if let Err(err) = cast.set_volume(1.0) {
+          tracing::debug!(error = %err, "post-load Cast volume set failed");
+        }
+        // Keep control-plane heartbeats so some receivers do not idle-kill.
+        cast.spawn_heartbeat_keep_alive(Duration::from_secs(4));
         tracing::info!(
           %device_id,
           cast = %device.host,
           transport_id = %session.transport_id,
           media_session_id = session.media_session_id,
-          "bridge session Cast LIVE WAV load ok"
+          %stream_url,
+          "bridge session Cast BUFFERED WAV load ok"
         );
         {
           let mut guard = self.sessions.lock();

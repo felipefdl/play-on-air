@@ -25,6 +25,10 @@ use crate::error::{Error, Result};
 const LIVE_CHUNK_FRAMES: usize = 1024;
 /// Sleep when the PCM ring underruns so the HTTP body stays open.
 const LIVE_UNDERRUN_SLEEP: Duration = Duration::from_millis(5);
+/// Silence frames prepended so Nest/Chromecast can buffer before real PCM.
+const SILENCE_PREROLL_FRAMES: usize = 24_000; // ~0.5 s at 48 kHz; scaled by rate in stream
+/// Content-Length matches continuous WAV data size + 44-byte header (avoids chunked TE).
+const LIVE_CONTENT_LENGTH: u64 = (u32::MAX / 2) as u64 + 44;
 
 /// What the media server currently serves at `/stream`.
 #[derive(Debug, Clone, Default)]
@@ -164,7 +168,9 @@ async fn serve_stream(State(state): State<AppState>) -> Response {
 }
 
 fn live_wav_response(ring: Arc<PcmRing>, channels: u16, sample_rate: u32) -> Response {
-  let header = match continuous_wav_header(channels.max(1), sample_rate.max(1)) {
+  let ch = channels.max(1);
+  let rate = sample_rate.max(1);
+  let header = match continuous_wav_header(ch, rate) {
     Ok(h) => h,
     Err(err) => {
       tracing::error!(error = %err, "failed to build continuous WAV header");
@@ -172,27 +178,58 @@ fn live_wav_response(ring: Arc<PcmRing>, channels: u16, sample_rate: u32) -> Res
     },
   };
 
-  let stream = live_wav_byte_stream(ring, channels.max(1), header);
+  // ~0.5 s of silence at the stream sample rate (Nest needs a buffer burst).
+  let preroll_frames = silence_preroll_frames(rate);
+  tracing::info!(
+    channels = ch,
+    sample_rate = rate,
+    preroll_frames,
+    "Cast client pulling LiveWav stream"
+  );
+
+  let stream = live_wav_byte_stream(ring, ch, header, preroll_frames);
   let mut response = Body::from_stream(stream).into_response();
   drop(
     response
       .headers_mut()
       .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("audio/wav")),
   );
+  // Nest/Chromecast often fail on chunked-only progressive audio. Advertise a
+  // large Content-Length matching the continuous WAV header data size.
+  if let Ok(val) = header::HeaderValue::from_str(&LIVE_CONTENT_LENGTH.to_string()) {
+    drop(response.headers_mut().insert(header::CONTENT_LENGTH, val));
+  }
+  // Discourage range probes that restart the progressive body mid-stream.
+  drop(
+    response
+      .headers_mut()
+      .insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("none")),
+  );
   response
 }
 
-/// Infinite async stream: WAV header once, then PCM LE chunks from the ring.
+/// ~0.5 s of silence frames at `sample_rate`.
+fn silence_preroll_frames(sample_rate: u32) -> usize {
+  // Scale default 48 kHz constant to the stream rate.
+  let base = u64::try_from(SILENCE_PREROLL_FRAMES).unwrap_or(24_000);
+  let n = (base * u64::from(sample_rate)) / 48_000;
+  usize::try_from(n).unwrap_or(SILENCE_PREROLL_FRAMES).max(1024)
+}
+
+/// Progressive async stream: WAV header, silence preroll, then PCM from the ring.
 fn live_wav_byte_stream(
   ring: Arc<PcmRing>,
   channels: u16,
   header: [u8; 44],
+  preroll_frames: usize,
 ) -> impl stream::Stream<Item = std::result::Result<Bytes, Infallible>> + Send {
   let header_bytes = Bytes::copy_from_slice(&header);
   let initial = LiveStreamState {
     ring,
     header: Some(header_bytes),
+    preroll_frames_left: preroll_frames,
     i16_buf: Vec::with_capacity(LIVE_CHUNK_FRAMES.saturating_mul(usize::from(channels))),
+    channels,
   };
 
   stream::unfold(initial, |mut live| async move {
@@ -200,10 +237,18 @@ fn live_wav_byte_stream(
       return Some((Ok(hdr), live));
     }
 
+    if live.preroll_frames_left > 0 {
+      let n = live.preroll_frames_left.min(LIVE_CHUNK_FRAMES);
+      live.preroll_frames_left = live.preroll_frames_left.saturating_sub(n);
+      let samples = n.saturating_mul(usize::from(live.channels));
+      let silence = vec![0_i16; samples];
+      return Some((Ok(i16_slice_to_le_bytes(&silence)), live));
+    }
+
     loop {
       let frames = live.ring.pop_i16(LIVE_CHUNK_FRAMES, &mut live.i16_buf);
       if frames == 0 {
-        // Brief underrun: keep the HTTP body open for Cast LIVE pull.
+        // Brief underrun: keep the HTTP body open for Cast progressive pull.
         sleep(LIVE_UNDERRUN_SLEEP).await;
         continue;
       }
@@ -216,7 +261,9 @@ fn live_wav_byte_stream(
 struct LiveStreamState {
   ring: Arc<PcmRing>,
   header: Option<Bytes>,
+  preroll_frames_left: usize,
   i16_buf: Vec<i16>,
+  channels: u16,
 }
 
 fn i16_slice_to_le_bytes(samples: &[i16]) -> Bytes {

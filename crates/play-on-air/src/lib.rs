@@ -21,4 +21,4 @@ pub mod registry;
 pub use app::App;
 pub use config::Config;
 pub use error::{Error, Result};
-pub use net::advertise_host_ip;
+pub use net::{advertise_host_for_peer, advertise_host_ip};
