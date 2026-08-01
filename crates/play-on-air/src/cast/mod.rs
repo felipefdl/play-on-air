@@ -225,7 +225,7 @@ pub struct CastController {
   last_transport: Option<TransportCommand>,
   /// Active media session after a successful [`Self::connect_and_load`].
   active: Option<ActiveCastSession>,
-  /// Optional background heartbeat task (stopped on drop / stop_active).
+  /// Optional background heartbeat task (stopped on drop / `stop_active`).
   heartbeat_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
