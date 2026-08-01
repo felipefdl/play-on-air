@@ -79,13 +79,22 @@ impl RolloverSignal {
   }
 
   /// Wait until the rollover count is strictly greater than `seen`, then return the new count.
+  ///
+  /// Registers the `Notify` waiter **before** the second count check so a `signal()` between
+  /// the first check and registration cannot be lost (`notify_waiters` stores no permit).
   pub async fn wait_past(&self, seen: u64) -> u64 {
     loop {
-      let current = self.count.load(Ordering::Acquire);
-      if current > seen {
-        return current;
+      let before = self.count.load(Ordering::Acquire);
+      if before > seen {
+        return before;
       }
-      self.notify.notified().await;
+      // Register first, then re-check — standard Notify lost-wakeup avoidance.
+      let notified = self.notify.notified();
+      let after = self.count.load(Ordering::Acquire);
+      if after > seen {
+        return after;
+      }
+      notified.await;
     }
   }
 }
@@ -420,18 +429,29 @@ fn live_wav_byte_stream(
         live.signal_rollover();
         return None;
       }
-      let frames = live.ring.pop_i16(LIVE_CHUNK_FRAMES, &mut live.i16_buf);
+      // Budget frames *before* pop so we never drop already-popped PCM at the cap.
+      let remaining = live.threshold.saturating_sub(live.bytes_sent);
+      let bytes_per_frame = u64::from(live.channels).saturating_mul(2);
+      if bytes_per_frame == 0 {
+        return None;
+      }
+      let max_frames_fit = usize::try_from(remaining / bytes_per_frame).unwrap_or(0);
+      if max_frames_fit == 0 {
+        live.signal_rollover();
+        return None;
+      }
+      let want_frames = LIVE_CHUNK_FRAMES.min(max_frames_fit);
+      let frames = live.ring.pop_i16(want_frames, &mut live.i16_buf);
       if frames == 0 {
         // Brief underrun: keep the HTTP body open for Cast progressive pull.
         sleep(LIVE_UNDERRUN_SLEEP).await;
         continue;
       }
-      let chunk = i16_slice_to_le_bytes(&live.i16_buf);
-      let chunk_bytes = chunk.len() as u64;
-      if live.bytes_sent.saturating_add(chunk_bytes) > live.threshold {
-        live.signal_rollover();
+      // After pop: if a newer GET owns the ring, drop this chunk (unavoidable on supersede).
+      if live.is_superseded() {
         return None;
       }
+      let chunk = i16_slice_to_le_bytes(&live.i16_buf);
       return Some(live.emit_chunk(chunk));
     }
   })
@@ -493,6 +513,24 @@ mod tests {
     assert!(threshold < LIVE_CONTENT_LENGTH);
     assert!(LIVE_CONTENT_LENGTH - threshold <= LIVE_ROLLOVER_MARGIN);
     assert!(threshold >= 44);
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn wait_past_does_not_lose_wakeup_under_concurrent_signal() {
+    // Stress the register-then-recheck pattern. A lost wakeup hangs until timeout.
+    let signal = Arc::new(RolloverSignal::default());
+    for seen in 0..64_u64 {
+      let waiter_signal = Arc::clone(&signal);
+      let waiter = tokio::spawn(async move { waiter_signal.wait_past(seen).await });
+      // Give the waiter a chance to observe `seen` and arm Notify before we signal.
+      tokio::task::yield_now().await;
+      signal.signal();
+      let advanced = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("wait_past must not hang (lost Notify wakeup)")
+        .expect("waiter join");
+      assert!(advanced > seen, "count must advance past {seen}, got {advanced}");
+    }
   }
 
   #[test]
@@ -588,6 +626,54 @@ mod tests {
     assert!(total >= 44 && total <= threshold, "total={total} threshold={threshold}");
     assert_eq!(rollover.count(), 1, "exactly one rollover signal when body ends at cap");
     assert_eq!(bytes_served.load(Ordering::Acquire), total);
+  }
+
+  #[tokio::test]
+  async fn live_wav_does_not_discard_pcm_when_nearing_threshold() {
+    use crate::audio::continuous_wav_header;
+    use futures_util::StreamExt;
+
+    // Header only + tiny PCM budget: old code popped a full chunk then discarded it at cap.
+    let ring = Arc::new(PcmRing::new(2, 16_384));
+    let frames_pushed = 1_000_usize;
+    let mut samples = Vec::with_capacity(frames_pushed.saturating_mul(2));
+    for _ in 0..frames_pushed {
+      samples.push(0.25);
+      samples.push(-0.25);
+    }
+    ring.push_f32(&samples);
+
+    let live_generation = Arc::new(AtomicU64::new(1));
+    let bytes_served = Arc::new(AtomicU64::new(0));
+    let rollover = Arc::new(RolloverSignal::default());
+    let header = continuous_wav_header(2, 48_000).expect("header");
+    // 44-byte header + 100 bytes PCM = 25 stereo frames max after header.
+    let threshold = 44 + 100;
+    let stream = live_wav_byte_stream(
+      Arc::clone(&ring),
+      2,
+      header,
+      0, // no silence preroll — exercise real PCM near the cap
+      live_generation,
+      1,
+      threshold,
+      bytes_served,
+      Arc::clone(&rollover),
+    );
+    tokio::pin!(stream);
+    let mut total = 0_u64;
+    while let Some(item) = stream.next().await {
+      total = total.saturating_add(item.expect("infallible").len() as u64);
+    }
+
+    assert!(total <= threshold, "total={total} threshold={threshold}");
+    assert_eq!(rollover.count(), 1);
+    let left = ring.available_frames();
+    // 25 frames fit after header; must not have dropped a full 1024-frame pop.
+    assert!(
+      left > 500,
+      "nearing threshold must pop only what fits; discarded PCM left ring empty-ish (left={left})"
+    );
   }
 
   #[tokio::test]
