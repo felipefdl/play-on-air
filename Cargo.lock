@@ -1327,7 +1327,6 @@ dependencies = [
  "flacenc",
  "futures-util",
  "hound",
- "mdns-sd",
  "parking_lot",
  "rust_cast",
  "serde",

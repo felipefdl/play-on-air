@@ -118,7 +118,14 @@ async fn maintain_airplay(registry: &DeviceRegistry, config: &Config, airplay: &
     }
     let name = airplay_name_with_id(&device.name, &device.id, config);
     let _inserted = desired.insert(device.id.clone());
-    airplay.ensure(&device.id, &name).await?;
+    if let Err(err) = airplay.ensure(&device.id, &name).await {
+      tracing::error!(
+        id = %device.id,
+        airplay_name = %name,
+        error = %err,
+        "failed to advertise AirPlay 2 receiver"
+      );
+    }
   }
 
   for active in airplay.active_ids() {

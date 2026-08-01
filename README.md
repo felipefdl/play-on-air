@@ -9,14 +9,16 @@ See [VISION.md](VISION.md) for product intent and non-goals.
 ## Quick start
 
 ```bash
-# From the repository root (Rust 1.88+):
+# From the repository root (Rust 1.88+, macOS with Bonjour / dns-sd):
 cargo run -p play-on-air
 
 # Or after install:
 play-on-air
 ```
 
-No config file and no flags are required. PlayOnAir discovers Chromecasts on the LAN, advertises each as an AirPlay 2 speaker, and bridges audio when you pick one from iPhone, iPad, or Mac.
+No config file and no flags are required. PlayOnAir discovers Chromecasts on the LAN via system `dns-sd`, advertises each as an AirPlay 2 speaker, and bridges audio when you pick one from iPhone, iPad, or Mac.
+
+**macOS:** keep the process running on a machine on the same LAN as the Chromecasts and the iPhone. Allow **Local Network** access if macOS prompts for the binary. On the iPhone Control Center AirPlay list, look for names matching your Cast devices (for example speaker names from the Google Home app).
 
 ## Optional config
 

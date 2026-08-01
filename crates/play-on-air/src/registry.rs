@@ -98,8 +98,12 @@ impl DeviceRegistry {
   }
 }
 
-/// Default TTL for registry entries without a fresh mDNS sighting.
-pub const DEFAULT_STALE_TTL: Duration = Duration::from_secs(90);
+/// Default TTL for registry entries without a re-sighting.
+///
+/// System DNS-SD often fires `Added` once until `Removed`. A short TTL was
+/// withdrawing live Chromecasts and their AirPlay ads after ~90s. Use a long
+/// safety net; primary removal is still `ServiceRemoved`.
+pub const DEFAULT_STALE_TTL: Duration = Duration::from_secs(86_400);
 
 #[cfg(test)]
 mod tests {
@@ -143,13 +147,13 @@ mod tests {
   fn expire_stale_removes_old_devices() {
     let reg = DeviceRegistry::new();
     let mut old = sample("stale", "Stale");
-    old.last_seen = Instant::now().checked_sub(Duration::from_secs(120)).expect("clock");
+    old.last_seen = Instant::now().checked_sub(Duration::from_secs(86_400 + 60)).expect("clock");
     reg.appear(old);
     reg.appear(sample("fresh", "Fresh"));
 
-    let removed = reg.expire_stale(Duration::from_secs(90));
+    let removed = reg.expire_stale(DEFAULT_STALE_TTL);
     assert_eq!(removed.len(), 1);
-    assert_eq!(removed[0].id, "stale");
+    assert_eq!(removed.first().map(|d| d.id.as_str()), Some("stale"));
     assert_eq!(reg.len(), 1);
     assert!(reg.get("fresh").is_some());
     assert!(reg.get("stale").is_none());
