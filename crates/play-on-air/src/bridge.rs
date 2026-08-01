@@ -84,9 +84,9 @@ impl Bridge {
   ) {
     while let Some(event) = events.recv().await {
       match event {
-        AirPlaySessionEvent::Started { device_id, sample_rate, channels } => {
+        AirPlaySessionEvent::Started { device_id, sample_rate, ring } => {
           if let Err(err) = self
-            .handle_session_start(&device_id, sample_rate, channels, Arc::clone(&rings))
+            .handle_session_start(&device_id, sample_rate, ring, Arc::clone(&rings))
             .await
           {
             tracing::error!(%device_id, error = %err, "failed to start Cast bridge session");
@@ -106,9 +106,21 @@ impl Bridge {
     &self,
     device_id: &str,
     sample_rate: u32,
-    channels: u16,
+    ring: Arc<PcmRing>,
     rings: Arc<dyn RingLookup>,
   ) -> Result<()> {
+    let is_current = |expected: &Arc<PcmRing>| -> bool {
+      rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, expected))
+    };
+
+    // A stale Started means the client already restarted the stream (a fresh
+    // event with the rebuilt ring is queued behind this one) or the receiver
+    // was withdrawn. Skip instead of bridging a ring that no longer feeds.
+    if !is_current(&ring) {
+      tracing::info!(%device_id, "skipping stale AirPlay session start (ring rebuilt or receiver gone)");
+      return Ok(());
+    }
+
     // Tear down any previous session for this device first.
     self.handle_session_end(device_id).await;
 
@@ -117,22 +129,16 @@ impl Bridge {
       .get(device_id)
       .ok_or_else(|| Error::Bridge(format!("unknown device {device_id}")))?;
 
-    let ring = rings
-      .ring_for(device_id)
-      .ok_or_else(|| Error::Bridge(format!("no PCM ring for {device_id}")))?;
-
-    // The ring is rebuilt in `audio_init` for the stream format, so it must
-    // agree with the event; its layout is what the WAV header advertises.
+    // The ring comes from the same `audio_init` that emitted this event; its
+    // layout is what the WAV header advertises.
     let stream_channels = ring.channels().max(1);
     let stream_rate = sample_rate.max(1);
 
-    if stream_channels != channels.max(1) {
-      return Err(Error::Bridge(format!(
-        "channel mismatch: ring={stream_channels} event={channels}"
-      )));
-    }
-
     for _ in 0..PREBUFFER_POLLS {
+      if !is_current(&ring) {
+        tracing::info!(%device_id, "session restarted during prebuffer; skipping stale start");
+        return Ok(());
+      }
       if ring.available_frames() >= PREBUFFER_FRAMES {
         break;
       }
@@ -144,6 +150,11 @@ impl Bridge {
     }
 
     verify_flac_snapshot(&ring, stream_channels, stream_rate);
+
+    if !is_current(&ring) {
+      tracing::info!(%device_id, "session restarted before Cast load; skipping stale start");
+      return Ok(());
+    }
 
     // Route media URL via the interface that can reach this Cast device.
     let host = advertise_host_for_peer(&device.host);
@@ -402,6 +413,48 @@ mod tests {
     }
     let text = String::from_utf8_lossy(&buf);
     text.contains("200")
+  }
+
+  struct FixedRingLookup {
+    current: Option<Arc<PcmRing>>,
+  }
+
+  impl RingLookup for FixedRingLookup {
+    fn ring_for(&self, _device_id: &str) -> Option<Arc<PcmRing>> {
+      self.current.clone()
+    }
+  }
+
+  #[tokio::test]
+  async fn stale_session_start_skips_without_prebuffer_or_session() {
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new()));
+    let event_ring = Arc::new(PcmRing::new(2, 64));
+    let rebuilt_ring = Arc::new(PcmRing::new(2, 64));
+    let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(rebuilt_ring) });
+
+    let start = Instant::now();
+    bridge
+      .handle_session_start("dev-1", 48_000, event_ring, rings)
+      .await
+      .expect("stale start skips cleanly");
+    assert!(
+      start.elapsed() < Duration::from_secs(1),
+      "stale start must not prebuffer or Cast-load"
+    );
+    assert!(bridge.sessions.lock().is_empty());
+  }
+
+  #[tokio::test]
+  async fn session_start_with_receiver_gone_skips() {
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new()));
+    let event_ring = Arc::new(PcmRing::new(2, 64));
+    let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: None });
+
+    bridge
+      .handle_session_start("dev-1", 48_000, event_ring, rings)
+      .await
+      .expect("withdrawn receiver skips cleanly");
+    assert!(bridge.sessions.lock().is_empty());
   }
 
   #[test]

@@ -28,8 +28,13 @@ pub enum AirPlaySessionEvent {
     device_id: String,
     /// Sample rate of the decoded PCM stream.
     sample_rate: u32,
-    /// Channel count of the decoded PCM stream.
-    channels: u16,
+    /// Ring receiving this stream's decoded PCM (rebuilt per `audio_init`).
+    ///
+    /// Carrying the ring pins the event to its stream: if the client restarts
+    /// quickly, the bridge can detect a stale `Started` by comparing this ring
+    /// against the receiver's current one instead of wiring the new ring (and
+    /// possibly a different sample rate) to the old event.
+    ring: Arc<PcmRing>,
   },
   /// Client disconnected; bridge should Cast-STOP and drop media.
   Ended {
@@ -99,7 +104,7 @@ impl AudioHandler for RingHandler {
       drop(tx.send(AirPlaySessionEvent::Started {
         device_id: self.state.device_id.clone(),
         sample_rate,
-        channels,
+        ring: Arc::clone(&ring),
       }));
     }
     Box::new(RingSession { ring })
@@ -291,7 +296,10 @@ pub fn stable_hwaddr(device_id: &str) -> [u8; 6] {
   mac
 }
 
-/// Unique RAOP listen port in `5100..6099` derived from `device_id`.
+/// Stable RAOP listen port in `5100..=6099` derived from `device_id`.
+///
+/// shairplay auto-senses upward (and advertises the actual port) if the
+/// derived port is already bound, so collisions only shift the port.
 pub fn stable_raop_port(device_id: &str) -> u16 {
   let h = hash_device_id(device_id);
   let offset = (h % RAOP_PORT_SPAN) as u16;
