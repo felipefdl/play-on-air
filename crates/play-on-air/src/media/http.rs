@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use parking_lot::RwLock;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::sleep;
 
 use crate::audio::{PcmRing, continuous_wav_header};
@@ -29,7 +29,11 @@ const LIVE_UNDERRUN_SLEEP: Duration = Duration::from_millis(5);
 /// Silence frames prepended so Nest/Chromecast can buffer before real PCM.
 const SILENCE_PREROLL_FRAMES: usize = 24_000; // ~0.5 s at 48 kHz; scaled by rate in stream
 /// Content-Length matches continuous WAV data size + 44-byte header (avoids chunked TE).
-const LIVE_CONTENT_LENGTH: u64 = (u32::MAX / 2) as u64 + 44;
+pub(crate) const LIVE_CONTENT_LENGTH: u64 = (u32::MAX / 2) as u64 + 44;
+/// Stop serving this many bytes before [`LIVE_CONTENT_LENGTH`] so hyper never hits the hard cap.
+///
+/// Sized for several max PCM chunks (`LIVE_CHUNK_FRAMES` × channels × 2).
+const LIVE_ROLLOVER_MARGIN: u64 = 65_536;
 
 /// What the media server currently serves at `/stream`.
 #[derive(Debug, Clone, Default)]
@@ -55,6 +59,46 @@ pub enum MediaContent {
   Empty,
 }
 
+/// Signals that a `LiveWav` body ended near its Content-Length cap and needs Cast re-LOAD.
+#[derive(Debug, Default)]
+pub struct RolloverSignal {
+  count: AtomicU64,
+  notify: Notify,
+}
+
+impl RolloverSignal {
+  /// Bump the rollover counter and wake waiters.
+  pub fn signal(&self) {
+    let _prev = self.count.fetch_add(1, Ordering::AcqRel);
+    self.notify.notify_waiters();
+  }
+
+  /// Current rollover count (monotonic for this media server lifetime).
+  pub fn count(&self) -> u64 {
+    self.count.load(Ordering::Acquire)
+  }
+
+  /// Wait until the rollover count is strictly greater than `seen`, then return the new count.
+  ///
+  /// Registers the `Notify` waiter **before** the second count check so a `signal()` between
+  /// the first check and registration cannot be lost (`notify_waiters` stores no permit).
+  pub async fn wait_past(&self, seen: u64) -> u64 {
+    loop {
+      let before = self.count.load(Ordering::Acquire);
+      if before > seen {
+        return before;
+      }
+      // Register first, then re-check — standard Notify lost-wakeup avoidance.
+      let notified = self.notify.notified();
+      let after = self.count.load(Ordering::Acquire);
+      if after > seen {
+        return after;
+      }
+      notified.await;
+    }
+  }
+}
+
 #[derive(Clone)]
 struct AppState {
   content: Arc<RwLock<MediaContent>>,
@@ -63,6 +107,14 @@ struct AppState {
   /// Cast clients sometimes probe `/stream` and then issue the real request;
   /// two live bodies popping the same ring would split frames between them.
   live_generation: Arc<AtomicU64>,
+  /// Max bytes a single `LiveWav` body will produce before clean end + rollover signal.
+  ///
+  /// Production default is [`LIVE_CONTENT_LENGTH`]; tests may lower it.
+  max_body_bytes: Arc<AtomicU64>,
+  /// Bytes emitted by the active `LiveWav` body (reset on each new generation).
+  bytes_served: Arc<AtomicU64>,
+  /// Notifies the bridge when a `LiveWav` body ends for Content-Length rollover.
+  rollover: Arc<RolloverSignal>,
 }
 
 /// Running media server handle with public base URL.
@@ -74,6 +126,9 @@ pub struct MediaServerHandle {
   pub addr: SocketAddr,
   /// Shared content slot for the active stream.
   content: Arc<RwLock<MediaContent>>,
+  max_body_bytes: Arc<AtomicU64>,
+  bytes_served: Arc<AtomicU64>,
+  rollover: Arc<RolloverSignal>,
   shutdown_tx: Option<oneshot::Sender<()>>,
   serve_task: tokio::task::JoinHandle<()>,
 }
@@ -87,6 +142,21 @@ impl MediaServerHandle {
   /// Replace the body served at `/stream`.
   pub fn set_content(&self, content: MediaContent) {
     *self.content.write() = content;
+  }
+
+  /// Shared rollover signal for bridge re-LOAD loops.
+  pub fn rollover_signal(&self) -> Arc<RolloverSignal> {
+    Arc::clone(&self.rollover)
+  }
+
+  /// Bytes emitted by the current `LiveWav` body (observability; reset on each GET generation).
+  pub fn bytes_served(&self) -> u64 {
+    self.bytes_served.load(Ordering::Acquire)
+  }
+
+  /// Override the `LiveWav` body byte cap (tests inject a tiny limit; production keeps default).
+  pub fn set_max_body_bytes(&self, max_body_bytes: u64) {
+    self.max_body_bytes.store(max_body_bytes.max(44), Ordering::Release);
   }
 
   /// Shut down the HTTP server task.
@@ -125,9 +195,15 @@ impl MediaServer {
       .map_err(|err| Error::Media(format!("local_addr failed: {err}")))?;
 
     let content = Arc::new(RwLock::new(MediaContent::Empty));
+    let max_body_bytes = Arc::new(AtomicU64::new(LIVE_CONTENT_LENGTH));
+    let bytes_served = Arc::new(AtomicU64::new(0));
+    let rollover = Arc::new(RolloverSignal::default());
     let state = AppState {
       content: Arc::clone(&content),
       live_generation: Arc::new(AtomicU64::new(0)),
+      max_body_bytes: Arc::clone(&max_body_bytes),
+      bytes_served: Arc::clone(&bytes_served),
+      rollover: Arc::clone(&rollover),
     };
 
     let app = Router::new()
@@ -159,6 +235,9 @@ impl MediaServer {
       base_url,
       addr,
       content,
+      max_body_bytes,
+      bytes_served,
+      rollover,
       shutdown_tx: Some(shutdown_tx),
       serve_task,
     })
@@ -180,18 +259,37 @@ async fn serve_stream(State(state): State<AppState>) -> Response {
       if generation > 1 {
         tracing::info!(generation, "new LiveWav request supersedes previous body");
       }
-      live_wav_response(ring, channels, sample_rate, Arc::clone(&state.live_generation), generation)
+      // Fresh body accounting for this GET generation.
+      state.bytes_served.store(0, Ordering::Release);
+      let max_body_bytes = state.max_body_bytes.load(Ordering::Acquire);
+      live_wav_response(
+        ring,
+        channels,
+        sample_rate,
+        Arc::clone(&state.live_generation),
+        generation,
+        max_body_bytes,
+        Arc::clone(&state.bytes_served),
+        Arc::clone(&state.rollover),
+      )
     },
     MediaContent::Empty => (StatusCode::NO_CONTENT, "no stream").into_response(),
   }
 }
 
+#[expect(
+  clippy::too_many_arguments,
+  reason = "live stream wiring carries generation, caps, and rollover signal explicitly"
+)]
 fn live_wav_response(
   ring: Arc<PcmRing>,
   channels: u16,
   sample_rate: u32,
   live_generation: Arc<AtomicU64>,
   generation: u64,
+  max_body_bytes: u64,
+  bytes_served: Arc<AtomicU64>,
+  rollover: Arc<RolloverSignal>,
 ) -> Response {
   let ch = channels.max(1);
   let rate = sample_rate.max(1);
@@ -205,14 +303,27 @@ fn live_wav_response(
 
   // ~0.5 s of silence at the stream sample rate (Nest needs a buffer burst).
   let preroll_frames = silence_preroll_frames(rate);
+  let threshold = live_body_threshold(max_body_bytes);
   tracing::info!(
     channels = ch,
     sample_rate = rate,
     preroll_frames,
+    max_body_bytes,
+    threshold,
     "Cast client pulling LiveWav stream"
   );
 
-  let stream = live_wav_byte_stream(ring, ch, header, preroll_frames, live_generation, generation);
+  let stream = live_wav_byte_stream(
+    ring,
+    ch,
+    header,
+    preroll_frames,
+    live_generation,
+    generation,
+    threshold,
+    bytes_served,
+    rollover,
+  );
   let mut response = Body::from_stream(stream).into_response();
   drop(
     response
@@ -221,6 +332,9 @@ fn live_wav_response(
   );
   // Nest/Chromecast often fail on chunked-only progressive audio. Advertise a
   // large Content-Length matching the continuous WAV header data size.
+  //
+  // The body ends at `threshold` (slightly before this value) so hyper never hits
+  // the hard cap mid-chunk; the bridge then re-LOADs for a fresh GET.
   if let Ok(val) = header::HeaderValue::from_str(&LIVE_CONTENT_LENGTH.to_string()) {
     drop(response.headers_mut().insert(header::CONTENT_LENGTH, val));
   }
@@ -233,6 +347,13 @@ fn live_wav_response(
   response
 }
 
+/// Byte count at which a `LiveWav` body ends cleanly and signals Cast re-LOAD.
+pub(crate) fn live_body_threshold(max_body_bytes: u64) -> u64 {
+  let capped = max_body_bytes.max(44);
+  let margin = LIVE_ROLLOVER_MARGIN.min(capped / 4);
+  capped.saturating_sub(margin).max(44)
+}
+
 /// ~0.5 s of silence frames at `sample_rate`.
 fn silence_preroll_frames(sample_rate: u32) -> usize {
   // Scale default 48 kHz constant to the stream rate.
@@ -242,6 +363,10 @@ fn silence_preroll_frames(sample_rate: u32) -> usize {
 }
 
 /// Progressive async stream: WAV header, silence preroll, then PCM from the ring.
+#[expect(
+  clippy::too_many_arguments,
+  reason = "stream state is assembled once; splitting would obscure the data path"
+)]
 fn live_wav_byte_stream(
   ring: Arc<PcmRing>,
   channels: u16,
@@ -249,6 +374,9 @@ fn live_wav_byte_stream(
   preroll_frames: usize,
   live_generation: Arc<AtomicU64>,
   generation: u64,
+  threshold: u64,
+  bytes_served: Arc<AtomicU64>,
+  rollover: Arc<RolloverSignal>,
 ) -> impl stream::Stream<Item = std::result::Result<Bytes, Infallible>> + Send {
   let header_bytes = Bytes::copy_from_slice(&header);
   let initial = LiveStreamState {
@@ -259,23 +387,36 @@ fn live_wav_byte_stream(
     channels,
     live_generation,
     generation,
+    bytes_sent: 0,
+    threshold,
+    bytes_served,
+    rollover,
   };
 
   stream::unfold(initial, |mut live| async move {
     if live.is_superseded() {
       return None;
     }
+    if live.bytes_sent >= live.threshold {
+      live.signal_rollover();
+      return None;
+    }
 
     if let Some(hdr) = live.header.take() {
-      return Some((Ok(hdr), live));
+      return Some(live.emit_chunk(hdr));
     }
 
     if live.preroll_frames_left > 0 {
       let n = live.preroll_frames_left.min(LIVE_CHUNK_FRAMES);
-      live.preroll_frames_left = live.preroll_frames_left.saturating_sub(n);
       let samples = n.saturating_mul(usize::from(live.channels));
+      let chunk_bytes = samples.saturating_mul(2) as u64;
+      if live.bytes_sent.saturating_add(chunk_bytes) > live.threshold {
+        live.signal_rollover();
+        return None;
+      }
+      live.preroll_frames_left = live.preroll_frames_left.saturating_sub(n);
       let silence = vec![0_i16; samples];
-      return Some((Ok(i16_slice_to_le_bytes(&silence)), live));
+      return Some(live.emit_chunk(i16_slice_to_le_bytes(&silence)));
     }
 
     loop {
@@ -284,14 +425,34 @@ fn live_wav_byte_stream(
       if live.is_superseded() {
         return None;
       }
-      let frames = live.ring.pop_i16(LIVE_CHUNK_FRAMES, &mut live.i16_buf);
+      if live.bytes_sent >= live.threshold {
+        live.signal_rollover();
+        return None;
+      }
+      // Budget frames *before* pop so we never drop already-popped PCM at the cap.
+      let remaining = live.threshold.saturating_sub(live.bytes_sent);
+      let bytes_per_frame = u64::from(live.channels).saturating_mul(2);
+      if bytes_per_frame == 0 {
+        return None;
+      }
+      let max_frames_fit = usize::try_from(remaining / bytes_per_frame).unwrap_or(0);
+      if max_frames_fit == 0 {
+        live.signal_rollover();
+        return None;
+      }
+      let want_frames = LIVE_CHUNK_FRAMES.min(max_frames_fit);
+      let frames = live.ring.pop_i16(want_frames, &mut live.i16_buf);
       if frames == 0 {
         // Brief underrun: keep the HTTP body open for Cast progressive pull.
         sleep(LIVE_UNDERRUN_SLEEP).await;
         continue;
       }
+      // After pop: if a newer GET owns the ring, drop this chunk (unavoidable on supersede).
+      if live.is_superseded() {
+        return None;
+      }
       let chunk = i16_slice_to_le_bytes(&live.i16_buf);
-      return Some((Ok(chunk), live));
+      return Some(live.emit_chunk(chunk));
     }
   })
 }
@@ -304,12 +465,33 @@ struct LiveStreamState {
   channels: u16,
   live_generation: Arc<AtomicU64>,
   generation: u64,
+  bytes_sent: u64,
+  threshold: u64,
+  bytes_served: Arc<AtomicU64>,
+  rollover: Arc<RolloverSignal>,
 }
 
 impl LiveStreamState {
   /// True when a newer `/stream` GET owns the ring, so this body must end.
   fn is_superseded(&self) -> bool {
     self.live_generation.load(Ordering::Acquire) != self.generation
+  }
+
+  fn signal_rollover(&self) {
+    tracing::info!(
+      bytes_sent = self.bytes_sent,
+      threshold = self.threshold,
+      generation = self.generation,
+      "LiveWav body ending for Content-Length rollover"
+    );
+    self.rollover.signal();
+  }
+
+  fn emit_chunk(mut self, chunk: Bytes) -> (std::result::Result<Bytes, Infallible>, Self) {
+    let n = chunk.len() as u64;
+    self.bytes_sent = self.bytes_sent.saturating_add(n);
+    self.bytes_served.store(self.bytes_sent, Ordering::Release);
+    (Ok(chunk), self)
   }
 }
 
@@ -324,6 +506,39 @@ fn i16_slice_to_le_bytes(samples: &[i16]) -> Bytes {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn live_body_threshold_keeps_margin_under_content_length() {
+    let threshold = live_body_threshold(LIVE_CONTENT_LENGTH);
+    assert!(threshold < LIVE_CONTENT_LENGTH);
+    assert!(LIVE_CONTENT_LENGTH - threshold <= LIVE_ROLLOVER_MARGIN);
+    assert!(threshold >= 44);
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn wait_past_does_not_lose_wakeup_under_concurrent_signal() {
+    // Stress the register-then-recheck pattern. A lost wakeup hangs until timeout.
+    let signal = Arc::new(RolloverSignal::default());
+    for seen in 0..64_u64 {
+      let waiter_signal = Arc::clone(&signal);
+      let waiter = tokio::spawn(async move { waiter_signal.wait_past(seen).await });
+      // Give the waiter a chance to observe `seen` and arm Notify before we signal.
+      tokio::task::yield_now().await;
+      signal.signal();
+      let advanced = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("wait_past must not hang (lost Notify wakeup)")
+        .expect("waiter join");
+      assert!(advanced > seen, "count must advance past {seen}, got {advanced}");
+    }
+  }
+
+  #[test]
+  fn live_body_threshold_scales_for_tiny_test_caps() {
+    let threshold = live_body_threshold(1_000);
+    assert!(threshold < 1_000);
+    assert!(threshold >= 44);
+  }
 
   #[tokio::test]
   async fn serves_static_flac_bytes() {
@@ -372,6 +587,122 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn live_wav_byte_stream_ends_at_threshold_and_signals_rollover() {
+    use crate::audio::continuous_wav_header;
+    use futures_util::StreamExt;
+
+    let ring = Arc::new(PcmRing::new(2, 4_096));
+    let live_generation = Arc::new(AtomicU64::new(1));
+    let bytes_served = Arc::new(AtomicU64::new(0));
+    let rollover = Arc::new(RolloverSignal::default());
+    let header = continuous_wav_header(2, 48_000).expect("header");
+    let threshold = live_body_threshold(800);
+    let stream = live_wav_byte_stream(
+      ring,
+      2,
+      header,
+      silence_preroll_frames(48_000),
+      live_generation,
+      1,
+      threshold,
+      Arc::clone(&bytes_served),
+      Arc::clone(&rollover),
+    );
+    tokio::pin!(stream);
+
+    let mut total = 0_u64;
+    let mut first_chunk: Option<Bytes> = None;
+    while let Some(item) = stream.next().await {
+      let chunk = item.expect("infallible stream");
+      if first_chunk.is_none() {
+        first_chunk = Some(chunk.clone());
+      }
+      total = total.saturating_add(chunk.len() as u64);
+    }
+
+    let header_chunk = first_chunk.expect("at least the WAV header");
+    assert!(header_chunk.len() >= 44);
+    assert_eq!(&header_chunk[..4], b"RIFF");
+    assert!(total >= 44 && total <= threshold, "total={total} threshold={threshold}");
+    assert_eq!(rollover.count(), 1, "exactly one rollover signal when body ends at cap");
+    assert_eq!(bytes_served.load(Ordering::Acquire), total);
+  }
+
+  #[tokio::test]
+  async fn live_wav_does_not_discard_pcm_when_nearing_threshold() {
+    use crate::audio::continuous_wav_header;
+    use futures_util::StreamExt;
+
+    // Header only + tiny PCM budget: old code popped a full chunk then discarded it at cap.
+    let ring = Arc::new(PcmRing::new(2, 16_384));
+    let frames_pushed = 1_000_usize;
+    let mut samples = Vec::with_capacity(frames_pushed.saturating_mul(2));
+    for _ in 0..frames_pushed {
+      samples.push(0.25);
+      samples.push(-0.25);
+    }
+    ring.push_f32(&samples);
+
+    let live_generation = Arc::new(AtomicU64::new(1));
+    let bytes_served = Arc::new(AtomicU64::new(0));
+    let rollover = Arc::new(RolloverSignal::default());
+    let header = continuous_wav_header(2, 48_000).expect("header");
+    // 44-byte header + 100 bytes PCM = 25 stereo frames max after header.
+    let threshold = 44 + 100;
+    let stream = live_wav_byte_stream(
+      Arc::clone(&ring),
+      2,
+      header,
+      0, // no silence preroll — exercise real PCM near the cap
+      live_generation,
+      1,
+      threshold,
+      bytes_served,
+      Arc::clone(&rollover),
+    );
+    tokio::pin!(stream);
+    let mut total = 0_u64;
+    while let Some(item) = stream.next().await {
+      total = total.saturating_add(item.expect("infallible").len() as u64);
+    }
+
+    assert!(total <= threshold, "total={total} threshold={threshold}");
+    assert_eq!(rollover.count(), 1);
+    let left = ring.available_frames();
+    // 25 frames fit after header; must not have dropped a full 1024-frame pop.
+    assert!(
+      left > 500,
+      "nearing threshold must pop only what fits; discarded PCM left ring empty-ish (left={left})"
+    );
+  }
+
+  #[tokio::test]
+  async fn live_wav_http_with_tiny_cap_signals_rollover() {
+    let ring = Arc::new(PcmRing::new(2, 4_096));
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    // Tiny cap so preroll silence alone ends the body without multi-hour runtime.
+    handle.set_max_body_bytes(800);
+    handle.set_content(MediaContent::LiveWav { ring, channels: 2, sample_rate: 48_000 });
+
+    let before = handle.rollover_signal().count();
+    let rollover = handle.rollover_signal();
+    let url = handle.stream_url();
+
+    // Drive the body over HTTP; with a tiny cap the stream ends and signals rollover.
+    // Peer may RST when Content-Length exceeds the early-ended body — that is fine;
+    // the bridge observes the rollover signal, not a perfect HTTP body length.
+    let pull = tokio::spawn(async move {
+      drop(http_get_body_until_eof(&url, Duration::from_secs(5)).await);
+    });
+    let signaled = tokio::time::timeout(Duration::from_secs(5), rollover.wait_past(before)).await;
+    assert!(signaled.is_ok(), "HTTP LiveWav must signal rollover under tiny cap");
+    assert!(handle.bytes_served() > 0, "server must have emitted at least the WAV header");
+    assert!(handle.bytes_served() <= live_body_threshold(800));
+    drop(pull.await);
+    handle.shutdown();
+  }
+
+  #[tokio::test]
   async fn second_live_get_ends_first_body() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -408,6 +739,8 @@ mod tests {
     })
     .await;
     assert!(ended.is_ok(), "superseded LiveWav body must end");
+    // Supersede must not look like a Content-Length rollover.
+    assert_eq!(handle.rollover_signal().count(), 0, "supersede must not signal rollover");
     handle.shutdown();
   }
 
@@ -453,6 +786,45 @@ mod tests {
     } else {
       raw_body.to_vec()
     }
+  }
+
+  /// Read until the server ends the body (EOF), with a timeout.
+  ///
+  /// Returns `None` if the deadline expires or the peer closes before HTTP headers arrive
+  /// (hyper may reset when `Content-Length` exceeds the early-ended `LiveWav` body).
+  async fn http_get_body_until_eof(url: &str, timeout: Duration) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let without_scheme = url.strip_prefix("http://").expect("http");
+    let (host_port, raw_path) = without_scheme.split_once('/').expect("path");
+    let request_path = format!("/{raw_path}");
+
+    tokio::time::timeout(timeout, async {
+      let mut stream = TcpStream::connect(host_port).await.expect("connect");
+      let req = format!("GET {request_path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+      stream.write_all(req.as_bytes()).await.expect("write");
+
+      let mut buf = Vec::new();
+      let mut tmp = [0_u8; 4096];
+      loop {
+        match stream.read(&mut tmp).await {
+          Ok(0) | Err(_) => break,
+          Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+      }
+      let split = find_header_end(&buf)?;
+      let headers = buf.get(..split).unwrap_or(&[]);
+      let raw_body = buf.get(split..).unwrap_or(&[]);
+      if headers_indicate_chunked(headers) {
+        Some(decode_chunked_prefix(raw_body, raw_body.len()))
+      } else {
+        Some(raw_body.to_vec())
+      }
+    })
+    .await
+    .ok()
+    .flatten()
   }
 
   fn find_header_end(buf: &[u8]) -> Option<usize> {
