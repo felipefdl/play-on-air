@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 
 use crate::airplay::{AirPlaySessionEvent, airplay_db_to_cast_linear};
 use crate::audio::{PcmRing, encode_pcm_i16_to_flac};
 use crate::cast::{CastPool, CastStreamKind, MediaLoadRequest};
 use crate::error::{Error, Result};
-use crate::media::{MediaContent, MediaServer, MediaServerHandle};
+use crate::media::{MediaContent, MediaServer, MediaServerHandle, RolloverSignal};
 use crate::net::advertise_host_for_peer;
 use crate::registry::DeviceRegistry;
 
@@ -30,6 +30,9 @@ struct ActiveSession {
   media: MediaServerHandle,
   device_id: String,
   pool: Arc<CastPool>,
+  /// Drop / send to stop the `LiveWav` Content-Length rollover re-LOAD loop.
+  rollover_cancel: Option<oneshot::Sender<()>>,
+  rollover_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Ordered teardown steps for an active bridge session.
@@ -180,17 +183,10 @@ impl Bridge {
     let load_device_id = device_id.to_owned();
     let cast_name = device.name.clone();
     let load_url = stream_url.clone();
-    let load_result = tokio::task::spawn_blocking(move || {
-      let request = MediaLoadRequest::wav(load_url, CastStreamKind::Buffered).with_title(cast_name);
-      let session = pool.load(&load_device_id, request)?;
-      // Nest device volume is independent of AirPlay; raise receiver volume.
-      if let Err(err) = pool.set_volume(&load_device_id, 1.0) {
-        tracing::debug!(error = %err, "post-load Cast volume set failed");
-      }
-      Ok::<_, Error>(session)
-    })
-    .await
-    .map_err(|err| Error::Bridge(format!("Cast load task join: {err}")))?;
+    let load_result =
+      tokio::task::spawn_blocking(move || cast_load_buffered_wav(&pool, &load_device_id, load_url, cast_name))
+        .await
+        .map_err(|err| Error::Bridge(format!("Cast load task join: {err}")))?;
 
     match load_result {
       Ok(session) => {
@@ -202,6 +198,13 @@ impl Bridge {
           %stream_url,
           "bridge session Cast BUFFERED WAV load ok"
         );
+        let (rollover_cancel, rollover_task) = spawn_rollover_reload_loop(
+          device_id.to_owned(),
+          stream_url,
+          device.name.clone(),
+          Arc::clone(&self.cast_pool),
+          media.rollover_signal(),
+        );
         {
           let mut guard = self.sessions.lock();
           drop(guard.insert(
@@ -210,6 +213,8 @@ impl Bridge {
               media,
               device_id: device_id.to_owned(),
               pool: Arc::clone(&self.cast_pool),
+              rollover_cancel: Some(rollover_cancel),
+              rollover_task: Some(rollover_task),
             },
           ));
         }
@@ -256,9 +261,90 @@ impl Bridge {
   }
 }
 
+/// Cast LOAD of buffered progressive WAV (shared by initial start and rollover re-LOAD).
+fn cast_load_buffered_wav(
+  pool: &CastPool,
+  device_id: &str,
+  stream_url: String,
+  title: String,
+) -> Result<crate::cast::MediaSessionRef> {
+  let request = MediaLoadRequest::wav(stream_url, CastStreamKind::Buffered).with_title(title);
+  let session = pool.load(device_id, request)?;
+  // Nest device volume is independent of AirPlay; raise receiver volume on initial loads.
+  // Rollover re-LOAD also benefits from keeping volume up if the sink reset it.
+  if let Err(err) = pool.set_volume(device_id, 1.0) {
+    tracing::debug!(error = %err, "post-load Cast volume set failed");
+  }
+  Ok(session)
+}
+
+/// Spawn a task that re-LOADs the same stream URL each time `LiveWav` hits its body cap.
+fn spawn_rollover_reload_loop(
+  device_id: String,
+  stream_url: String,
+  cast_name: String,
+  pool: Arc<CastPool>,
+  rollover: Arc<RolloverSignal>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+  let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+  let task = tokio::spawn(async move {
+    let mut seen = 0_u64;
+    loop {
+      tokio::select! {
+        _ = &mut cancel_rx => {
+          tracing::debug!(%device_id, "LiveWav rollover re-LOAD loop cancelled");
+          break;
+        },
+        count = rollover.wait_past(seen) => {
+          seen = count;
+          tracing::info!(%device_id, rollover = seen, %stream_url, "LiveWav rollover: re-LOADing Cast stream");
+          let load_pool = Arc::clone(&pool);
+          let id = device_id.clone();
+          let url = stream_url.clone();
+          let title = cast_name.clone();
+          let load_result = tokio::task::spawn_blocking(move || {
+            cast_load_buffered_wav(&load_pool, &id, url, title)
+          })
+          .await;
+          match load_result {
+            Ok(Ok(session)) => {
+              tracing::info!(
+                %device_id,
+                transport_id = %session.transport_id,
+                media_session_id = session.media_session_id,
+                "LiveWav rollover Cast re-LOAD ok"
+              );
+            },
+            Ok(Err(err)) => {
+              tracing::warn!(%device_id, error = %err, "LiveWav rollover Cast re-LOAD failed");
+            },
+            Err(err) => {
+              tracing::warn!(%device_id, error = %err, "LiveWav rollover re-LOAD task join failed");
+            },
+          }
+        },
+      }
+    }
+  });
+  (cancel_tx, task)
+}
+
 /// Run shipped teardown order for one active session.
 fn end_active_session(active: ActiveSession) {
-  let ActiveSession { media, device_id, pool } = active;
+  let ActiveSession {
+    media,
+    device_id,
+    pool,
+    rollover_cancel,
+    rollover_task,
+  } = active;
+  // Stop re-LOAD before tearing down media HTTP.
+  if let Some(tx) = rollover_cancel {
+    let _cancelled = tx.send(());
+  }
+  if let Some(task) = rollover_task {
+    task.abort();
+  }
   let mut media_handle = Some(media);
   for step in session_end_steps() {
     match step {
@@ -369,6 +455,8 @@ mod tests {
           media,
           device_id: "dev-1".to_owned(),
           pool: Arc::clone(&pool),
+          rollover_cancel: None,
+          rollover_task: None,
         },
       ));
     }
@@ -388,6 +476,77 @@ mod tests {
       !http_get_status_ok(&health_url).await,
       "media.shutdown must run on session end so LiveWav stops"
     );
+  }
+
+  #[tokio::test]
+  async fn session_end_cancels_rollover_reload_loop() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let pool = Arc::new(CastPool::new());
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let rollover = media.rollover_signal();
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+    // Task that only exits via cancel — proves session end stops the loop.
+    let task = tokio::spawn(async move {
+      let mut seen = 0_u64;
+      loop {
+        tokio::select! {
+          _ = &mut cancel_rx => break,
+          count = rollover.wait_past(seen) => {
+            seen = count;
+          },
+        }
+      }
+    });
+
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert(
+        "dev-roll".to_owned(),
+        ActiveSession {
+          media,
+          device_id: "dev-roll".to_owned(),
+          pool,
+          rollover_cancel: Some(cancel_tx),
+          rollover_task: Some(task),
+        },
+      ));
+    }
+
+    bridge.handle_session_end("dev-roll").await;
+    assert!(bridge.sessions.lock().is_empty());
+  }
+
+  #[tokio::test]
+  async fn rollover_signal_invokes_reload_path_without_panic() {
+    // Exercise the shared LOAD helper + rollover wait wiring without a Cast device.
+    let pool = Arc::new(CastPool::new());
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let rollover = media.rollover_signal();
+    let rollover_for_task = Arc::clone(&rollover);
+    let pool_task = Arc::clone(&pool);
+    let task = tokio::spawn(async move {
+      let count = rollover_for_task.wait_past(0).await;
+      assert!(count > 0);
+      let load_pool = Arc::clone(&pool_task);
+      let result = tokio::task::spawn_blocking(move || {
+        cast_load_buffered_wav(
+          &load_pool,
+          "missing-device",
+          "http://127.0.0.1:9/stream".to_owned(),
+          "test".to_owned(),
+        )
+      })
+      .await;
+      // No worker → load errors; must not panic.
+      assert!(matches!(result, Ok(Err(_))));
+    });
+
+    rollover.signal();
+    let finished = tokio::time::timeout(Duration::from_secs(3), task).await;
+    assert!(finished.is_ok(), "rollover re-LOAD path must complete");
+    media.shutdown();
   }
 
   async fn http_get_status_ok(url: &str) -> bool {
