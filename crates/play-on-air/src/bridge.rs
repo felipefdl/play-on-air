@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::airplay::{AirPlaySessionEvent, airplay_db_to_cast_linear};
@@ -26,6 +28,94 @@ const PREBUFFER_POLL: Duration = Duration::from_millis(50);
 const SNAPSHOT_FRAMES: usize = 2048;
 /// How long the main `run` loop waits for per-device workers after the event channel closes.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long teardown waits for an in-flight blocking Cast LOAD to finish.
+const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How Cast volume is applied after a progressive WAV LOAD.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LoadVolumePolicy {
+  /// Initial session start: force receiver volume to full (Nest device volume is independent).
+  InitialFull,
+  /// Content-Length rollover re-LOAD: re-apply last AirPlay linear volume, or skip if unknown.
+  Rollover { last_volume: Option<f32> },
+}
+
+/// Resolve the linear volume to set after LOAD, if any.
+const fn volume_after_load(policy: LoadVolumePolicy) -> Option<f32> {
+  match policy {
+    LoadVolumePolicy::InitialFull => Some(1.0),
+    LoadVolumePolicy::Rollover { last_volume } => last_volume,
+  }
+}
+
+/// Tracks per-device session workers; aborts all on drop so `Bridge::run` abort cannot leave zombies.
+struct DeviceWorkerSet {
+  senders: HashMap<String, mpsc::UnboundedSender<AirPlaySessionEvent>>,
+  set: JoinSet<()>,
+}
+
+impl DeviceWorkerSet {
+  fn new() -> Self {
+    Self {
+      senders: HashMap::new(),
+      set: JoinSet::new(),
+    }
+  }
+
+  fn spawn_worker(
+    &mut self,
+    bridge: Arc<Bridge>,
+    rings: Arc<dyn RingLookup>,
+    device_id: String,
+  ) -> mpsc::UnboundedSender<AirPlaySessionEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let worker_id = device_id.clone();
+    let _abort = self.set.spawn(async move {
+      device_worker_loop(bridge, rings, worker_id, rx).await;
+    });
+    let sender = tx.clone();
+    drop(self.senders.insert(device_id, tx));
+    sender
+  }
+
+  /// Drop inboxes, wait for workers to drain, then abort any still running.
+  async fn shutdown_graceful(&mut self) {
+    self.senders.clear();
+    let deadline = tokio::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+    while !self.set.is_empty() {
+      let now = tokio::time::Instant::now();
+      if now >= deadline {
+        tracing::warn!("device session workers join timed out; aborting remaining");
+        self.set.abort_all();
+        break;
+      }
+      let remaining = deadline - now;
+      match tokio::time::timeout(remaining, self.set.join_next()).await {
+        Ok(Some(Ok(()))) => {},
+        Ok(Some(Err(err))) => {
+          if !err.is_cancelled() {
+            tracing::warn!(error = %err, "device session worker panicked");
+          }
+        },
+        Ok(None) => break,
+        Err(_) => {
+          tracing::warn!("device session workers join timed out; aborting remaining");
+          self.set.abort_all();
+          break;
+        },
+      }
+    }
+    // Drain aborted / finished tasks so JoinSet drops cleanly.
+    while self.set.join_next().await.is_some() {}
+  }
+}
+
+impl Drop for DeviceWorkerSet {
+  fn drop(&mut self) {
+    self.senders.clear();
+    self.set.abort_all();
+  }
+}
 
 /// One live bridge session for a device.
 struct ActiveSession {
@@ -35,6 +125,12 @@ struct ActiveSession {
   /// Drop / send to stop the `LiveWav` Content-Length rollover re-LOAD loop.
   rollover_cancel: Option<oneshot::Sender<()>>,
   rollover_task: Option<tokio::task::JoinHandle<()>>,
+  /// Cleared first on teardown so late LOAD paths STOP instead of reviving playback.
+  session_alive: Arc<AtomicBool>,
+  /// Last AirPlay volume as Cast linear level (updated by volume events).
+  last_volume_linear: Arc<Mutex<Option<f32>>>,
+  /// In-flight blocking Cast LOAD (rollover); awaited on teardown before media STOP.
+  inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Ordered teardown steps for an active bridge session.
@@ -96,45 +192,40 @@ impl Bridge {
   /// Events are routed to a small per-`device_id` worker so one device's slow
   /// Cast LOAD cannot head-of-line-block another device. Ordering within a
   /// device (Started / Ended / Volume) remains sequential.
+  ///
+  /// Workers are tracked in a [`JoinSet`] and aborted when `run` returns or is
+  /// dropped/aborted, so nested tasks cannot outlive the bridge task as zombies.
   pub async fn run(
     self: Arc<Self>,
     mut events: mpsc::UnboundedReceiver<AirPlaySessionEvent>,
     rings: Arc<dyn RingLookup>,
   ) {
-    let mut device_workers: HashMap<String, mpsc::UnboundedSender<AirPlaySessionEvent>> = HashMap::new();
-    let mut worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut workers = DeviceWorkerSet::new();
 
     while let Some(event) = events.recv().await {
       let device_id = event_device_id(&event).to_owned();
-      let sender = device_workers.entry(device_id.clone()).or_insert_with(|| {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let bridge = Arc::clone(&self);
-        let rings_for_worker = Arc::clone(&rings);
-        let worker_id = device_id.clone();
-        worker_handles.push(tokio::spawn(async move {
-          device_worker_loop(bridge, rings_for_worker, worker_id, rx).await;
-        }));
-        tx
-      });
-      if sender.send(event).is_err() {
-        tracing::error!(%device_id, "device session worker dropped; event lost");
-        drop(device_workers.remove(&device_id));
+      if !workers.senders.contains_key(&device_id) {
+        let _tx = workers.spawn_worker(Arc::clone(&self), Arc::clone(&rings), device_id.clone());
+      }
+      let Some(sender) = workers.senders.get(&device_id).cloned() else {
+        tracing::error!(%device_id, "device session worker missing after spawn");
+        continue;
+      };
+      match sender.send(event) {
+        Ok(()) => {},
+        Err(mpsc::error::SendError(failed_event)) => {
+          // Dead worker: recreate and retry the same event (do not discard).
+          tracing::warn!(%device_id, "device session worker dropped; recreating and retrying event");
+          drop(workers.senders.remove(&device_id));
+          let tx = workers.spawn_worker(Arc::clone(&self), Arc::clone(&rings), device_id.clone());
+          if tx.send(failed_event).is_err() {
+            tracing::error!(%device_id, "device session worker failed to accept retried event");
+          }
+        },
       }
     }
 
-    // Close all worker inboxes so they drain and exit.
-    drop(device_workers);
-    for handle in worker_handles {
-      match tokio::time::timeout(WORKER_JOIN_TIMEOUT, handle).await {
-        Ok(Ok(())) => {},
-        Ok(Err(err)) => {
-          tracing::warn!(error = %err, "device session worker panicked");
-        },
-        Err(_) => {
-          tracing::warn!("device session worker join timed out");
-        },
-      }
-    }
+    workers.shutdown_graceful().await;
   }
 
   async fn handle_session_start(
@@ -175,19 +266,8 @@ impl Bridge {
     let stream_channels = ring.channels().max(1);
     let stream_rate = sample_rate.max(1);
 
-    for _ in 0..PREBUFFER_POLLS {
-      if !is_current(&ring) {
-        tracing::info!(%device_id, "session restarted during prebuffer; skipping stale start");
-        return Ok(());
-      }
-      if ring.available_frames() >= PREBUFFER_FRAMES {
-        break;
-      }
-      sleep(PREBUFFER_POLL).await;
-    }
-
-    if ring.available_frames() == 0 {
-      return Err(Error::Bridge("no PCM available at session start".to_owned()));
+    if !wait_for_prebuffer(device_id, &ring, rings.as_ref()).await? {
+      return Ok(());
     }
 
     verify_flac_snapshot(&ring, stream_channels, stream_rate);
@@ -197,6 +277,19 @@ impl Bridge {
       return Ok(());
     }
 
+    self
+      .start_cast_session(device_id, &device, ring, stream_channels, stream_rate)
+      .await
+  }
+
+  async fn start_cast_session(
+    &self,
+    device_id: &str,
+    device: &crate::registry::Device,
+    ring: Arc<PcmRing>,
+    stream_channels: u16,
+    stream_rate: u32,
+  ) -> Result<()> {
     // Route media URL via the interface that can reach this Cast device.
     let host = advertise_host_for_peer(&device.host);
     let media = MediaServer::start(&host).await?;
@@ -210,7 +303,7 @@ impl Bridge {
     );
 
     media.set_content(MediaContent::LiveWav {
-      ring: Arc::clone(&ring),
+      ring,
       channels: stream_channels,
       sample_rate: stream_rate,
     });
@@ -221,10 +314,11 @@ impl Bridge {
     let load_device_id = device_id.to_owned();
     let cast_name = device.name.clone();
     let load_url = stream_url.clone();
-    let load_result =
-      tokio::task::spawn_blocking(move || cast_load_buffered_wav(&pool, &load_device_id, load_url, cast_name))
-        .await
-        .map_err(|err| Error::Bridge(format!("Cast load task join: {err}")))?;
+    let load_result = tokio::task::spawn_blocking(move || {
+      cast_load_buffered_wav(&pool, &load_device_id, load_url, cast_name, LoadVolumePolicy::InitialFull)
+    })
+    .await
+    .map_err(|err| Error::Bridge(format!("Cast load task join: {err}")))?;
 
     match load_result {
       Ok(session) => {
@@ -236,12 +330,18 @@ impl Bridge {
           %stream_url,
           "bridge session Cast BUFFERED WAV load ok"
         );
+        let session_alive = Arc::new(AtomicBool::new(true));
+        let last_volume_linear = Arc::new(Mutex::new(None));
+        let inflight_load = Arc::new(Mutex::new(None));
         let (rollover_cancel, rollover_task) = spawn_rollover_reload_loop(
           device_id.to_owned(),
           stream_url,
           device.name.clone(),
           Arc::clone(&self.cast_pool),
           media.rollover_signal(),
+          Arc::clone(&session_alive),
+          Arc::clone(&last_volume_linear),
+          Arc::clone(&inflight_load),
         );
         {
           let mut guard = self.sessions.lock();
@@ -253,6 +353,9 @@ impl Bridge {
               pool: Arc::clone(&self.cast_pool),
               rollover_cancel: Some(rollover_cancel),
               rollover_task: Some(rollover_task),
+              session_alive,
+              last_volume_linear,
+              inflight_load,
             },
           ));
         }
@@ -274,28 +377,69 @@ impl Bridge {
     let Some(active) = removed else {
       return;
     };
+
+    // Mark dead first so an in-flight or just-finishing LOAD will STOP.
+    active.session_alive.store(false, Ordering::Release);
+
+    // Stop scheduling new re-LOADs, then join any blocking LOAD already running.
+    if let Some(tx) = active.rollover_cancel {
+      let _cancelled = tx.send(());
+    }
+    if let Some(task) = active.rollover_task {
+      task.abort();
+    }
+    let inflight = active.inflight_load.lock().take();
+    if let Some(handle) = inflight {
+      match tokio::time::timeout(INFLIGHT_LOAD_JOIN_TIMEOUT, handle).await {
+        Ok(Ok(())) => {},
+        Ok(Err(err)) if err.is_cancelled() => {},
+        Ok(Err(err)) => {
+          tracing::warn!(%device_id, error = %err, "in-flight Cast LOAD task panicked");
+        },
+        Err(_) => {
+          tracing::warn!(%device_id, "in-flight Cast LOAD join timed out");
+        },
+      }
+    }
+
     // Cast STOP can block up to its timeout; keep it off the runtime thread.
-    if tokio::task::spawn_blocking(move || end_active_session(active)).await.is_err() {
+    let media = active.media;
+    let pool = active.pool;
+    let end_device_id = active.device_id;
+    if tokio::task::spawn_blocking(move || end_media_and_cast_stop(media, &pool, &end_device_id))
+      .await
+      .is_err()
+    {
       tracing::warn!(%device_id, "session teardown task panicked");
     }
     tracing::info!(%device_id, "bridge session ended (media dropped; Cast STOP best-effort)");
   }
 
-  fn handle_volume(&self, device_id: &str, volume_db: f32) {
+  async fn handle_volume(&self, device_id: &str, volume_db: f32) {
     let level = airplay_db_to_cast_linear(volume_db);
     // Volume only applies while a bridge session is active for this device.
-    let has_session = self.sessions.lock().contains_key(device_id);
+    let has_session = {
+      let guard = self.sessions.lock();
+      guard.get(device_id).is_some_and(|session| {
+        *session.last_volume_linear.lock() = Some(level);
+        true
+      })
+    };
     if !has_session {
       return;
     }
-    // set_volume blocks on the warm-worker reply; keep the event loop responsive.
+    // Await so Volume stays ordered with Started/Ended on this device worker.
     let pool = Arc::clone(&self.cast_pool);
     let id = device_id.to_owned();
-    drop(tokio::task::spawn_blocking(move || {
-      if let Err(err) = pool.set_volume(&id, level) {
-        tracing::debug!(device_id = %id, error = %err, "Cast volume sync failed");
-      }
-    }));
+    match tokio::task::spawn_blocking(move || pool.set_volume(&id, level)).await {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => {
+        tracing::debug!(device_id = %device_id, error = %err, "Cast volume sync failed");
+      },
+      Err(err) => {
+        tracing::debug!(device_id = %device_id, error = %err, "Cast volume task join failed");
+      },
+    }
   }
 }
 
@@ -331,11 +475,35 @@ async fn device_worker_loop(
         bridge.handle_session_end(&event_device).await;
       },
       AirPlaySessionEvent::Volume { device_id: event_device, volume_db } => {
-        bridge.handle_volume(&event_device, volume_db);
+        bridge.handle_volume(&event_device, volume_db).await;
       },
     }
   }
   tracing::debug!(%device_id, "device session worker exited");
+}
+
+/// Poll until prebuffer frames are available, or the ring is superseded / empty.
+///
+/// Returns `Ok(true)` when enough (or any) PCM is ready to start Cast load.
+async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn RingLookup) -> Result<bool> {
+  for _ in 0..PREBUFFER_POLLS {
+    let still_current = rings
+      .ring_for(device_id)
+      .is_some_and(|current| Arc::ptr_eq(&current, ring));
+    if !still_current {
+      tracing::info!(%device_id, "session restarted during prebuffer; skipping stale start");
+      return Ok(false);
+    }
+    if ring.available_frames() >= PREBUFFER_FRAMES {
+      break;
+    }
+    sleep(PREBUFFER_POLL).await;
+  }
+
+  if ring.available_frames() == 0 {
+    return Err(Error::Bridge("no PCM available at session start".to_owned()));
+  }
+  Ok(true)
 }
 
 /// Cast LOAD of buffered progressive WAV (shared by initial start and rollover re-LOAD).
@@ -344,24 +512,32 @@ fn cast_load_buffered_wav(
   device_id: &str,
   stream_url: String,
   title: String,
+  volume: LoadVolumePolicy,
 ) -> Result<crate::cast::MediaSessionRef> {
   let request = MediaLoadRequest::wav(stream_url, CastStreamKind::Buffered).with_title(title);
   let session = pool.load(device_id, request)?;
-  // Nest device volume is independent of AirPlay; raise receiver volume on initial loads.
-  // Rollover re-LOAD also benefits from keeping volume up if the sink reset it.
-  if let Err(err) = pool.set_volume(device_id, 1.0) {
+  if let Some(level) = volume_after_load(volume)
+    && let Err(err) = pool.set_volume(device_id, level)
+  {
     tracing::debug!(error = %err, "post-load Cast volume set failed");
   }
   Ok(session)
 }
 
 /// Spawn a task that re-LOADs the same stream URL each time `LiveWav` hits its body cap.
+#[expect(
+  clippy::too_many_arguments,
+  reason = "rollover loop needs session liveness, volume, and inflight load slots"
+)]
 fn spawn_rollover_reload_loop(
   device_id: String,
   stream_url: String,
   cast_name: String,
   pool: Arc<CastPool>,
   rollover: Arc<RolloverSignal>,
+  session_alive: Arc<AtomicBool>,
+  last_volume_linear: Arc<Mutex<Option<f32>>>,
+  inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
   let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
   let task = tokio::spawn(async move {
@@ -374,30 +550,71 @@ fn spawn_rollover_reload_loop(
         },
         count = rollover.wait_past(seen) => {
           seen = count;
+          if !session_alive.load(Ordering::Acquire) {
+            tracing::debug!(%device_id, "skipping LiveWav rollover re-LOAD; session ended");
+            break;
+          }
           tracing::info!(%device_id, rollover = seen, %stream_url, "LiveWav rollover: re-LOADing Cast stream");
           let load_pool = Arc::clone(&pool);
           let id = device_id.clone();
           let url = stream_url.clone();
           let title = cast_name.clone();
-          let load_result = tokio::task::spawn_blocking(move || {
-            cast_load_buffered_wav(&load_pool, &id, url, title)
-          })
-          .await;
+          let last_volume = *last_volume_linear.lock();
+          let alive = Arc::clone(&session_alive);
+          // Result channel lets this loop observe LOAD while `inflight_load` stays joinable by teardown.
+          let (result_tx, result_rx) = oneshot::channel();
+          let load_task = tokio::task::spawn_blocking(move || {
+            let result = cast_load_buffered_wav(
+              &load_pool,
+              &id,
+              url,
+              title,
+              LoadVolumePolicy::Rollover { last_volume },
+            );
+            // Late LOAD after teardown: stop so playback cannot revive against a dead HTTP server.
+            if !alive.load(Ordering::Acquire) {
+              load_pool.stop_best_effort(&id, Duration::from_secs(2));
+            }
+            let _sent = result_tx.send(result);
+          });
+          {
+            *inflight_load.lock() = Some(load_task);
+          }
+          let load_result = result_rx.await;
+          // Clear our slot if teardown has not already taken the JoinHandle.
+          // Drop the parking_lot guard before await (guard is !Send).
+          let pending_join = inflight_load.lock().take();
+          if let Some(join_handle) = pending_join {
+            match join_handle.await {
+              Ok(()) => {},
+              Err(err) if err.is_cancelled() => {},
+              Err(err) => {
+                tracing::warn!(%device_id, error = %err, "LiveWav rollover re-LOAD task join failed");
+              },
+            }
+          }
           match load_result {
             Ok(Ok(session)) => {
-              tracing::info!(
-                %device_id,
-                transport_id = %session.transport_id,
-                media_session_id = session.media_session_id,
-                "LiveWav rollover Cast re-LOAD ok"
-              );
+              if session_alive.load(Ordering::Acquire) {
+                tracing::info!(
+                  %device_id,
+                  transport_id = %session.transport_id,
+                  media_session_id = session.media_session_id,
+                  "LiveWav rollover Cast re-LOAD ok"
+                );
+              }
             },
             Ok(Err(err)) => {
               tracing::warn!(%device_id, error = %err, "LiveWav rollover Cast re-LOAD failed");
             },
-            Err(err) => {
-              tracing::warn!(%device_id, error = %err, "LiveWav rollover re-LOAD task join failed");
+            Err(_recv) => {
+              // Teardown aborted this task or dropped the sender path; join handled above / by teardown.
+              tracing::debug!(%device_id, "LiveWav rollover re-LOAD result dropped (session teardown)");
+              break;
             },
+          }
+          if !session_alive.load(Ordering::Acquire) {
+            break;
           }
         },
       }
@@ -406,22 +623,8 @@ fn spawn_rollover_reload_loop(
   (cancel_tx, task)
 }
 
-/// Run shipped teardown order for one active session.
-fn end_active_session(active: ActiveSession) {
-  let ActiveSession {
-    media,
-    device_id,
-    pool,
-    rollover_cancel,
-    rollover_task,
-  } = active;
-  // Stop re-LOAD before tearing down media HTTP.
-  if let Some(tx) = rollover_cancel {
-    let _cancelled = tx.send(());
-  }
-  if let Some(task) = rollover_task {
-    task.abort();
-  }
+/// Run media shutdown then Cast STOP (blocking; call from `spawn_blocking`).
+fn end_media_and_cast_stop(media: MediaServerHandle, pool: &CastPool, device_id: &str) {
   let mut media_handle = Some(media);
   for step in session_end_steps() {
     match step {
@@ -433,7 +636,7 @@ fn end_active_session(active: ActiveSession) {
       },
       SessionEndStep::CastStopBestEffort => {
         // Best-effort Cast STOP with timeout; keep warm TCP for the next play.
-        pool.stop_best_effort(&device_id, Duration::from_secs(2));
+        pool.stop_best_effort(device_id, Duration::from_secs(2));
       },
     }
   }
@@ -506,6 +709,16 @@ mod tests {
     assert_eq!(steps[1], SessionEndStep::CastStopBestEffort);
   }
 
+  #[test]
+  fn volume_after_load_initial_full_rollover_preserves_or_skips() {
+    assert_eq!(volume_after_load(LoadVolumePolicy::InitialFull), Some(1.0));
+    assert_eq!(volume_after_load(LoadVolumePolicy::Rollover { last_volume: None }), None);
+    assert_eq!(
+      volume_after_load(LoadVolumePolicy::Rollover { last_volume: Some(0.42) }),
+      Some(0.42)
+    );
+  }
+
   #[tokio::test]
   async fn handle_session_end_shuts_media_before_cast_stop_and_does_not_hang() {
     let registry = Arc::new(DeviceRegistry::new());
@@ -534,6 +747,9 @@ mod tests {
           pool: Arc::clone(&pool),
           rollover_cancel: None,
           rollover_task: None,
+          session_alive: Arc::new(AtomicBool::new(true)),
+          last_volume_linear: Arc::new(Mutex::new(None)),
+          inflight_load: Arc::new(Mutex::new(None)),
         },
       ));
     }
@@ -587,11 +803,67 @@ mod tests {
           pool,
           rollover_cancel: Some(cancel_tx),
           rollover_task: Some(task),
+          session_alive: Arc::new(AtomicBool::new(true)),
+          last_volume_linear: Arc::new(Mutex::new(None)),
+          inflight_load: Arc::new(Mutex::new(None)),
         },
       ));
     }
 
     bridge.handle_session_end("dev-roll").await;
+    assert!(bridge.sessions.lock().is_empty());
+  }
+
+  #[tokio::test]
+  async fn session_end_joins_inflight_load_and_marks_session_dead() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let pool = Arc::new(CastPool::new());
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+
+    let session_alive = Arc::new(AtomicBool::new(true));
+    let inflight_load = Arc::new(Mutex::new(None));
+    let alive_for_load = Arc::clone(&session_alive);
+    let started = Arc::new(AtomicBool::new(false));
+    let started_flag = Arc::clone(&started);
+
+    // Simulate a slow blocking LOAD that observes session_alive after "LOAD".
+    let handle = tokio::task::spawn_blocking(move || {
+      started_flag.store(true, Ordering::Release);
+      std::thread::sleep(Duration::from_millis(200));
+      let still_alive = alive_for_load.load(Ordering::Acquire);
+      // Teardown should have cleared the flag before we finish.
+      assert!(!still_alive, "session must be marked dead before inflight load finishes join");
+    });
+    *inflight_load.lock() = Some(handle);
+
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert(
+        "dev-inflight".to_owned(),
+        ActiveSession {
+          media,
+          device_id: "dev-inflight".to_owned(),
+          pool,
+          rollover_cancel: None,
+          rollover_task: None,
+          session_alive: Arc::clone(&session_alive),
+          last_volume_linear: Arc::new(Mutex::new(None)),
+          inflight_load: Arc::clone(&inflight_load),
+        },
+      ));
+    }
+
+    // Wait until the blocking load has started so teardown has something to join.
+    let wait_start = Instant::now();
+    while !started.load(Ordering::Acquire) && wait_start.elapsed() < Duration::from_secs(2) {
+      sleep(Duration::from_millis(5)).await;
+    }
+    assert!(started.load(Ordering::Acquire), "inflight load must start");
+
+    bridge.handle_session_end("dev-inflight").await;
+    assert!(!session_alive.load(Ordering::Acquire));
+    assert!(inflight_load.lock().is_none(), "inflight load handle must be taken and joined");
     assert!(bridge.sessions.lock().is_empty());
   }
 
@@ -613,6 +885,7 @@ mod tests {
           "missing-device",
           "http://127.0.0.1:9/stream".to_owned(),
           "test".to_owned(),
+          LoadVolumePolicy::Rollover { last_volume: None },
         )
       })
       .await;
@@ -624,6 +897,45 @@ mod tests {
     let finished = tokio::time::timeout(Duration::from_secs(3), task).await;
     assert!(finished.is_ok(), "rollover re-LOAD path must complete");
     media.shutdown();
+  }
+
+  #[tokio::test]
+  async fn handle_volume_updates_last_volume_on_active_session() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let pool = Arc::new(CastPool::new());
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let last_volume_linear = Arc::new(Mutex::new(None));
+
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert(
+        "dev-vol".to_owned(),
+        ActiveSession {
+          media,
+          device_id: "dev-vol".to_owned(),
+          pool,
+          rollover_cancel: None,
+          rollover_task: None,
+          session_alive: Arc::new(AtomicBool::new(true)),
+          last_volume_linear: Arc::clone(&last_volume_linear),
+          inflight_load: Arc::new(Mutex::new(None)),
+        },
+      ));
+    }
+
+    // AirPlay 0 dB → Cast linear 1.0 (see airplay_db_to_cast_linear).
+    bridge.handle_volume("dev-vol", 0.0).await;
+    let stored = *last_volume_linear.lock();
+    assert_eq!(stored, Some(1.0));
+    // Rollover policy must re-apply that level, not force 1.0 only via InitialFull.
+    assert_eq!(volume_after_load(LoadVolumePolicy::Rollover { last_volume: stored }), Some(1.0));
+    assert_eq!(
+      volume_after_load(LoadVolumePolicy::Rollover { last_volume: Some(0.25) }),
+      Some(0.25)
+    );
+
+    bridge.handle_session_end("dev-vol").await;
   }
 
   async fn http_get_status_ok(url: &str) -> bool {
@@ -768,6 +1080,31 @@ mod tests {
     drop(tx);
     let joined = tokio::time::timeout(Duration::from_secs(10), run).await;
     assert!(joined.is_ok(), "bridge run must exit after event channel close");
+  }
+
+  #[tokio::test]
+  async fn aborting_bridge_run_aborts_device_workers() {
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new())));
+    let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: None });
+    let (tx, rx) = mpsc::unbounded_channel();
+    // Keep the channel open so run stays in recv; abort must still tear down workers.
+    let run = tokio::spawn({
+      let bridge_for_run = Arc::clone(&bridge);
+      async move {
+        bridge_for_run.run(rx, rings).await;
+      }
+    });
+
+    // Force a worker to exist by sending a no-op end (no session).
+    tx.send(AirPlaySessionEvent::Ended { device_id: "dev-zombie".to_owned() })
+      .expect("send");
+    sleep(Duration::from_millis(50)).await;
+
+    run.abort();
+    let result = tokio::time::timeout(Duration::from_secs(2), run).await;
+    assert!(result.is_ok(), "aborted bridge run must finish promptly");
+    // Drop sender after abort so we do not keep the test process holding the channel.
+    drop(tx);
   }
 
   #[test]
