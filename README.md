@@ -6,19 +6,57 @@ See [VISION.md](VISION.md) for product intent and non-goals.
 
 ---
 
-## Quick start
+## Quick start (developers)
 
 ```bash
-# From the repository root (Rust 1.88+, macOS with Bonjour / dns-sd):
+# From the repository root (Rust 1.88+):
 cargo run -p play-on-air
 
 # Or after install:
 play-on-air
 ```
 
-No config file and no flags are required. PlayOnAir discovers Chromecasts on the LAN via system `dns-sd`, advertises each as an AirPlay 2 speaker, and bridges audio when you pick one from iPhone, iPad, or Mac.
+No config file and no flags are required. PlayOnAir discovers Chromecasts on the LAN, advertises each as an AirPlay 2 speaker, and bridges audio when you pick one from iPhone, iPad, or Mac.
+
+| Platform | Discovery backend |
+|----------|-------------------|
+| macOS | system `dns-sd` (Bonjour) |
+| Linux | `avahi-browse` (`avahi-utils`) |
 
 **macOS:** keep the process running on a machine on the same LAN as the Chromecasts and the iPhone. Allow **Local Network** access if macOS prompts for the binary. On the iPhone Control Center AirPlay list, look for names matching your Cast devices (for example speaker names from the Google Home app).
+
+**Linux:** install `avahi-utils` (provides `avahi-browse`) and ensure Avahi is running on the host.
+
+## Home Assistant OS
+
+PlayOnAir is published as a Home Assistant app (add-on) with a multi-arch image on GHCR.
+
+### Install from this repository
+
+1. **Settings → Add-ons → Add-on store → ⋮ → Repositories**
+2. Add `https://github.com/felipefdl/play-on-air`
+3. Install **PlayOnAir**, then start it
+
+The app uses **host network** (`host_network: true`) so mDNS discovery, AirPlay advertisement, and Cast control work on the LAN. That shares the host network namespace with the container (not an isolated bridge). Details and optional rename config: [play-on-air/DOCS.md](play-on-air/DOCS.md).
+
+### Container image
+
+| Image | Notes |
+|-------|--------|
+| `ghcr.io/felipefdl/play-on-air:0.1.0` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
+| `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
+
+Architectures: `linux/amd64`, `linux/arm64` (HA arch names `amd64`, `aarch64`).
+
+Standalone run (still needs host network and Avahi tools in the image):
+
+```bash
+docker run --rm --network host \
+  -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
+  -v "$PWD/config:/config" \
+  ghcr.io/felipefdl/play-on-air:0.1.0
+```
 
 ## Optional config
 

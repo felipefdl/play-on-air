@@ -71,9 +71,7 @@ New crates must set `[lints] workspace = true`.
 5. Pairing / FairPlay / encrypted RTSP stay on the AP2 path. Do not ship an AP1 “fallback that just works.”
 6. Video, screen mirroring, and lip-synced TV audio are **not supported**.
 
-## Layout (target)
-
-Until crates land, keep the root thin: vision, agents, license, then code.
+## Layout
 
 ```
 play-on-air/
@@ -81,16 +79,21 @@ play-on-air/
   CLAUDE.md          # symlink → AGENTS.md
   VISION.md          # product intent
   LICENSE.md         # MIT, Felipe Lima
-  rustfmt.toml       # when workspace exists
+  README.md
+  repository.yaml    # Home Assistant app store repository
+  Dockerfile         # multi-stage binary image (GHCR)
+  rustfmt.toml
   clippy.toml
   deny.toml
   Cargo.toml         # virtual workspace
   crates/
-    play-on-air/     # binary + library (names may refine; keep consistent)
+    play-on-air/     # binary + library
+  play-on-air/       # HAOS app folder (config.yaml, DOCS.md, …)
+  .github/workflows/ # ci + docker multi-arch GHCR
   docs/              # design notes, plans (optional)
 ```
 
-Put reusable logic in a library crate, not only in `main`.
+Put reusable logic in a library crate, not only in `main`. HAOS packaging lives under root `play-on-air/` (app slug folder) and pulls `ghcr.io/felipefdl/play-on-air` with `host_network: true`.
 
 ## Quality gate
 

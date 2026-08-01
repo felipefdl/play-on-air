@@ -1,8 +1,12 @@
-//! Chromecast discovery via the system `dns-sd` CLI (Bonjour).
+//! Chromecast discovery via OS mDNS tools.
 //!
-//! Pure-Rust mDNS and `astro-dnssd` browse do not reliably see `_googlecast._tcp`
-//! on macOS, while Apple's `dns-sd` does. Registration (shairplay / Bonjour) still
-//! works for AirPlay ads; discovery alone uses the CLI that matches the OS.
+//! - **macOS**: system `dns-sd` CLI (Bonjour). Pure-Rust mDNS and `astro-dnssd`
+//!   browse do not reliably see `_googlecast._tcp` on macOS, while Apple's
+//!   `dns-sd` does.
+//! - **Linux**: `avahi-browse -p -r` (parsable continuous browse + resolve).
+//!
+//! Registration (shairplay / Bonjour or Avahi) still works for AirPlay ads;
+//! discovery alone uses the CLI that matches the OS.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -42,7 +46,8 @@ impl Discovery {
   }
 
   fn run_blocking(self, shutdown: &watch::Receiver<bool>) {
-    tracing::info!(service = GOOGLECAST_REGTYPE, "browsing for Chromecast devices via dns-sd");
+    let backend = discovery_backend_label();
+    tracing::info!(service = GOOGLECAST_REGTYPE, backend, "browsing for Chromecast devices");
 
     // Restart the browser if it exits; stop when shutdown is set.
     while !*shutdown.borrow() {
@@ -51,11 +56,11 @@ impl Discovery {
           if *shutdown.borrow() {
             break;
           }
-          tracing::warn!("dns-sd browse exited; restarting in 1s");
+          tracing::warn!(backend, "browse exited; restarting in 1s");
           std::thread::sleep(Duration::from_secs(1));
         },
         Err(err) => {
-          tracing::error!(error = %err, "dns-sd browse failed; retrying in 2s");
+          tracing::error!(backend, error = %err, "browse failed; retrying in 2s");
           std::thread::sleep(Duration::from_secs(2));
         },
       }
@@ -63,87 +68,19 @@ impl Discovery {
   }
 }
 
-fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool>) -> Result<()> {
-  let mut child = spawn_browse()?;
-  let stdout = child
-    .stdout
-    .take()
-    .ok_or_else(|| Error::Discovery("dns-sd browse missing stdout".to_owned()))?;
-  let reader = BufReader::new(stdout);
-
-  // `lines()` blocks until dns-sd prints; kill the child on shutdown so the
-  // reader unblocks and runtime shutdown never hangs on this thread.
-  let shared_child = Arc::new(std::sync::Mutex::new(child));
-  let session_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-  let watcher = {
-    let watcher_child = Arc::clone(&shared_child);
-    let watcher_done = Arc::clone(&session_done);
-    let watcher_shutdown = shutdown.clone();
-    std::thread::spawn(move || {
-      while !watcher_done.load(std::sync::atomic::Ordering::Relaxed) {
-        if *watcher_shutdown.borrow() {
-          if let Ok(mut guard) = watcher_child.lock() {
-            terminate_child(&mut guard);
-          }
-          break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-      }
-    })
-  };
-
-  for raw_line in reader.lines() {
-    if *shutdown.borrow() {
-      break;
-    }
-    let Ok(line) = raw_line else {
-      tracing::warn!("dns-sd browse read error");
-      break;
-    };
-    let Some(event) = parse_browse_line(&line) else {
-      continue;
-    };
-    match event.kind {
-      BrowseKind::Add => match resolve_instance(&event.instance, shutdown) {
-        Ok(device) => {
-          tracing::info!(
-            id = %device.id,
-            name = %device.name,
-            host = %device.host,
-            port = device.port,
-            "Chromecast appeared"
-          );
-          registry.appear(device);
-        },
-        Err(err) => {
-          tracing::warn!(
-            instance = %event.instance,
-            error = %err,
-            "failed to resolve Chromecast"
-          );
-        },
-      },
-      BrowseKind::Remove => {
-        leave_by_instance(registry, &event.instance);
-      },
-    }
+const fn discovery_backend_label() -> &'static str {
+  #[cfg(target_os = "macos")]
+  {
+    "dns-sd"
   }
-
-  session_done.store(true, std::sync::atomic::Ordering::Relaxed);
-  if let Ok(mut guard) = shared_child.lock() {
-    terminate_child(&mut guard);
+  #[cfg(target_os = "linux")]
+  {
+    "avahi-browse"
   }
-  drop(watcher.join());
-  Ok(())
-}
-
-fn spawn_browse() -> Result<Child> {
-  Command::new("dns-sd")
-    .args(["-B", GOOGLECAST_REGTYPE, "local."])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .map_err(|err| Error::Discovery(format!("failed to spawn dns-sd -B: {err}")))
+  #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+  {
+    "unsupported"
+  }
 }
 
 fn terminate_child(child: &mut Child) {
@@ -151,7 +88,7 @@ fn terminate_child(child: &mut Child) {
   drop(child.wait());
 }
 
-/// Browse line event kind.
+/// Browse line event kind (macOS `dns-sd -B`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowseKind {
   /// Instance added.
@@ -204,15 +141,17 @@ fn find_token_after<'a>(line: &'a str, token: &str) -> Option<&'a str> {
   line.get(idx + token.len()..)
 }
 
-/// Resolved fields from `dns-sd -L`.
+/// Resolved fields from `dns-sd -L` or avahi `=` lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveInfo {
   /// Hostname (may end with `.local.`).
   pub hostname: String,
   /// Port (usually 8009).
   pub port: u16,
-  /// Raw TXT string from the lookup line(s).
+  /// Raw TXT string in dns-sd style (`key=value` space-separated, `\` escapes).
   pub txt: String,
+  /// Optional pre-resolved address (e.g. from avahi). When set, used as Cast host.
+  pub address: Option<String>,
 }
 
 /// Parse `dns-sd -L` output for host, port, and TXT blob.
@@ -244,6 +183,7 @@ pub fn parse_lookup_output(output: &str) -> Option<ResolveInfo> {
     hostname: hostname?,
     port: port.unwrap_or(8009),
     txt,
+    address: None,
   })
 }
 
@@ -299,6 +239,19 @@ fn unescape_dns_sd(s: &str) -> String {
   out
 }
 
+/// Escape spaces (and backslashes) so [`parse_txt_blob`] keeps multi-word values.
+fn escape_txt_value(s: &str) -> String {
+  let mut out = String::with_capacity(s.len());
+  for c in s.chars() {
+    match c {
+      '\\' => out.push_str("\\\\"),
+      ' ' => out.push_str("\\ "),
+      other => out.push(other),
+    }
+  }
+  out
+}
+
 /// Build a [`Device`] from instance name + resolve info.
 pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
   let txt = parse_txt_blob(&info.txt);
@@ -313,7 +266,12 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
     .filter(|s| !s.is_empty())
     .unwrap_or_else(|| instance.replace('-', " "));
   let hostname = info.hostname.trim_end_matches('.').to_owned();
-  let host = resolve_cast_host(&hostname);
+  let host = info
+    .address
+    .as_deref()
+    .map(str::trim)
+    .filter(|a| !a.is_empty())
+    .map_or_else(|| resolve_cast_host(&hostname), ToOwned::to_owned);
   let port = if info.port == 0 { 8009 } else { info.port };
   Device {
     id,
@@ -325,19 +283,143 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
   }
 }
 
-fn resolve_instance(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<Device> {
-  let output = run_lookup(instance, shutdown)?;
+fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
+  // Instance name may match id or be a prefix of name; also try TXT id later.
+  let list = registry.list();
+  let rid = list
+    .iter()
+    .find(|d| d.id == instance || d.name == instance || d.id.contains(instance) || instance.contains(&d.id))
+    .map(|d| d.id.clone());
+  if let Some(id) = rid {
+    tracing::info!(%id, instance, "Chromecast left");
+    drop(registry.leave(&id));
+  }
+}
+
+/// Prefer a resolved IPv4 address; fall back to hostname for Cast control.
+pub fn resolve_cast_host(hostname: &str) -> String {
+  crate::net::resolve_host_ipv4(hostname).unwrap_or_else(|| {
+    let host = hostname.trim_end_matches('.');
+    if host.is_empty() {
+      "127.0.0.1".to_owned()
+    } else {
+      host.to_owned()
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Shared child stdout session helper
+// ---------------------------------------------------------------------------
+
+/// Kill `child` when `shutdown` is set so a blocking stdout reader unblocks.
+fn spawn_shutdown_watcher(
+  shared_child: Arc<std::sync::Mutex<Child>>,
+  session_done: Arc<std::sync::atomic::AtomicBool>,
+  shutdown: watch::Receiver<bool>,
+) -> std::thread::JoinHandle<()> {
+  std::thread::spawn(move || {
+    while !session_done.load(std::sync::atomic::Ordering::Relaxed) {
+      if *shutdown.borrow() {
+        if let Ok(mut guard) = shared_child.lock() {
+          terminate_child(&mut guard);
+        }
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(200));
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// macOS: dns-sd
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool>) -> Result<()> {
+  let mut child = spawn_dns_sd_browse()?;
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| Error::Discovery("dns-sd browse missing stdout".to_owned()))?;
+  let reader = BufReader::new(stdout);
+
+  let shared_child = Arc::new(std::sync::Mutex::new(child));
+  let session_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let watcher = spawn_shutdown_watcher(Arc::clone(&shared_child), Arc::clone(&session_done), shutdown.clone());
+
+  for raw_line in reader.lines() {
+    if *shutdown.borrow() {
+      break;
+    }
+    let Ok(line) = raw_line else {
+      tracing::warn!("dns-sd browse read error");
+      break;
+    };
+    let Some(event) = parse_browse_line(&line) else {
+      continue;
+    };
+    match event.kind {
+      BrowseKind::Add => match resolve_instance_dns_sd(&event.instance, shutdown) {
+        Ok(device) => {
+          tracing::info!(
+            id = %device.id,
+            name = %device.name,
+            host = %device.host,
+            port = device.port,
+            "Chromecast appeared"
+          );
+          registry.appear(device);
+        },
+        Err(err) => {
+          tracing::warn!(
+            instance = %event.instance,
+            error = %err,
+            "failed to resolve Chromecast"
+          );
+        },
+      },
+      BrowseKind::Remove => {
+        leave_by_instance(registry, &event.instance);
+      },
+    }
+  }
+
+  session_done.store(true, std::sync::atomic::Ordering::Relaxed);
+  if let Ok(mut guard) = shared_child.lock() {
+    terminate_child(&mut guard);
+  }
+  drop(watcher.join());
+  Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_dns_sd_browse() -> Result<Child> {
+  Command::new("dns-sd")
+    .args(["-B", GOOGLECAST_REGTYPE, "local."])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|err| Error::Discovery(format!("failed to spawn dns-sd -B: {err}")))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_instance_dns_sd(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<Device> {
+  let output = run_lookup_dns_sd(instance, shutdown)?;
   let info = parse_lookup_output(&output)
     .ok_or_else(|| Error::Discovery(format!("could not parse dns-sd -L for {instance}")))?;
   Ok(device_from_resolve(instance, &info))
 }
 
 /// Max wall-clock for one `dns-sd -L` resolve before the child is killed.
+#[cfg(target_os = "macos")]
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Watchdog poll cadence for lookup deadline / shutdown checks.
+#[cfg(target_os = "macos")]
 const LOOKUP_WATCH_POLL: Duration = Duration::from_millis(100);
 
-fn run_lookup(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<String> {
+#[cfg(target_os = "macos")]
+fn run_lookup_dns_sd(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<String> {
   // dns-sd -L streams; collect for a short window then kill.
   let mut child = Command::new("dns-sd")
     .args(["-L", instance, GOOGLECAST_REGTYPE, "local."])
@@ -402,29 +484,245 @@ fn run_lookup(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<String
   Ok(buf)
 }
 
-fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
-  // Instance name may match id or be a prefix of name; also try TXT id later.
-  let list = registry.list();
-  let rid = list
-    .iter()
-    .find(|d| d.id == instance || d.name == instance || d.id.contains(instance) || instance.contains(&d.id))
-    .map(|d| d.id.clone());
-  if let Some(id) = rid {
-    tracing::info!(%id, instance, "Chromecast left");
-    drop(registry.leave(&id));
+// ---------------------------------------------------------------------------
+// Linux: avahi-browse
+// ---------------------------------------------------------------------------
+
+/// Parsed avahi-browse event (parsable mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AvahiEvent {
+  /// Fully resolved service (`=` line).
+  Resolved {
+    /// Service instance name.
+    instance: String,
+    /// Resolve info (hostname, port, TXT, address).
+    info: ResolveInfo,
+  },
+  /// Service removed (`-` line).
+  Removed {
+    /// Service instance name.
+    instance: String,
+  },
+}
+
+/// Split an avahi parsable line on unescaped `;`.
+pub fn split_avahi_fields(line: &str) -> Vec<String> {
+  let mut fields = Vec::new();
+  let mut cur = String::new();
+  let mut chars = line.chars();
+  while let Some(c) = chars.next() {
+    if c == '\\' {
+      if let Some(n) = chars.next() {
+        cur.push(n);
+      }
+    } else if c == ';' {
+      fields.push(std::mem::take(&mut cur));
+    } else {
+      cur.push(c);
+    }
+  }
+  fields.push(cur);
+  fields
+}
+
+/// Convert avahi TXT field (`"k=v" "k2=v2"`) into dns-sd-style space-separated pairs.
+///
+/// Values with spaces are escaped for [`parse_txt_blob`].
+pub fn normalize_avahi_txt(txt: &str) -> String {
+  let trimmed = txt.trim();
+  if trimmed.is_empty() {
+    return String::new();
+  }
+
+  let mut pairs = Vec::new();
+  let mut cur = String::new();
+  let mut in_quotes = false;
+  let mut chars = trimmed.chars();
+  while let Some(ch) = chars.next() {
+    match ch {
+      '"' if !in_quotes => {
+        in_quotes = true;
+      },
+      '"' if in_quotes => {
+        in_quotes = false;
+        if !cur.is_empty() {
+          pairs.push(std::mem::take(&mut cur));
+        }
+      },
+      '\\' if in_quotes => {
+        if let Some(n) = chars.next() {
+          cur.push(n);
+        }
+      },
+      _ if in_quotes => {
+        cur.push(ch);
+      },
+      _ if ch.is_whitespace() => {},
+      other => {
+        // Unquoted fallback character: accumulate into a free-form token.
+        cur.push(other);
+      },
+    }
+  }
+  if !cur.is_empty() {
+    pairs.push(cur);
+  }
+
+  let mut out = String::new();
+  for pair in pairs {
+    let Some((k, v)) = pair.split_once('=') else {
+      continue;
+    };
+    if !out.is_empty() {
+      out.push(' ');
+    }
+    out.push_str(k);
+    out.push('=');
+    out.push_str(&escape_txt_value(v));
+  }
+  out
+}
+
+/// Parse one avahi-browse `-p` line into a resolved or removed event.
+///
+/// Examples:
+/// ```text
+/// =;eth0;IPv4;Living Room;_googlecast._tcp;local;Chromecast-xxx.local;192.168.1.50;8009;"id=abc" "fn=Living Room" "md=Chromecast"
+/// -;eth0;IPv4;Living Room;_googlecast._tcp;local
+/// ```
+///
+/// `+` cache/add lines are ignored (wait for `=` when using `-r`). Non-IPv4
+/// resolves are skipped so IPv6 does not overwrite a good IPv4 host.
+pub fn parse_avahi_line(line: &str) -> Option<AvahiEvent> {
+  let trimmed = line.trim();
+  if trimmed.is_empty() || trimmed.starts_with('#') {
+    return None;
+  }
+  let fields = split_avahi_fields(trimmed);
+  let kind = fields.first()?.as_str();
+  match kind {
+    "-" => {
+      let instance = fields.get(3)?.clone();
+      if instance.is_empty() {
+        return None;
+      }
+      Some(AvahiEvent::Removed { instance })
+    },
+    "=" => {
+      // =;if;proto;name;type;domain;host;addr;port;txt...
+      if fields.len() < 9 {
+        return None;
+      }
+      let proto = fields.get(2).map(String::as_str)?;
+      if proto != "IPv4" {
+        return None;
+      }
+      let instance = fields.get(3)?.clone();
+      if instance.is_empty() {
+        return None;
+      }
+      let service_type = fields.get(4).map_or("", String::as_str);
+      if !service_type.is_empty() && !service_type.contains("googlecast") {
+        return None;
+      }
+      let hostname = fields.get(6)?.trim_end_matches('.').to_owned();
+      let address = fields.get(7)?.clone();
+      let port = fields
+        .get(8)
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|&p| p != 0)
+        .unwrap_or(8009);
+      let txt_raw = fields.get(9).cloned().unwrap_or_default();
+      let txt = normalize_avahi_txt(&txt_raw);
+      Some(AvahiEvent::Resolved {
+        instance,
+        info: ResolveInfo {
+          hostname,
+          port,
+          txt,
+          address: if address.is_empty() {
+            None
+          } else {
+            Some(address)
+          },
+        },
+      })
+    },
+    // "+" cache/add lines and unknown kinds: wait for "=" when using -r.
+    _ => None,
   }
 }
 
-/// Prefer a resolved IPv4 address; fall back to hostname for Cast control.
-pub fn resolve_cast_host(hostname: &str) -> String {
-  crate::net::resolve_host_ipv4(hostname).unwrap_or_else(|| {
-    let host = hostname.trim_end_matches('.');
-    if host.is_empty() {
-      "127.0.0.1".to_owned()
-    } else {
-      host.to_owned()
+#[cfg(target_os = "linux")]
+fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool>) -> Result<()> {
+  let mut child = spawn_avahi_browse()?;
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| Error::Discovery("avahi-browse missing stdout".to_owned()))?;
+  let reader = BufReader::new(stdout);
+
+  let shared_child = Arc::new(std::sync::Mutex::new(child));
+  let session_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let watcher = spawn_shutdown_watcher(Arc::clone(&shared_child), Arc::clone(&session_done), shutdown.clone());
+
+  for raw_line in reader.lines() {
+    if *shutdown.borrow() {
+      break;
     }
-  })
+    let Ok(line) = raw_line else {
+      tracing::warn!("avahi-browse read error");
+      break;
+    };
+    let Some(event) = parse_avahi_line(&line) else {
+      continue;
+    };
+    match event {
+      AvahiEvent::Resolved { instance, info } => {
+        let device = device_from_resolve(&instance, &info);
+        tracing::info!(
+          id = %device.id,
+          name = %device.name,
+          host = %device.host,
+          port = device.port,
+          "Chromecast appeared"
+        );
+        registry.appear(device);
+      },
+      AvahiEvent::Removed { instance } => {
+        leave_by_instance(registry, &instance);
+      },
+    }
+  }
+
+  session_done.store(true, std::sync::atomic::Ordering::Relaxed);
+  if let Ok(mut guard) = shared_child.lock() {
+    terminate_child(&mut guard);
+  }
+  drop(watcher.join());
+  Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_avahi_browse() -> Result<Child> {
+  // -p parsable, -r resolve, continuous (no -t terminate)
+  Command::new("avahi-browse")
+    .args(["-p", "-r", GOOGLECAST_REGTYPE])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|err| Error::Discovery(format!("failed to spawn avahi-browse: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// Other OS
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn run_browse_session(_registry: &DeviceRegistry, _shutdown: &watch::Receiver<bool>) -> Result<()> {
+  Err(Error::Discovery(
+    "Chromecast discovery requires dns-sd (macOS) or avahi-browse (Linux)".to_owned(),
+  ))
 }
 
 #[cfg(test)]
@@ -462,6 +760,7 @@ Lookup Nest-Audio-x._googlecast._tcp.local.
     let info = parse_lookup_output(out).expect("lookup");
     assert_eq!(info.hostname, "56cb7fe7-e13f-3256-2532-5c4a304c57fa.local");
     assert_eq!(info.port, 8009);
+    assert!(info.address.is_none());
     let d = device_from_resolve("Nest-Audio-x", &info);
     assert_eq!(d.id, "56cb7fe7e13f325625325c4a304c57fa");
     assert_eq!(d.name, "Gym speaker");
@@ -479,5 +778,72 @@ Lookup Nest-Audio-x._googlecast._tcp.local.
   fn resolve_cast_host_trims_dot() {
     let host = resolve_cast_host("definitely-not-a-real-host.invalid.");
     assert_eq!(host, "definitely-not-a-real-host.invalid");
+  }
+
+  #[test]
+  fn parse_avahi_resolved_line() {
+    let line = r#"=;eth0;IPv4;Living Room;_googlecast._tcp;local;Chromecast-xxx.local;192.168.1.50;8009;"id=abc" "fn=Living Room" "md=Chromecast""#;
+    let event = parse_avahi_line(line).expect("parse");
+    match event {
+      AvahiEvent::Resolved { instance, info } => {
+        assert_eq!(instance, "Living Room");
+        assert_eq!(info.hostname, "Chromecast-xxx.local");
+        assert_eq!(info.port, 8009);
+        assert_eq!(info.address.as_deref(), Some("192.168.1.50"));
+        let d = device_from_resolve(&instance, &info);
+        assert_eq!(d.id, "abc");
+        assert_eq!(d.name, "Living Room");
+        assert_eq!(d.host, "192.168.1.50");
+        assert_eq!(d.port, 8009);
+      },
+      AvahiEvent::Removed { .. } => panic!("expected resolved"),
+    }
+  }
+
+  #[test]
+  fn parse_avahi_remove_line() {
+    let line = "-;eth0;IPv4;Living Room;_googlecast._tcp;local";
+    let event = parse_avahi_line(line).expect("parse");
+    match event {
+      AvahiEvent::Removed { instance } => assert_eq!(instance, "Living Room"),
+      AvahiEvent::Resolved { .. } => panic!("expected removed"),
+    }
+  }
+
+  #[test]
+  fn parse_avahi_ignores_add_and_ipv6() {
+    assert!(parse_avahi_line("+;eth0;IPv4;Living Room;_googlecast._tcp;local").is_none());
+    let ipv6 = r#"=;eth0;IPv6;Living Room;_googlecast._tcp;local;Chromecast-xxx.local;fe80::1;8009;"id=abc""#;
+    assert!(parse_avahi_line(ipv6).is_none());
+  }
+
+  #[test]
+  fn normalize_avahi_txt_quoted_pairs() {
+    let raw = r#""id=abc" "fn=Living Room" "md=Chromecast""#;
+    let norm = normalize_avahi_txt(raw);
+    let m = parse_txt_blob(&norm);
+    assert_eq!(m.get("id").map(String::as_str), Some("abc"));
+    assert_eq!(m.get("fn").map(String::as_str), Some("Living Room"));
+    assert_eq!(m.get("md").map(String::as_str), Some("Chromecast"));
+  }
+
+  #[test]
+  fn split_avahi_fields_unescapes() {
+    let fields = split_avahi_fields(r"a;b\;c;d");
+    assert_eq!(fields, vec!["a", "b;c", "d"]);
+  }
+
+  #[test]
+  fn device_from_resolve_prefers_address() {
+    let info = ResolveInfo {
+      hostname: "cast.local".to_owned(),
+      port: 8009,
+      txt: "id=xyz fn=Kitchen".to_owned(),
+      address: Some("10.0.0.9".to_owned()),
+    };
+    let d = device_from_resolve("Kitchen-Speaker", &info);
+    assert_eq!(d.host, "10.0.0.9");
+    assert_eq!(d.id, "xyz");
+    assert_eq!(d.name, "Kitchen");
   }
 }
