@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- Pause/resume: detect AirPlay playout idle and issue Cast PAUSE/PLAY (snappier stop).
+- Flush: clear ring and pause Cast so Nest does not keep playing stale audio.
+- LiveWav underrun: feed silence instead of stalling the HTTP body (Nest Mini hickups).
+
 ## 0.1.3
 
 - End Cast bridge only when the **audio** session drops, not on every RTSP

@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use shairplay::{AirPlayMode, AudioFormat, AudioHandler, AudioSession, RaopServer};
@@ -18,6 +20,10 @@ const RAOP_PORT_SPAN: u64 = 1000;
 const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
+/// No PCM for this long ⇒ treat AirPlay playout as paused (Cast PAUSE).
+const PAUSE_IDLE: Duration = Duration::from_millis(250);
+/// Pause-watch poll cadence.
+const PAUSE_POLL: Duration = Duration::from_millis(50);
 
 /// Lifecycle events from an AirPlay receiver toward the bridge.
 #[derive(Debug, Clone)]
@@ -38,6 +44,21 @@ pub enum AirPlaySessionEvent {
   },
   /// Client disconnected; bridge should Cast-STOP and drop media.
   Ended {
+    /// Device id this receiver is bound to.
+    device_id: String,
+  },
+  /// AirPlay playout rate went to 0 (or PCM idle); Cast should PAUSE promptly.
+  Paused {
+    /// Device id this receiver is bound to.
+    device_id: String,
+  },
+  /// PCM flowing again after pause; Cast should PLAY.
+  Resumed {
+    /// Device id this receiver is bound to.
+    device_id: String,
+  },
+  /// AirPlay FLUSH / buffer clear; ring already cleared, Cast should PAUSE.
+  Flushed {
     /// Device id this receiver is bound to.
     device_id: String,
   },
@@ -74,23 +95,81 @@ impl DeviceAudioState {
 /// RTSP Remote-Control connections also call [`AudioHandler::on_client_disconnected`]
 /// when they close; those must not stop Cast (multi-speaker iOS opens/closes RC
 /// links while audio keeps running on another connection).
+///
+/// Pause is inferred when PCM stops for [`PAUSE_IDLE`] (AP2 rate=0 stops delivery
+/// without dropping the session). Flush is explicit via [`AudioSession::audio_flush`].
 struct RingSession {
   state: Arc<DeviceAudioState>,
   ring: Arc<PcmRing>,
+  last_process_ms: Arc<AtomicU64>,
+  /// At least one PCM buffer has been delivered (avoids false pause before playout).
+  had_pcm: Arc<AtomicBool>,
+  cast_paused: Arc<AtomicBool>,
+  watch_cancel: Arc<AtomicBool>,
+  watch: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RingSession {
+  fn new(state: Arc<DeviceAudioState>, ring: Arc<PcmRing>) -> Self {
+    let last_process_ms = Arc::new(AtomicU64::new(millis_since_start()));
+    let had_pcm = Arc::new(AtomicBool::new(false));
+    let cast_paused = Arc::new(AtomicBool::new(false));
+    let watch_cancel = Arc::new(AtomicBool::new(false));
+    let watch = spawn_pause_watch(
+      Arc::clone(&state),
+      Arc::clone(&last_process_ms),
+      Arc::clone(&had_pcm),
+      Arc::clone(&cast_paused),
+      Arc::clone(&watch_cancel),
+    );
+    Self {
+      state,
+      ring,
+      last_process_ms,
+      had_pcm,
+      cast_paused,
+      watch_cancel,
+      watch: Some(watch),
+    }
+  }
+
+  fn note_pcm(&self) {
+    self.had_pcm.store(true, Ordering::Release);
+    self.last_process_ms.store(millis_since_start(), Ordering::Release);
+    if self.cast_paused.swap(false, Ordering::AcqRel)
+      && let Some(tx) = &self.state.event_tx
+    {
+      drop(tx.send(AirPlaySessionEvent::Resumed { device_id: self.state.device_id.clone() }));
+    }
+  }
 }
 
 impl AudioSession for RingSession {
   fn audio_process(&mut self, samples: &[f32]) {
+    self.note_pcm();
     self.ring.push_f32(samples);
   }
 
   fn audio_flush(&mut self) {
     self.ring.clear();
+    self.last_process_ms.store(millis_since_start(), Ordering::Release);
+    if let Some(tx) = &self.state.event_tx {
+      drop(tx.send(AirPlaySessionEvent::Flushed { device_id: self.state.device_id.clone() }));
+    }
+    if !self.cast_paused.swap(true, Ordering::AcqRel)
+      && let Some(tx) = &self.state.event_tx
+    {
+      drop(tx.send(AirPlaySessionEvent::Paused { device_id: self.state.device_id.clone() }));
+    }
   }
 }
 
 impl Drop for RingSession {
   fn drop(&mut self) {
+    self.watch_cancel.store(true, Ordering::Release);
+    if let Some(handle) = self.watch.take() {
+      drop(handle.join());
+    }
     self.ring.clear();
     if let Some(tx) = &self.state.event_tx {
       drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
@@ -100,6 +179,51 @@ impl Drop for RingSession {
       "AirPlay audio session dropped (bridge should Cast-STOP)"
     );
   }
+}
+
+fn millis_since_start() -> u64 {
+  static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+  let start = START.get_or_init(Instant::now);
+  u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn spawn_pause_watch(
+  state: Arc<DeviceAudioState>,
+  last_process_ms: Arc<AtomicU64>,
+  had_pcm: Arc<AtomicBool>,
+  cast_paused: Arc<AtomicBool>,
+  cancel: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+  std::thread::Builder::new()
+    .name(format!("ap-pause-{}", short_device_id(&state.device_id)))
+    .spawn(move || {
+      while !cancel.load(Ordering::Acquire) {
+        std::thread::sleep(PAUSE_POLL);
+        if cancel.load(Ordering::Acquire) {
+          break;
+        }
+        if !had_pcm.load(Ordering::Acquire) {
+          continue;
+        }
+        let last = last_process_ms.load(Ordering::Acquire);
+        let now = millis_since_start();
+        let idle_ms = now.saturating_sub(last);
+        if idle_ms >= u64::try_from(PAUSE_IDLE.as_millis()).unwrap_or(250)
+          && !cast_paused.swap(true, Ordering::AcqRel)
+          && let Some(tx) = &state.event_tx
+        {
+          drop(tx.send(AirPlaySessionEvent::Paused { device_id: state.device_id.clone() }));
+        }
+      }
+    })
+    .unwrap_or_else(|_| {
+      // Spawn failed: fall back to a no-op join handle via a finished thread.
+      std::thread::spawn(|| {})
+    })
+}
+
+fn short_device_id(id: &str) -> String {
+  id.chars().take(8).collect()
 }
 
 /// Creates ring-backed sessions and notifies the bridge on lifecycle events.
@@ -126,7 +250,7 @@ impl AudioHandler for RingHandler {
         ring: Arc::clone(&ring),
       }));
     }
-    Box::new(RingSession { state: Arc::clone(&self.state), ring })
+    Box::new(RingSession::new(Arc::clone(&self.state), ring))
   }
 
   fn on_volume(&self, volume: f32) {

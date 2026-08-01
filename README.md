@@ -43,7 +43,7 @@ The app uses **host network** (`host_network: true`) so mDNS discovery, AirPlay 
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/felipefdl/play-on-air:0.1.3` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:0.1.4` | Version tag (matches app `config.yaml` / Cargo package version) |
 | `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
 | `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
 
@@ -55,7 +55,7 @@ Standalone run (host network required for mDNS):
 docker run --rm --network host \
   -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
   -v "$PWD/config:/config" \
-  ghcr.io/felipefdl/play-on-air:0.1.3
+  ghcr.io/felipefdl/play-on-air:0.1.4
 ```
 
 ## Optional config

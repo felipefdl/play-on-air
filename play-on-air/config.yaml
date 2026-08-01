@@ -1,5 +1,5 @@
 name: PlayOnAir
-version: "0.1.3"
+version: "0.1.4"
 slug: play_on_air
 description: >
   Chromecast devices as AirPlay 2 speakers on the local network.

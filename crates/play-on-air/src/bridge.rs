@@ -457,12 +457,53 @@ impl Bridge {
       },
     }
   }
+
+  /// Pause Cast media immediately (AirPlay rate=0 / flush). Keeps HTTP + session warm.
+  async fn handle_pause(&self, device_id: &str) {
+    if !self.sessions.lock().contains_key(device_id) {
+      return;
+    }
+    tracing::info!(%device_id, "AirPlay paused; pausing Cast media");
+    let pool = Arc::clone(&self.cast_pool);
+    let id = device_id.to_owned();
+    match tokio::task::spawn_blocking(move || pool.pause(&id)).await {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => {
+        tracing::debug!(device_id = %device_id, error = %err, "Cast pause failed");
+      },
+      Err(err) => {
+        tracing::debug!(device_id = %device_id, error = %err, "Cast pause task join failed");
+      },
+    }
+  }
+
+  /// Resume Cast media after AirPlay playout restarts.
+  async fn handle_resume(&self, device_id: &str) {
+    if !self.sessions.lock().contains_key(device_id) {
+      return;
+    }
+    tracing::info!(%device_id, "AirPlay resumed; resuming Cast media");
+    let pool = Arc::clone(&self.cast_pool);
+    let id = device_id.to_owned();
+    match tokio::task::spawn_blocking(move || pool.play(&id)).await {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => {
+        tracing::debug!(device_id = %device_id, error = %err, "Cast play failed");
+      },
+      Err(err) => {
+        tracing::debug!(device_id = %device_id, error = %err, "Cast play task join failed");
+      },
+    }
+  }
 }
 
 const fn event_device_id(event: &AirPlaySessionEvent) -> &str {
   match event {
     AirPlaySessionEvent::Started { device_id, .. }
     | AirPlaySessionEvent::Ended { device_id }
+    | AirPlaySessionEvent::Paused { device_id }
+    | AirPlaySessionEvent::Resumed { device_id }
+    | AirPlaySessionEvent::Flushed { device_id }
     | AirPlaySessionEvent::Volume { device_id, .. } => device_id.as_str(),
   }
 }
@@ -489,6 +530,16 @@ async fn device_worker_loop(
       },
       AirPlaySessionEvent::Ended { device_id: event_device } => {
         bridge.handle_session_end(&event_device).await;
+      },
+      AirPlaySessionEvent::Paused { device_id: event_device } => {
+        bridge.handle_pause(&event_device).await;
+      },
+      AirPlaySessionEvent::Resumed { device_id: event_device } => {
+        bridge.handle_resume(&event_device).await;
+      },
+      AirPlaySessionEvent::Flushed { device_id: event_device } => {
+        // Ring already cleared; pause Cast so Nest does not play stale buffer.
+        bridge.handle_pause(&event_device).await;
       },
       AirPlaySessionEvent::Volume { device_id: event_device, volume_db } => {
         bridge.handle_volume(&event_device, volume_db).await;

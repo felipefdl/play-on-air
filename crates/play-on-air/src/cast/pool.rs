@@ -46,6 +46,10 @@ enum CastWorkerCmd {
   },
   /// Stop active media session (if any); keep TCP warm.
   Stop { reply: SyncSender<Result<()>> },
+  /// Pause active media session (keep session id for later PLAY).
+  Pause { reply: SyncSender<Result<()>> },
+  /// Resume a paused media session.
+  Play { reply: SyncSender<Result<()>> },
   /// Best-effort stop; always replies after attempt (or immediately if no session).
   StopBestEffort { reply: SyncSender<()> },
   /// Exit the worker loop and drop the Cast device.
@@ -218,6 +222,32 @@ impl CastPool {
     }
   }
 
+  /// Pause active media (no-op if no session). Keeps session id for [`Self::play`].
+  pub fn pause(&self, device_id: &str) -> Result<()> {
+    let tx = self.cmd_tx(device_id)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::Pause { reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast pause timed out for {device_id}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast pause reply dropped for {device_id}"))),
+    }
+  }
+
+  /// Resume a paused media session (no-op if no session).
+  pub fn play(&self, device_id: &str) -> Result<()> {
+    let tx = self.cmd_tx(device_id)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::Play { reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast play timed out for {device_id}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast play reply dropped for {device_id}"))),
+    }
+  }
+
   /// Best-effort media STOP with a wall-clock timeout; never tears down warm TCP.
   pub fn stop_best_effort(&self, device_id: &str, timeout: Duration) {
     let Ok(tx) = self.cmd_tx(device_id) else {
@@ -331,6 +361,14 @@ fn worker_main(device_id: String, host: String, hostname: String, port: u16, cmd
       },
       Ok(CastWorkerCmd::Stop { reply }) => {
         let result = state.handle_stop();
+        drop(reply.send(result));
+      },
+      Ok(CastWorkerCmd::Pause { reply }) => {
+        let result = state.handle_pause();
+        drop(reply.send(result));
+      },
+      Ok(CastWorkerCmd::Play { reply }) => {
+        let result = state.handle_play();
         drop(reply.send(result));
       },
       Ok(CastWorkerCmd::StopBestEffort { reply }) => {
@@ -604,6 +642,67 @@ impl WorkerState {
       transport_id = %session.transport_id,
       media_session_id = session.media_session_id,
       "warm Cast STOP ok"
+    );
+    Ok(())
+  }
+
+  fn handle_pause(&mut self) -> Result<()> {
+    // Clone ids so the CONNECT loop can drop `self` on failure without holding `active`.
+    let Some((transport_id, media_session_id)) =
+      self.active.as_ref().map(|s| (s.transport_id.clone(), s.media_session_id))
+    else {
+      return Ok(());
+    };
+    let Some(device) = self.device.as_ref() else {
+      return Ok(());
+    };
+    for dest in ["receiver-0", transport_id.as_str()] {
+      if let Err(err) = device.connection.connect(dest) {
+        tracing::debug!(device_id = %self.device_id, dest, error = %err, "warm Cast PAUSE connect failed");
+        self.drop_device();
+        return Err(Error::Cast(format!("warm pause connect {dest}: {err}")));
+      }
+    }
+    drop(
+      device
+        .media
+        .pause(transport_id.as_str(), media_session_id)
+        .map_err(|err| Error::Cast(format!("warm pause: {err}")))?,
+    );
+    tracing::debug!(
+      device_id = %self.device_id,
+      media_session_id,
+      "warm Cast PAUSE ok"
+    );
+    Ok(())
+  }
+
+  fn handle_play(&mut self) -> Result<()> {
+    let Some((transport_id, media_session_id)) =
+      self.active.as_ref().map(|s| (s.transport_id.clone(), s.media_session_id))
+    else {
+      return Ok(());
+    };
+    let Some(device) = self.device.as_ref() else {
+      return Ok(());
+    };
+    for dest in ["receiver-0", transport_id.as_str()] {
+      if let Err(err) = device.connection.connect(dest) {
+        tracing::debug!(device_id = %self.device_id, dest, error = %err, "warm Cast PLAY connect failed");
+        self.drop_device();
+        return Err(Error::Cast(format!("warm play connect {dest}: {err}")));
+      }
+    }
+    drop(
+      device
+        .media
+        .play(transport_id.as_str(), media_session_id)
+        .map_err(|err| Error::Cast(format!("warm play: {err}")))?,
+    );
+    tracing::debug!(
+      device_id = %self.device_id,
+      media_session_id,
+      "warm Cast PLAY ok"
     );
     Ok(())
   }

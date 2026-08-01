@@ -419,41 +419,50 @@ fn live_wav_byte_stream(
       return Some(live.emit_chunk(i16_slice_to_le_bytes(&silence)));
     }
 
-    loop {
-      // Re-check inside the underrun loop so a superseded body stops pulling
-      // (and stops sleeping) instead of stealing frames from the new request.
-      if live.is_superseded() {
-        return None;
-      }
-      if live.bytes_sent >= live.threshold {
-        live.signal_rollover();
-        return None;
-      }
-      // Budget frames *before* pop so we never drop already-popped PCM at the cap.
-      let remaining = live.threshold.saturating_sub(live.bytes_sent);
-      let bytes_per_frame = u64::from(live.channels).saturating_mul(2);
-      if bytes_per_frame == 0 {
-        return None;
-      }
-      let max_frames_fit = usize::try_from(remaining / bytes_per_frame).unwrap_or(0);
-      if max_frames_fit == 0 {
-        live.signal_rollover();
-        return None;
-      }
-      let want_frames = LIVE_CHUNK_FRAMES.min(max_frames_fit);
-      let frames = live.ring.pop_i16(want_frames, &mut live.i16_buf);
-      if frames == 0 {
-        // Brief underrun: keep the HTTP body open for Cast progressive pull.
-        sleep(LIVE_UNDERRUN_SLEEP).await;
-        continue;
-      }
-      // After pop: if a newer GET owns the ring, drop this chunk (unavoidable on supersede).
-      if live.is_superseded() {
-        return None;
-      }
-      let chunk = i16_slice_to_le_bytes(&live.i16_buf);
-      return Some(live.emit_chunk(chunk));
+    // Re-check before pop so a superseded body stops instead of stealing frames.
+    if live.is_superseded() {
+      return None;
     }
+    if live.bytes_sent >= live.threshold {
+      live.signal_rollover();
+      return None;
+    }
+    // Budget frames *before* pop so we never drop already-popped PCM at the cap.
+    let remaining = live.threshold.saturating_sub(live.bytes_sent);
+    let bytes_per_frame = u64::from(live.channels).saturating_mul(2);
+    if bytes_per_frame == 0 {
+      return None;
+    }
+    let max_frames_fit = usize::try_from(remaining / bytes_per_frame).unwrap_or(0);
+    if max_frames_fit == 0 {
+      live.signal_rollover();
+      return None;
+    }
+    let want_frames = LIVE_CHUNK_FRAMES.min(max_frames_fit);
+    let frames = live.ring.pop_i16(want_frames, &mut live.i16_buf);
+    if frames == 0 {
+      // Nest progressive pull underruns if the body stalls. Feed silence so the
+      // Cast buffer keeps filling while AirPlay is paused or briefly late.
+      // Pace with a short sleep so we do not spin when the client is idle.
+      let samples = want_frames.saturating_mul(usize::from(live.channels));
+      let chunk_bytes = samples.saturating_mul(2) as u64;
+      if live.bytes_sent.saturating_add(chunk_bytes) > live.threshold {
+        live.signal_rollover();
+        return None;
+      }
+      sleep(LIVE_UNDERRUN_SLEEP).await;
+      if live.is_superseded() {
+        return None;
+      }
+      let silence = vec![0_i16; samples];
+      return Some(live.emit_chunk(i16_slice_to_le_bytes(&silence)));
+    }
+    // After pop: if a newer GET owns the ring, drop this chunk (unavoidable on supersede).
+    if live.is_superseded() {
+      return None;
+    }
+    let chunk = i16_slice_to_le_bytes(&live.i16_buf);
+    Some(live.emit_chunk(chunk))
   })
 }
 
