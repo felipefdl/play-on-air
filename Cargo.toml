@@ -147,6 +147,10 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 return_self_not_must_use = "allow"
 double_must_use = "allow"
+# MSRV 1.88 nursery scores this far above the clippy.toml threshold on ordinary
+# control-flow (Cast workers, discovery). Current clippy (1.9x) does not gate CI
+# the same way. Prefer design review over this unstable metric.
+cognitive_complexity = "allow"
 # Conflicts with unreachable_pub on items in private modules; prefer explicit pub(crate).
 redundant_pub_crate = "allow"
 # Binary crates often look "redundant" to cargo lints; lockfile is the source of truth.
