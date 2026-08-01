@@ -683,18 +683,31 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     match receiver.recv_timeout(MDNS_RECV_POLL) {
       Ok(ServiceEvent::ServiceResolved(resolved)) => {
         let device = device_from_mdns_resolved(resolved.as_ref());
-        tracing::info!(
-          id = %device.id,
-          name = %device.name,
-          host = %device.host,
-          port = device.port,
-          "Chromecast appeared"
-        );
+        let is_new = registry.get(&device.id).is_none();
+        if is_new {
+          tracing::info!(
+            id = %device.id,
+            name = %device.name,
+            host = %device.host,
+            port = device.port,
+            "Chromecast appeared"
+          );
+        } else {
+          tracing::debug!(
+            id = %device.id,
+            host = %device.host,
+            "Chromecast re-resolved"
+          );
+        }
         registry.appear(device);
       },
       Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
+        // mdns-sd often emits ServiceRemoved during re-query / interface churn even
+        // while the Cast device is still online. Acting on that withdraws AirPlay
+        // ads and breaks iOS (RC-only probes, TEARDOWN, no audio). Rely on
+        // expire_stale for true departures; only refresh last_seen via Resolved.
         let instance = instance_from_mdns_fullname(&fullname);
-        leave_by_instance(registry, instance);
+        tracing::debug!(instance, "ignoring mdns-sd ServiceRemoved (debounce via stale TTL)");
       },
       Ok(ServiceEvent::SearchStopped(ty)) => {
         tracing::warn!(%ty, "mdns-sd search stopped");

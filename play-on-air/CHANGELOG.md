@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Ignore noisy `mdns-sd` ServiceRemoved events that were withdrawing AirPlay ads
+  every few seconds (iOS stayed on Remote Control only and never started audio).
+- Device departures still use stale TTL when re-resolve stops.
+
 ## 0.1.1
 
 - Linux Chromecast discovery uses in-process mDNS (`mdns-sd`) instead of `avahi-browse`.
