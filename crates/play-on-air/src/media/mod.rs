@@ -2,4 +2,4 @@
 
 pub mod http;
 
-pub use http::{MediaContent, MediaServer, MediaServerHandle};
+pub use http::{MediaContent, MediaServer, MediaServerHandle, RolloverSignal};
