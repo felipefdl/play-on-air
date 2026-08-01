@@ -22,7 +22,6 @@ bytes = { workspace = true }
 clap = { workspace = true }
 flacenc = { workspace = true }
 futures-util = { workspace = true }
-hound = { workspace = true }
 if-addrs = "0.13"
 parking_lot = { workspace = true }
 rust_cast = { workspace = true }
@@ -39,6 +38,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 claxon = { workspace = true }
+hound = { workspace = true }
 symphonia = { workspace = true }
 symphonia-core = "0.6"
 tempfile = "3"
