@@ -205,7 +205,7 @@ impl CastPool {
     }
   }
 
-  /// Stop the active media session on the warm connection (errors if no session).
+  /// Stop the active media session on the warm connection (no-op if no session).
   pub fn stop(&self, device_id: &str) -> Result<()> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
