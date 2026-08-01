@@ -23,6 +23,7 @@ clap = { workspace = true }
 flacenc = { workspace = true }
 futures-util = { workspace = true }
 hound = { workspace = true }
+if-addrs = "0.13"
 parking_lot = { workspace = true }
 rust_cast = { workspace = true }
 serde = { workspace = true }

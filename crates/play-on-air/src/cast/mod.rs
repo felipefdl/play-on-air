@@ -601,28 +601,45 @@ impl CastController {
   where
     F: FnMut(&rust_cast::CastDevice<'_>) -> Result<T>,
   {
-    const ATTEMPTS: u32 = 5;
+    const ATTEMPTS: u32 = 8;
     let mut last_err: Option<Error> = None;
+    let candidates = crate::net::cast_connect_hosts(self.host.as_str(), self.hostname.as_deref());
+    // Wake ARP on every candidate once up front.
+    for c in &candidates {
+      crate::net::wake_cast_host(c);
+    }
+
     for attempt in 1..=ATTEMPTS {
       self.refresh_host();
-      match self.with_device(&mut f) {
-        Ok(v) => return Ok(v),
-        Err(err) => {
-          let retriable = is_retriable_cast_error(&err);
-          tracing::warn!(
-            attempt,
-            max = ATTEMPTS,
-            host = %self.host,
-            retriable,
-            error = %err,
-            "Cast connect attempt failed"
-          );
-          last_err = Some(err);
-          if !retriable || attempt == ATTEMPTS {
-            break;
-          }
-          std::thread::sleep(std::time::Duration::from_millis(300 * u64::from(attempt)));
-        },
+      let mut hosts = crate::net::cast_connect_hosts(self.host.as_str(), self.hostname.as_deref());
+      if hosts.is_empty() {
+        hosts.push(self.host.clone());
+      }
+      for host in hosts {
+        self.host = host;
+        crate::net::wake_cast_host(&self.host);
+        match self.with_device(&mut f) {
+          Ok(v) => return Ok(v),
+          Err(err) => {
+            let retriable = is_retriable_cast_error(&err);
+            tracing::warn!(
+              attempt,
+              max = ATTEMPTS,
+              host = %self.host,
+              retriable,
+              error = %err,
+              "Cast connect attempt failed"
+            );
+            last_err = Some(err);
+            if !retriable {
+              // Hard protocol error: stop trying other hosts this attempt.
+              break;
+            }
+          },
+        }
+      }
+      if attempt < ATTEMPTS {
+        std::thread::sleep(std::time::Duration::from_millis(400 * u64::from(attempt)));
       }
     }
     Err(last_err.unwrap_or_else(|| Error::Cast("Cast connect failed with no error detail".to_owned())))
