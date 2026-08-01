@@ -3,7 +3,7 @@
 # PlayOnAir multi-stage image (glibc). Used by Home Assistant OS via GHCR.
 # Build args: BUILD_VERSION, BUILD_ARCH (HA: amd64 | aarch64)
 
-ARG BUILD_VERSION=0.1.0
+ARG BUILD_VERSION=0.1.1
 ARG BUILD_ARCH=amd64
 
 # -----------------------------------------------------------------------------
@@ -43,7 +43,6 @@ ARG BUILD_ARCH
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    avahi-utils \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 

@@ -9,7 +9,7 @@ Chromecast devices as AirPlay 2 speakers on the local network. Zero setup by def
 3. Add `https://github.com/felipefdl/play-on-air` and wait for the store to refresh.
 4. Find **PlayOnAir**, install, then **Start**.
 
-Host networking is enabled in the app config (`host_network: true`). That is required for mDNS discovery, AirPlay advertisement, and Cast control on the LAN. The tradeoff is that the container shares the host network namespace (not an isolated bridge network).
+Host networking is enabled in the app config (`host_network: true`). That is required for mDNS discovery (in-process multicast, no Avahi D-Bus), AirPlay advertisement, and Cast control on the LAN. The tradeoff is that the container shares the host network namespace (not an isolated bridge network).
 
 ## Optional rename / hide
 
@@ -39,7 +39,7 @@ hide = true
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:
 
-`ghcr.io/felipefdl/play-on-air:0.1.0`
+`ghcr.io/felipefdl/play-on-air:0.1.1`
 
 Architectures: `amd64`, `aarch64`.
 

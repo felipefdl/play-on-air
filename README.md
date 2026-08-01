@@ -21,11 +21,11 @@ No config file and no flags are required. PlayOnAir discovers Chromecasts on the
 | Platform | Discovery backend |
 |----------|-------------------|
 | macOS | system `dns-sd` (Bonjour) |
-| Linux | `avahi-browse` (`avahi-utils`) |
+| Linux | in-process `mdns-sd` (multicast UDP; no Avahi daemon) |
 
 **macOS:** keep the process running on a machine on the same LAN as the Chromecasts and the iPhone. Allow **Local Network** access if macOS prompts for the binary. On the iPhone Control Center AirPlay list, look for names matching your Cast devices (for example speaker names from the Google Home app).
 
-**Linux:** install `avahi-utils` (provides `avahi-browse`) and ensure Avahi is running on the host.
+**Linux / HAOS:** use host networking so mDNS multicast reaches the LAN. No Avahi package is required.
 
 ## Home Assistant OS
 
@@ -43,19 +43,19 @@ The app uses **host network** (`host_network: true`) so mDNS discovery, AirPlay 
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/felipefdl/play-on-air:0.1.0` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:0.1.1` | Version tag (matches app `config.yaml` / Cargo package version) |
 | `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
 | `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
 
 Architectures: `linux/amd64`, `linux/arm64` (HA arch names `amd64`, `aarch64`).
 
-Standalone run (still needs host network and Avahi tools in the image):
+Standalone run (host network required for mDNS):
 
 ```bash
 docker run --rm --network host \
   -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
   -v "$PWD/config:/config" \
-  ghcr.io/felipefdl/play-on-air:0.1.0
+  ghcr.io/felipefdl/play-on-air:0.1.1
 ```
 
 ## Optional config

@@ -1,12 +1,13 @@
 //! Chromecast discovery via OS mDNS tools.
 //!
-//! - **macOS**: system `dns-sd` CLI (Bonjour). Pure-Rust mDNS and `astro-dnssd`
-//!   browse do not reliably see `_googlecast._tcp` on macOS, while Apple's
-//!   `dns-sd` does.
-//! - **Linux**: `avahi-browse -p -r` (parsable continuous browse + resolve).
+//! - **macOS**: system `dns-sd` CLI (Bonjour). Pure-Rust mDNS browse does not
+//!   reliably see `_googlecast._tcp` on macOS, while Apple's `dns-sd` does.
+//! - **Linux**: in-process `mdns-sd` browse (no avahi-daemon or D-Bus). HAOS
+//!   containers rarely have a working Avahi client socket; host network alone
+//!   is enough for multicast UDP.
 //!
 //! Registration (shairplay / Bonjour or Avahi) still works for AirPlay ads;
-//! discovery alone uses the CLI that matches the OS.
+//! discovery alone uses the backend that matches the OS.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -75,7 +76,7 @@ const fn discovery_backend_label() -> &'static str {
   }
   #[cfg(target_os = "linux")]
   {
-    "avahi-browse"
+    "mdns-sd"
   }
   #[cfg(not(any(target_os = "macos", target_os = "linux")))]
   {
@@ -653,33 +654,31 @@ pub fn parse_avahi_line(line: &str) -> Option<AvahiEvent> {
   }
 }
 
+/// mDNS service type including domain (required by `mdns-sd`).
+#[cfg(target_os = "linux")]
+const GOOGLECAST_MDNS_TYPE: &str = "_googlecast._tcp.local.";
+
+/// Poll cadence while waiting for mDNS events so shutdown stays responsive.
+#[cfg(target_os = "linux")]
+const MDNS_RECV_POLL: Duration = Duration::from_millis(250);
+
 #[cfg(target_os = "linux")]
 fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool>) -> Result<()> {
-  let mut child = spawn_avahi_browse()?;
-  let stdout = child
-    .stdout
-    .take()
-    .ok_or_else(|| Error::Discovery("avahi-browse missing stdout".to_owned()))?;
-  let reader = BufReader::new(stdout);
+  use mdns_sd::{ServiceDaemon, ServiceEvent};
+  use std::sync::mpsc::RecvTimeoutError;
 
-  let shared_child = Arc::new(std::sync::Mutex::new(child));
-  let session_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-  let watcher = spawn_shutdown_watcher(Arc::clone(&shared_child), Arc::clone(&session_done), shutdown.clone());
+  let daemon = ServiceDaemon::new()
+    .map_err(|err| Error::Discovery(format!("mdns-sd daemon failed (need host network / multicast UDP): {err}")))?;
+  let receiver = daemon
+    .browse(GOOGLECAST_MDNS_TYPE)
+    .map_err(|err| Error::Discovery(format!("mdns-sd browse failed: {err}")))?;
 
-  for raw_line in reader.lines() {
-    if *shutdown.borrow() {
-      break;
-    }
-    let Ok(line) = raw_line else {
-      tracing::warn!("avahi-browse read error");
-      break;
-    };
-    let Some(event) = parse_avahi_line(&line) else {
-      continue;
-    };
-    match event {
-      AvahiEvent::Resolved { instance, info } => {
-        let device = device_from_resolve(&instance, &info);
+  tracing::debug!(service = GOOGLECAST_MDNS_TYPE, "mdns-sd browse started");
+
+  while !*shutdown.borrow() {
+    match receiver.recv_timeout(MDNS_RECV_POLL) {
+      Ok(ServiceEvent::ServiceResolved(resolved)) => {
+        let device = device_from_mdns_resolved(resolved.as_ref());
         tracing::info!(
           id = %device.id,
           name = %device.name,
@@ -689,29 +688,75 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
         );
         registry.appear(device);
       },
-      AvahiEvent::Removed { instance } => {
-        leave_by_instance(registry, &instance);
+      Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
+        let instance = instance_from_mdns_fullname(&fullname);
+        leave_by_instance(registry, instance);
+      },
+      Ok(ServiceEvent::SearchStopped(ty)) => {
+        tracing::warn!(%ty, "mdns-sd search stopped");
+        break;
+      },
+      Ok(ServiceEvent::SearchStarted(_) | ServiceEvent::ServiceFound(_, _)) => {},
+      // Future non_exhaustive variants: ignore.
+      Ok(_) => {},
+      Err(RecvTimeoutError::Timeout) => {},
+      Err(RecvTimeoutError::Disconnected) => {
+        tracing::warn!("mdns-sd browse channel disconnected");
+        break;
       },
     }
   }
 
-  session_done.store(true, std::sync::atomic::Ordering::Relaxed);
-  if let Ok(mut guard) = shared_child.lock() {
-    terminate_child(&mut guard);
+  if let Err(err) = daemon.shutdown() {
+    tracing::debug!(error = %err, "mdns-sd daemon shutdown");
   }
-  drop(watcher.join());
   Ok(())
 }
 
+/// Instance label from a full mDNS name (`Name._googlecast._tcp.local.`).
 #[cfg(target_os = "linux")]
-fn spawn_avahi_browse() -> Result<Child> {
-  // -p parsable, -r resolve, continuous (no -t terminate)
-  Command::new("avahi-browse")
-    .args(["-p", "-r", GOOGLECAST_REGTYPE])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .map_err(|err| Error::Discovery(format!("failed to spawn avahi-browse: {err}")))
+fn instance_from_mdns_fullname(fullname: &str) -> &str {
+  fullname
+    .split("._googlecast._tcp")
+    .next()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .unwrap_or(fullname)
+}
+
+/// Map a resolved mDNS service into a Cast [`Device`].
+#[cfg(target_os = "linux")]
+fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
+  let props = resolved.get_properties();
+  let id = props
+    .get("id")
+    .map(|p| p.val_str().to_owned())
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| instance_from_mdns_fullname(resolved.get_fullname()).to_owned());
+  let name = props
+    .get("fn")
+    .map(|p| p.val_str().to_owned())
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| instance_from_mdns_fullname(resolved.get_fullname()).replace('-', " "));
+  let hostname = resolved.get_hostname().trim_end_matches('.').to_owned();
+  let host = resolved
+    .get_addresses_v4()
+    .into_iter()
+    .next()
+    .map(|ip| ip.to_string())
+    .unwrap_or_else(|| resolve_cast_host(&hostname));
+  let port = {
+    let p = resolved.get_port();
+    if p == 0 { 8009 } else { p }
+  };
+  Device {
+    id,
+    name,
+    host,
+    hostname,
+    port,
+    last_seen: Instant::now(),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +766,7 @@ fn spawn_avahi_browse() -> Result<Child> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn run_browse_session(_registry: &DeviceRegistry, _shutdown: &watch::Receiver<bool>) -> Result<()> {
   Err(Error::Discovery(
-    "Chromecast discovery requires dns-sd (macOS) or avahi-browse (Linux)".to_owned(),
+    "Chromecast discovery requires dns-sd (macOS) or mdns-sd (Linux)".to_owned(),
   ))
 }
 
