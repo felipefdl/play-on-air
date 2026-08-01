@@ -104,7 +104,7 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
       continue;
     };
     match event.kind {
-      BrowseKind::Add => match resolve_instance(&event.instance) {
+      BrowseKind::Add => match resolve_instance(&event.instance, shutdown) {
         Ok(device) => {
           tracing::info!(
             id = %device.id,
@@ -325,14 +325,19 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
   }
 }
 
-fn resolve_instance(instance: &str) -> Result<Device> {
-  let output = run_lookup(instance)?;
+fn resolve_instance(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<Device> {
+  let output = run_lookup(instance, shutdown)?;
   let info = parse_lookup_output(&output)
     .ok_or_else(|| Error::Discovery(format!("could not parse dns-sd -L for {instance}")))?;
   Ok(device_from_resolve(instance, &info))
 }
 
-fn run_lookup(instance: &str) -> Result<String> {
+/// Max wall-clock for one `dns-sd -L` resolve before the child is killed.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Watchdog poll cadence for lookup deadline / shutdown checks.
+const LOOKUP_WATCH_POLL: Duration = Duration::from_millis(100);
+
+fn run_lookup(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<String> {
   // dns-sd -L streams; collect for a short window then kill.
   let mut child = Command::new("dns-sd")
     .args(["-L", instance, GOOGLECAST_REGTYPE, "local."])
@@ -346,9 +351,32 @@ fn run_lookup(instance: &str) -> Result<String> {
     .take()
     .ok_or_else(|| Error::Discovery("dns-sd -L missing stdout".to_owned()))?;
 
+  // `lines()` blocks until dns-sd prints; a never-resolving instance would
+  // wedge the discovery thread (and runtime shutdown, which joins blocking
+  // tasks) forever. Kill the child at the deadline or on shutdown so the
+  // blocking reader always unblocks.
+  let deadline = Instant::now() + LOOKUP_TIMEOUT;
+  let shared_child = Arc::new(std::sync::Mutex::new(child));
+  let lookup_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let watchdog = {
+    let watchdog_child = Arc::clone(&shared_child);
+    let watchdog_done = Arc::clone(&lookup_done);
+    let watchdog_shutdown = shutdown.clone();
+    std::thread::spawn(move || {
+      while !watchdog_done.load(std::sync::atomic::Ordering::Relaxed) {
+        if Instant::now() > deadline || *watchdog_shutdown.borrow() {
+          if let Ok(mut guard) = watchdog_child.lock() {
+            terminate_child(&mut guard);
+          }
+          break;
+        }
+        std::thread::sleep(LOOKUP_WATCH_POLL);
+      }
+    })
+  };
+
   let reader = BufReader::new(stdout);
   let mut buf = String::new();
-  let deadline = Instant::now() + Duration::from_secs(3);
   for raw_line in reader.lines() {
     if Instant::now() > deadline {
       break;
@@ -363,7 +391,11 @@ fn run_lookup(instance: &str) -> Result<String> {
       break;
     }
   }
-  terminate_child(&mut child);
+  lookup_done.store(true, std::sync::atomic::Ordering::Relaxed);
+  if let Ok(mut guard) = shared_child.lock() {
+    terminate_child(&mut guard);
+  }
+  drop(watchdog.join());
   if buf.is_empty() {
     return Err(Error::Discovery(format!("empty dns-sd -L for {instance}")));
   }
