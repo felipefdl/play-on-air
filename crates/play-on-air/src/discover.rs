@@ -700,7 +700,7 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
         tracing::warn!(%ty, "mdns-sd search stopped");
         break;
       },
-      Ok(ServiceEvent::SearchStarted(_) | ServiceEvent::ServiceFound(_, _)) => {},
+      // SearchStarted / ServiceFound / future non_exhaustive variants.
       Ok(_) => {},
       Err(err) => {
         // Discriminate without depending on flume types in our crate surface.
@@ -750,8 +750,7 @@ fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
     .get_addresses_v4()
     .into_iter()
     .next()
-    .map(|ip| ip.to_string())
-    .unwrap_or_else(|| resolve_cast_host(&hostname));
+    .map_or_else(|| resolve_cast_host(&hostname), |ip| ip.to_string());
   let port = {
     let p = resolved.get_port();
     if p == 0 { 8009 } else { p }
