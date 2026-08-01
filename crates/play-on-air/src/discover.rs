@@ -9,7 +9,9 @@
 //! Registration (shairplay / Bonjour or Avahi) still works for AirPlay ads;
 //! discovery alone uses the backend that matches the OS.
 
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "macos")]
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -84,6 +86,7 @@ const fn discovery_backend_label() -> &'static str {
   }
 }
 
+#[cfg(target_os = "macos")]
 fn terminate_child(child: &mut Child) {
   drop(child.kill());
   drop(child.wait());
@@ -314,6 +317,7 @@ pub fn resolve_cast_host(hostname: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Kill `child` when `shutdown` is set so a blocking stdout reader unblocks.
+#[cfg(target_os = "macos")]
 fn spawn_shutdown_watcher(
   shared_child: Arc<std::sync::Mutex<Child>>,
   session_done: Arc<std::sync::atomic::AtomicBool>,
@@ -665,7 +669,6 @@ const MDNS_RECV_POLL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool>) -> Result<()> {
   use mdns_sd::{ServiceDaemon, ServiceEvent};
-  use std::sync::mpsc::RecvTimeoutError;
 
   let daemon = ServiceDaemon::new()
     .map_err(|err| Error::Discovery(format!("mdns-sd daemon failed (need host network / multicast UDP): {err}")))?;
@@ -676,6 +679,7 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
   tracing::debug!(service = GOOGLECAST_MDNS_TYPE, "mdns-sd browse started");
 
   while !*shutdown.borrow() {
+    // flume RecvTimeoutError: Timeout keeps the loop (shutdown poll); other = end.
     match receiver.recv_timeout(MDNS_RECV_POLL) {
       Ok(ServiceEvent::ServiceResolved(resolved)) => {
         let device = device_from_mdns_resolved(resolved.as_ref());
@@ -697,12 +701,15 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
         break;
       },
       Ok(ServiceEvent::SearchStarted(_) | ServiceEvent::ServiceFound(_, _)) => {},
-      // Future non_exhaustive variants: ignore.
       Ok(_) => {},
-      Err(RecvTimeoutError::Timeout) => {},
-      Err(RecvTimeoutError::Disconnected) => {
-        tracing::warn!("mdns-sd browse channel disconnected");
-        break;
+      Err(err) => {
+        // Discriminate without depending on flume types in our crate surface.
+        let msg = err.to_string();
+        if msg.contains("disconnect") || msg.contains("Disconnect") {
+          tracing::warn!(error = %err, "mdns-sd browse channel disconnected");
+          break;
+        }
+        // Timeout: loop and re-check shutdown.
       },
     }
   }
