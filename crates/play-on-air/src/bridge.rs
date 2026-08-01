@@ -31,6 +31,23 @@ struct ActiveSession {
   cast: CastController,
 }
 
+/// Ordered teardown steps for an active bridge session.
+///
+/// [`Bridge::handle_session_end`] always runs these in order: media HTTP first,
+/// then timed best-effort Cast STOP. Media must not wait on STOP success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndStep {
+  /// Shut down the local LiveWav HTTP server (stop underrun immediately).
+  MediaShutdown,
+  /// Best-effort Cast STOP with timeout (may fail or time out).
+  CastStopBestEffort,
+}
+
+/// Shipped session-end order (media first, then Cast STOP).
+pub const fn session_end_steps() -> [SessionEndStep; 2] {
+  [SessionEndStep::MediaShutdown, SessionEndStep::CastStopBestEffort]
+}
+
 /// Orchestrates media HTTP + Cast load for AirPlay lifecycle events.
 pub struct Bridge {
   registry: Arc<DeviceRegistry>,
@@ -165,13 +182,10 @@ impl Bridge {
       let mut guard = self.sessions.lock();
       guard.remove(device_id)
     };
-    let Some(mut active) = removed else {
+    let Some(active) = removed else {
       return;
     };
-    // Always stop LiveWav HTTP first so underrun ends even if Cast STOP hangs.
-    active.media.shutdown();
-    // Best-effort Cast STOP with timeout; never block the AirPlay lifecycle path.
-    active.cast.stop_active_best_effort(Duration::from_secs(2));
+    end_active_session(active);
     tracing::info!(%device_id, "bridge session ended (media dropped; Cast STOP best-effort)");
   }
 
@@ -183,6 +197,26 @@ impl Bridge {
     };
     if let Some(Err(err)) = result {
       tracing::debug!(%device_id, error = %err, "Cast volume sync failed");
+    }
+  }
+}
+
+/// Run shipped teardown order for one active session.
+fn end_active_session(active: ActiveSession) {
+  let ActiveSession { media, mut cast } = active;
+  let mut media = Some(media);
+  for step in session_end_steps() {
+    match step {
+      SessionEndStep::MediaShutdown => {
+        // Always stop LiveWav HTTP first so underrun ends even if Cast STOP hangs.
+        if let Some(handle) = media.take() {
+          handle.shutdown();
+        }
+      },
+      SessionEndStep::CastStopBestEffort => {
+        // Best-effort Cast STOP with timeout; never block the AirPlay lifecycle path.
+        cast.stop_active_best_effort(Duration::from_secs(2));
+      },
     }
   }
 }
@@ -243,6 +277,81 @@ impl RingLookup for crate::airplay::AirPlayManager {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cast::MediaSessionRef;
+  use crate::registry::Device;
+  use std::time::{Duration, Instant};
+
+  #[test]
+  fn session_end_steps_media_before_cast_stop() {
+    let steps = session_end_steps();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0], SessionEndStep::MediaShutdown);
+    assert_eq!(steps[1], SessionEndStep::CastStopBestEffort);
+  }
+
+  #[tokio::test]
+  async fn handle_session_end_shuts_media_before_cast_stop_and_does_not_hang() {
+    let registry = Arc::new(DeviceRegistry::new());
+    registry.appear(Device {
+      id: "dev-1".to_owned(),
+      name: "Test".to_owned(),
+      host: "127.0.0.1".to_owned(),
+      port: 9,
+      last_seen: Instant::now(),
+    });
+    let bridge = Bridge::new(Arc::clone(&registry));
+
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let health_url = format!("{}/health", media.base_url);
+    assert!(http_get_status_ok(&health_url).await, "media must be up before end");
+
+    let mut cast = CastController::new("127.0.0.1", 9);
+    cast.set_active_for_test(MediaSessionRef::new("web-1", 3));
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert("dev-1".to_owned(), ActiveSession { media, cast }));
+    }
+
+    let start = Instant::now();
+    // Shipped path: session_end_steps() → MediaShutdown then timed CastStopBestEffort.
+    bridge.handle_session_end("dev-1");
+    let elapsed = start.elapsed();
+    assert!(
+      elapsed < Duration::from_secs(4),
+      "session end must not hang on Cast STOP; elapsed={elapsed:?}"
+    );
+    assert!(bridge.sessions.lock().is_empty(), "session removed from map");
+    // Media HTTP must already be down (MediaShutdown ran first / independently).
+    assert!(
+      !http_get_status_ok(&health_url).await,
+      "media.shutdown must run on session end so LiveWav stops"
+    );
+  }
+
+  async fn http_get_status_ok(url: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let Some(without_scheme) = url.strip_prefix("http://") else {
+      return false;
+    };
+    let Some((host_port, path)) = without_scheme.split_once('/') else {
+      return false;
+    };
+    let Ok(mut stream) = TcpStream::connect(host_port).await else {
+      return false;
+    };
+    let req = format!("GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).await.is_err() {
+      return false;
+    }
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).await.is_err() {
+      return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.contains("200")
+  }
 
   #[test]
   fn encode_session_snapshot_flac_roundtrip() {

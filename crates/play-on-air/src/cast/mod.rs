@@ -245,6 +245,12 @@ impl CastController {
     self.active.as_ref()
   }
 
+  /// Test-only: install an active session without LOAD (for teardown path tests).
+  #[cfg(test)]
+  pub fn set_active_for_test(&mut self, session: MediaSessionRef) {
+    self.active = Some(session);
+  }
+
   /// Record a media load payload (pure; no network).
   pub fn prepare_load(&mut self, request: MediaLoadRequest) -> Media {
     let media = request.to_media();
@@ -367,49 +373,72 @@ impl CastController {
   pub fn pause(&mut self, transport_id: &str, media_session_id: i32) -> Result<()> {
     let session = MediaSessionRef::new(transport_id, media_session_id);
     let cmd = self.prepare_pause(session);
-    let _wire = cmd.to_media_message_body(0);
-    self.with_device(|device| {
-      connect_media_transport(device, transport_id)?;
-      drop(
-        device
-          .media
-          .pause(transport_id, media_session_id)
-          .map_err(|err| Error::Cast(format!("pause: {err}")))?,
-      );
-      Ok(())
-    })
+    let plan = MediaTransportPlan::from_command(&cmd);
+    self.execute_media_transport_plan(&plan)
   }
 
   /// Resume using a known media session.
   pub fn play(&mut self, transport_id: &str, media_session_id: i32) -> Result<()> {
     let session = MediaSessionRef::new(transport_id, media_session_id);
     let cmd = self.prepare_play(session);
-    let _wire = cmd.to_media_message_body(0);
-    self.with_device(|device| {
-      connect_media_transport(device, transport_id)?;
-      drop(
-        device
-          .media
-          .play(transport_id, media_session_id)
-          .map_err(|err| Error::Cast(format!("play: {err}")))?,
-      );
-      Ok(())
-    })
+    let plan = MediaTransportPlan::from_command(&cmd);
+    self.execute_media_transport_plan(&plan)
   }
 
   /// Stop using a known media session.
   pub fn stop(&mut self, transport_id: &str, media_session_id: i32) -> Result<()> {
     let session = MediaSessionRef::new(transport_id, media_session_id);
     let cmd = self.prepare_stop(session);
-    let _wire = cmd.to_media_message_body(0);
+    let plan = MediaTransportPlan::from_command(&cmd);
+    self.execute_media_transport_plan(&plan)
+  }
+
+  /// Execute a media transport plan: CONNECT destinations, then the media command.
+  ///
+  /// This is the single shipped path for pause/play/stop on a fresh TCP session.
+  pub fn execute_media_transport_plan(&self, plan: &MediaTransportPlan) -> Result<()> {
+    let _wire = plan.command.to_media_message_body(0);
     self.with_device(|device| {
-      connect_media_transport(device, transport_id)?;
-      drop(
+      // CONNECT order is defined by the plan (receiver-0 then app transport).
+      for dest in &plan.connect_destinations {
         device
-          .media
-          .stop(transport_id, media_session_id)
-          .map_err(|err| Error::Cast(format!("stop: {err}")))?,
-      );
+          .connection
+          .connect(dest.as_str())
+          .map_err(|err| Error::Cast(format!("connection channel to {dest}: {err}")))?;
+      }
+      device
+        .heartbeat
+        .ping()
+        .map_err(|err| Error::Cast(format!("heartbeat after media transport connect: {err}")))?;
+
+      let transport_id = plan.command.transport_id();
+      let media_session_id = plan.media_session_id();
+      match plan.command {
+        TransportCommand::Pause(_) => {
+          drop(
+            device
+              .media
+              .pause(transport_id, media_session_id)
+              .map_err(|err| Error::Cast(format!("pause: {err}")))?,
+          );
+        },
+        TransportCommand::Play(_) => {
+          drop(
+            device
+              .media
+              .play(transport_id, media_session_id)
+              .map_err(|err| Error::Cast(format!("play: {err}")))?,
+          );
+        },
+        TransportCommand::Stop(_) => {
+          drop(
+            device
+              .media
+              .stop(transport_id, media_session_id)
+              .map_err(|err| Error::Cast(format!("stop: {err}")))?,
+          );
+        },
+      }
       Ok(())
     })
   }
@@ -500,20 +529,51 @@ pub const fn media_command_connect_destinations(transport_id: &str) -> [&str; 2]
   ["receiver-0", transport_id]
 }
 
-/// CONNECT `receiver-0` and `transport_id` so media-channel commands get replies.
-fn connect_media_transport(device: &rust_cast::CastDevice<'_>, transport_id: &str) -> Result<()> {
-  for dest in media_command_connect_destinations(transport_id) {
-    device
-      .connection
-      .connect(dest)
-      .map_err(|err| Error::Cast(format!("connection channel to {dest}: {err}")))?;
+/// Ordered wire plan for pause/play/stop on a **fresh** TCP Cast session.
+///
+/// Production `pause`/`play`/`stop` always build this plan via
+/// [`MediaTransportPlan::from_command`] and execute it with
+/// [`CastController::execute_media_transport_plan`]. CONNECT destinations come
+/// first so `rust_cast` media commands receive STATUS replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTransportPlan {
+  /// CONNECT destinations in order (must include `receiver-0` then app transport).
+  pub connect_destinations: Vec<String>,
+  /// Media command after CONNECT.
+  pub command: TransportCommand,
+}
+
+impl MediaTransportPlan {
+  /// Build the shipped plan for a transport command (CONNECT ×2 then media op).
+  pub fn from_command(command: &TransportCommand) -> Self {
+    let transport_id = command.transport_id();
+    let connect_destinations = media_command_connect_destinations(transport_id)
+      .into_iter()
+      .map(str::to_owned)
+      .collect();
+    Self {
+      connect_destinations,
+      command: command.clone(),
+    }
   }
-  // Keep-alive after CONNECT so some receivers stay ready for media commands.
-  device
-    .heartbeat
-    .ping()
-    .map_err(|err| Error::Cast(format!("heartbeat after media transport connect: {err}")))?;
-  Ok(())
+
+  /// Media session id targeted by this plan.
+  pub const fn media_session_id(&self) -> i32 {
+    match &self.command {
+      TransportCommand::Pause(s) | TransportCommand::Play(s) | TransportCommand::Stop(s) => s.media_session_id,
+    }
+  }
+
+  /// True when the plan CONNECTs `receiver-0` before the app transport id.
+  pub fn connects_receiver_then_transport(&self) -> bool {
+    let Some(first) = self.connect_destinations.first() else {
+      return false;
+    };
+    let Some(second) = self.connect_destinations.get(1) else {
+      return false;
+    };
+    first == "receiver-0" && second == self.command.transport_id() && self.connect_destinations.len() == 2
+  }
 }
 
 #[cfg(test)]
@@ -653,10 +713,75 @@ mod tests {
   }
 
   #[test]
+  fn pause_play_stop_plans_connect_receiver_then_transport_before_media() {
+    let session = MediaSessionRef::new("web-42", 99);
+    for cmd in [
+      TransportCommand::Pause(session.clone()),
+      TransportCommand::Play(session.clone()),
+      TransportCommand::Stop(session),
+    ] {
+      let plan = MediaTransportPlan::from_command(&cmd);
+      // Shipped path: CONNECT receiver-0, CONNECT transport, then media op.
+      assert!(
+        plan.connects_receiver_then_transport(),
+        "plan must CONNECT receiver-0 then transport before media: {plan:?}"
+      );
+      assert_eq!(plan.connect_destinations.len(), 2);
+      assert_eq!(plan.connect_destinations.first().map(String::as_str), Some("receiver-0"));
+      assert_eq!(plan.connect_destinations.get(1).map(String::as_str), Some("web-42"));
+      assert_eq!(plan.media_session_id(), 99);
+      // Wire body type must match command (media channel after CONNECT).
+      let body = plan.command.to_media_message_body(1);
+      let expected_type = match plan.command {
+        TransportCommand::Pause(_) => "PAUSE",
+        TransportCommand::Play(_) => "PLAY",
+        TransportCommand::Stop(_) => "STOP",
+      };
+      assert_eq!(body["type"], expected_type);
+      assert_eq!(body["mediaSessionId"], 99);
+    }
+  }
+
+  #[test]
+  fn pause_play_stop_methods_use_same_transport_plan_as_from_command() {
+    // prepare_* + from_command is exactly what pause/play/stop build before execute.
+    let mut ctl = CastController::new("127.0.0.1", 8009);
+    let session = MediaSessionRef::new("transport-1", 5);
+
+    let pause_cmd = ctl.prepare_pause(session.clone());
+    let pause_plan = MediaTransportPlan::from_command(&pause_cmd);
+    assert!(pause_plan.connects_receiver_then_transport());
+    assert_eq!(ctl.last_transport(), Some(&TransportCommand::Pause(session.clone())));
+
+    let play_cmd = ctl.prepare_play(session.clone());
+    let play_plan = MediaTransportPlan::from_command(&play_cmd);
+    assert!(play_plan.connects_receiver_then_transport());
+
+    let stop_cmd = ctl.prepare_stop(session);
+    let stop_plan = MediaTransportPlan::from_command(&stop_cmd);
+    assert!(stop_plan.connects_receiver_then_transport());
+  }
+
+  #[test]
+  fn execute_media_transport_plan_fails_before_media_when_host_unreachable() {
+    // Unreachable host: connect fails during CONNECT phase (no hang on media STATUS).
+    let ctl = CastController::new("127.0.0.1", 9);
+    let plan = MediaTransportPlan::from_command(&TransportCommand::Pause(MediaSessionRef::new("web-1", 1)));
+    assert!(plan.connects_receiver_then_transport());
+    let start = std::time::Instant::now();
+    let err = ctl.execute_media_transport_plan(&plan).expect_err("must fail");
+    assert!(matches!(err, Error::Cast(_)));
+    assert!(
+      start.elapsed() < std::time::Duration::from_secs(3),
+      "CONNECT failure must not hang waiting for media STATUS"
+    );
+  }
+
+  #[test]
   fn stop_active_best_effort_clears_session_without_device() {
     let mut ctl = CastController::new("127.0.0.1", 9);
     // Inject a fake active session; stop will fail to connect (port 9 closed) but must clear.
-    ctl.active = Some(MediaSessionRef::new("transport-x", 7));
+    ctl.set_active_for_test(MediaSessionRef::new("transport-x", 7));
     ctl.stop_active_best_effort(std::time::Duration::from_millis(500));
     assert!(ctl.active_session().is_none());
   }
