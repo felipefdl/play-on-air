@@ -287,6 +287,11 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
   }
 }
 
+/// Remove a registry entry when macOS `dns-sd` reports a real leave.
+///
+/// Linux mdns-sd `ServiceRemoved` is ignored (noisy re-query); stale TTL handles
+/// true departures there, so this helper is macOS-only.
+#[cfg(target_os = "macos")]
 fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
   // Instance name may match id or be a prefix of name; also try TXT id later.
   let list = registry.list();
