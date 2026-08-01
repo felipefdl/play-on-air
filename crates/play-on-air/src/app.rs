@@ -70,8 +70,10 @@ impl App {
         }
         tokio::select! {
           () = sleep(Duration::from_secs(2)) => {}
-          _ = maintain_shutdown.changed() => {
-            if *maintain_shutdown.borrow() {
+          changed = maintain_shutdown.changed() => {
+            // A closed channel (sender dropped) must exit too; otherwise
+            // `changed()` resolves immediately forever and this loop spins.
+            if changed.is_err() || *maintain_shutdown.borrow() {
               break;
             }
           }
