@@ -71,6 +71,27 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     .ok_or_else(|| Error::Discovery("dns-sd browse missing stdout".to_owned()))?;
   let reader = BufReader::new(stdout);
 
+  // `lines()` blocks until dns-sd prints; kill the child on shutdown so the
+  // reader unblocks and runtime shutdown never hangs on this thread.
+  let shared_child = Arc::new(std::sync::Mutex::new(child));
+  let session_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let watcher = {
+    let watcher_child = Arc::clone(&shared_child);
+    let watcher_done = Arc::clone(&session_done);
+    let watcher_shutdown = shutdown.clone();
+    std::thread::spawn(move || {
+      while !watcher_done.load(std::sync::atomic::Ordering::Relaxed) {
+        if *watcher_shutdown.borrow() {
+          if let Ok(mut guard) = watcher_child.lock() {
+            terminate_child(&mut guard);
+          }
+          break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+      }
+    })
+  };
+
   for raw_line in reader.lines() {
     if *shutdown.borrow() {
       break;
@@ -108,7 +129,11 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     }
   }
 
-  terminate_child(&mut child);
+  session_done.store(true, std::sync::atomic::Ordering::Relaxed);
+  if let Ok(mut guard) = shared_child.lock() {
+    terminate_child(&mut guard);
+  }
+  drop(watcher.join());
   Ok(())
 }
 
