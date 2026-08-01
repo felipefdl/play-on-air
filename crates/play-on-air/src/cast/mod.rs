@@ -603,8 +603,8 @@ impl CastController {
     // rust_cast only talks to 127.0.0.1; TLS still terminates on the Nest.
     let (relay_host, relay_port) = crate::net::spawn_cast_connect_relay(self.host.as_str(), self.port)
       .map_err(|err| Error::Cast(format!("connect {}:{}: {err}", self.host, self.port)))?;
-    let device = rust_cast::CastDevice::connect_without_host_verification(relay_host.as_str(), relay_port)
-      .map_err(|err| {
+    let device =
+      rust_cast::CastDevice::connect_without_host_verification(relay_host.as_str(), relay_port).map_err(|err| {
         Error::Cast(format!(
           "connect {}:{} (via local relay {relay_host}:{relay_port}): {err}",
           self.host, self.port

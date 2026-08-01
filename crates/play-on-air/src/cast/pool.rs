@@ -15,9 +15,7 @@ use parking_lot::Mutex;
 use crate::error::{Error, Result};
 use crate::registry::Device;
 
-use super::{
-  volume_level_clamped, ActiveCastSession, MediaLoadRequest, media_session_id_from_status,
-};
+use super::{ActiveCastSession, MediaLoadRequest, media_session_id_from_status, volume_level_clamped};
 
 /// Heartbeat interval on the warm control-plane connection.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
@@ -47,13 +45,9 @@ enum CastWorkerCmd {
     reply: SyncSender<Result<()>>,
   },
   /// Stop active media session (if any); keep TCP warm.
-  Stop {
-    reply: SyncSender<Result<()>>,
-  },
+  Stop { reply: SyncSender<Result<()>> },
   /// Best-effort stop; always replies after attempt (or immediately if no session).
-  StopBestEffort {
-    reply: SyncSender<()>,
-  },
+  StopBestEffort { reply: SyncSender<()> },
   /// Exit the worker loop and drop the Cast device.
   Shutdown,
 }
@@ -78,9 +72,7 @@ pub struct CastPool {
 
 impl std::fmt::Debug for CastPool {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("CastPool")
-      .field("workers", &self.workers.lock().len())
-      .finish()
+    f.debug_struct("CastPool").field("workers", &self.workers.lock().len()).finish()
   }
 }
 
@@ -88,9 +80,7 @@ impl CastPool {
   /// Create an empty pool (no workers yet).
   #[must_use]
   pub fn new() -> Self {
-    Self {
-      workers: Mutex::new(HashMap::new()),
-    }
+    Self { workers: Mutex::new(HashMap::new()) }
   }
 
   /// Ensure a warm worker exists for `device` (start one if missing).
@@ -99,9 +89,7 @@ impl CastPool {
   pub fn ensure(&self, device: &Device) {
     let mut guard = self.workers.lock();
     if let Some(handle) = guard.get_mut(&device.id) {
-      let host_changed = handle.host != device.host
-        || handle.hostname != device.hostname
-        || handle.port != device.port;
+      let host_changed = handle.host != device.host || handle.hostname != device.hostname || handle.port != device.port;
       if host_changed {
         handle.host.clone_from(&device.host);
         handle.hostname.clone_from(&device.hostname);
@@ -190,20 +178,15 @@ impl CastPool {
   pub fn load(&self, device_id: &str, request: MediaLoadRequest) -> Result<ActiveCastSession> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(CastWorkerCmd::Load {
-      request,
-      reply: reply_tx,
-    })
-    .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    tx.send(CastWorkerCmd::Load { request, reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
     match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
       Ok(result) => result,
       Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!(
         "warm Cast load timed out after {}s for {device_id}",
         COMMAND_TIMEOUT.as_secs()
       ))),
-      Err(RecvTimeoutError::Disconnected) => {
-        Err(Error::Cast(format!("warm Cast load reply dropped for {device_id}")))
-      },
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast load reply dropped for {device_id}"))),
     }
   }
 
@@ -211,16 +194,11 @@ impl CastPool {
   pub fn set_volume(&self, device_id: &str, level: f32) -> Result<()> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(CastWorkerCmd::SetVolume {
-      level,
-      reply: reply_tx,
-    })
-    .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    tx.send(CastWorkerCmd::SetVolume { level, reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
     match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
       Ok(result) => result,
-      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!(
-        "warm Cast set_volume timed out for {device_id}"
-      ))),
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast set_volume timed out for {device_id}"))),
       Err(RecvTimeoutError::Disconnected) => {
         Err(Error::Cast(format!("warm Cast set_volume reply dropped for {device_id}")))
       },
@@ -235,12 +213,8 @@ impl CastPool {
       .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
     match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
       Ok(result) => result,
-      Err(RecvTimeoutError::Timeout) => {
-        Err(Error::Cast(format!("warm Cast stop timed out for {device_id}")))
-      },
-      Err(RecvTimeoutError::Disconnected) => {
-        Err(Error::Cast(format!("warm Cast stop reply dropped for {device_id}")))
-      },
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast stop timed out for {device_id}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast stop reply dropped for {device_id}"))),
     }
   }
 
@@ -293,13 +267,7 @@ struct WorkerState {
   clippy::needless_pass_by_value,
   reason = "worker thread owns the command receiver for its full lifetime"
 )]
-fn worker_main(
-  device_id: String,
-  host: String,
-  hostname: String,
-  port: u16,
-  cmd_rx: mpsc::Receiver<CastWorkerCmd>,
-) {
+fn worker_main(device_id: String, host: String, hostname: String, port: u16, cmd_rx: mpsc::Receiver<CastWorkerCmd>) {
   let mut state = WorkerState {
     device_id,
     host,
@@ -332,8 +300,7 @@ fn worker_main(
         hostname: new_hostname,
         port: new_port,
       }) => {
-        let changed =
-          state.host != new_host || state.hostname != new_hostname || state.port != new_port;
+        let changed = state.host != new_host || state.hostname != new_hostname || state.port != new_port;
         state.host = new_host;
         state.hostname = new_hostname;
         state.port = new_port;
@@ -646,13 +613,11 @@ impl WorkerState {
 fn connect_cast_device(host: &str, port: u16) -> Result<rust_cast::CastDevice<'static>> {
   let (relay_host, relay_port) = crate::net::spawn_cast_connect_relay(host, port)
     .map_err(|err| Error::Cast(format!("connect {host}:{port}: {err}")))?;
-  rust_cast::CastDevice::connect_without_host_verification("127.0.0.1", relay_port).map_err(
-    |err| {
-      Error::Cast(format!(
-        "connect {host}:{port} (via local relay {relay_host}:{relay_port}): {err}"
-      ))
-    },
-  )
+  rust_cast::CastDevice::connect_without_host_verification("127.0.0.1", relay_port).map_err(|err| {
+    Error::Cast(format!(
+      "connect {host}:{port} (via local relay {relay_host}:{relay_port}): {err}"
+    ))
+  })
 }
 
 fn short_id(device_id: &str) -> &str {
@@ -715,10 +680,7 @@ mod tests {
     let request = MediaLoadRequest::wav("http://127.0.0.1:9/stream", CastStreamKind::Buffered);
     let err = pool.load("missing-device", request).unwrap_err();
     let msg = err.to_string();
-    assert!(
-      msg.contains("no warm Cast worker"),
-      "expected missing-worker error, got: {msg}"
-    );
+    assert!(msg.contains("no warm Cast worker"), "expected missing-worker error, got: {msg}");
   }
 
   #[test]

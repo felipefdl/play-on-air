@@ -170,8 +170,7 @@ impl Bridge {
     let cast_name = device.name.clone();
     let load_url = stream_url.clone();
     let load_result = tokio::task::spawn_blocking(move || {
-      let request =
-        MediaLoadRequest::wav(load_url, CastStreamKind::Buffered).with_title(cast_name);
+      let request = MediaLoadRequest::wav(load_url, CastStreamKind::Buffered).with_title(cast_name);
       let session = pool.load(&load_device_id, request)?;
       // Nest device volume is independent of AirPlay; raise receiver volume.
       if let Err(err) = pool.set_volume(&load_device_id, 1.0) {
@@ -240,11 +239,7 @@ impl Bridge {
 
 /// Run shipped teardown order for one active session.
 fn end_active_session(active: ActiveSession) {
-  let ActiveSession {
-    media,
-    device_id,
-    pool,
-  } = active;
+  let ActiveSession { media, device_id, pool } = active;
   let mut media_handle = Some(media);
   for step in session_end_steps() {
     match step {

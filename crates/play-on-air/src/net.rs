@@ -251,12 +251,8 @@ pub fn probe_cast_reachability(host: &str, port: u16) {
 }
 
 fn resolve_dest_ipv4(host: &str) -> io::Result<Ipv4Addr> {
-  let ip_s = resolve_host_ipv4(host).ok_or_else(|| {
-    io::Error::new(
-      io::ErrorKind::AddrNotAvailable,
-      format!("no IPv4 address for Cast host {host}"),
-    )
-  })?;
+  let ip_s = resolve_host_ipv4(host)
+    .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, format!("no IPv4 address for Cast host {host}")))?;
   ip_s.parse::<Ipv4Addr>().map_err(|parse_err| {
     io::Error::new(
       io::ErrorKind::InvalidInput,
@@ -473,8 +469,7 @@ mod tests {
       drop(stream);
     });
 
-    let (stream, local) =
-      tcp_connect_cast_bound("127.0.0.1", port).expect("bound connect to 127.0.0.1");
+    let (stream, local) = tcp_connect_cast_bound("127.0.0.1", port).expect("bound connect to 127.0.0.1");
     assert!(local.is_loopback(), "local source should be loopback, got {local}");
     drop(stream);
     accept.join().expect("accept thread");
@@ -493,14 +488,11 @@ mod tests {
       drop(sock.shutdown(Shutdown::Both));
     });
 
-    let (relay_host, relay_port) =
-      spawn_cast_connect_relay("127.0.0.1", echo_port).expect("spawn relay");
+    let (relay_host, relay_port) = spawn_cast_connect_relay("127.0.0.1", echo_port).expect("spawn relay");
     assert_eq!(relay_host, "127.0.0.1");
 
     let mut client = TcpStream::connect((relay_host.as_str(), relay_port)).expect("dial relay");
-    client
-      .set_read_timeout(Some(Duration::from_secs(2)))
-      .expect("read timeout");
+    client.set_read_timeout(Some(Duration::from_secs(2))).expect("read timeout");
     client.write_all(b"ping-cast").expect("client write");
     let mut got = vec![0_u8; 9];
     client.read_exact(&mut got).expect("client read");
