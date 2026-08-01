@@ -1,0 +1,2 @@
+# No user options schema; config is optional TOML on the addon config share.
+configuration: {}

@@ -1,0 +1,197 @@
+# Native multi-arch image build → GHCR (amd64 + arm64), digest push + manifest merge.
+name: docker
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: play-on-air
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version and image name
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^version: *"\(.*\)"/\1/p' play-on-air/config.yaml | head -n1)"
+            if [[ -z "${VERSION}" ]]; then
+              VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+            fi
+          fi
+          if [[ -z "${VERSION}" ]]; then
+            echo "could not resolve version" >&2
+            exit 1
+          fi
+          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved version=${VERSION} image=${IMAGE}"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            hass_arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            hass_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "${GITHUB_ENV}"
+
+      # Pull requests: build only (no registry push).
+      - name: Build (pull request)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          build-args: |
+            BUILD_VERSION=${{ needs.version.outputs.version }}
+            BUILD_ARCH=${{ matrix.hass_arch }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # Default branch / tags / dispatch: push by digest for later manifest merge.
+      - name: Build and push by digest
+        id: build
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            io.hass.version=${{ needs.version.outputs.version }}
+            io.hass.arch=${{ matrix.hass_arch }}
+            io.hass.type=app
+            io.hass.name=PlayOnAir
+          outputs: type=image,name=${{ needs.version.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            BUILD_VERSION=${{ needs.version.outputs.version }}
+            BUILD_ARCH=${{ matrix.hass_arch }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ -z "${digest}" ]]; then
+            echo "missing image digest from build" >&2
+            exit 1
+          fi
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: github.event_name != 'pull_request'
+    needs:
+      - version
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest and push tags
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          digests=()
+          for f in /tmp/digests/*; do
+            digests+=("${IMAGE}@sha256:$(basename "${f}")")
+          done
+          if [[ "${#digests[@]}" -lt 1 ]]; then
+            echo "no digests to merge" >&2
+            exit 1
+          fi
+
+          tags=("-t" "${IMAGE}:${VERSION}")
+          if [[ "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tags+=("-t" "${IMAGE}:latest")
+          fi
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          tags+=("-t" "${IMAGE}:sha-${short_sha}")
+
+          docker buildx imagetools create \
+            "${tags[@]}" \
+            "${digests[@]}"
+
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
