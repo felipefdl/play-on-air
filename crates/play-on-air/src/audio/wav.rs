@@ -81,7 +81,7 @@ pub fn encode_pcm_i16_to_wav(samples: &[i16], channels: u16, sample_rate: u32) -
 
 /// Continuous-stream header using a large data size so players keep reading.
 pub fn continuous_wav_header(channels: u16, sample_rate: u32) -> Result<[u8; 44]> {
-  // ~4 GiB payload placeholder; many players stream until connection close.
+  // ~2 GiB payload placeholder; many players stream until connection close.
   wav_header(channels, sample_rate, u32::MAX / 2)
 }
 
