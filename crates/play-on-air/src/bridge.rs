@@ -121,14 +121,14 @@ impl Bridge {
       .ring_for(device_id)
       .ok_or_else(|| Error::Bridge(format!("no PCM ring for {device_id}")))?;
 
-    // Prefer the ring's actual channel layout (rebuilt in `audio_init`).
-    let stream_channels = ring.channels().max(1).min(channels.max(1));
+    // The ring is rebuilt in `audio_init` for the stream format, so it must
+    // agree with the event; its layout is what the WAV header advertises.
+    let stream_channels = ring.channels().max(1);
     let stream_rate = sample_rate.max(1);
 
-    if ring.channels() != stream_channels {
+    if stream_channels != channels.max(1) {
       return Err(Error::Bridge(format!(
-        "channel mismatch: ring={} event={stream_channels}",
-        ring.channels()
+        "channel mismatch: ring={stream_channels} event={channels}"
       )));
     }
 
