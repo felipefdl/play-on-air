@@ -1,0 +1,8 @@
+# cargo-audit configuration. Keep in sync with deny.toml [advisories].ignore.
+
+[advisories]
+ignore = [
+  # rsa via shairplay (AirPlay pairing). No safe upgrade on crates.io yet.
+  # Acceptable for LAN-only personal use; revisit when shairplay moves off rsa 0.9.
+  "RUSTSEC-2023-0071",
+]

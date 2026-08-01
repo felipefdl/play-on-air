@@ -1,0 +1,16 @@
+# Rust
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Operator optional config (do not commit personal device renames)
+config.toml
+play-on-air.toml
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~

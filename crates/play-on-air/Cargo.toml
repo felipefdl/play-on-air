@@ -1,0 +1,46 @@
+[package]
+name = "play-on-air"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Chromecast devices as AirPlay 2 speakers on the local network"
+readme = "../../VISION.md"
+
+[[bin]]
+name = "play-on-air"
+path = "src/main.rs"
+
+[lib]
+name = "play_on_air"
+path = "src/lib.rs"
+
+[dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+flacenc = { workspace = true }
+futures-util = { workspace = true }
+hound = { workspace = true }
+mdns-sd = { workspace = true }
+parking_lot = { workspace = true }
+rust_cast = { workspace = true }
+serde = { workspace = true }
+shairplay = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Workspace-pinned for future media/cast surfaces (kept available via workspace.dependencies):
+# http-body-util, hyper, hyper-util, log, serde_json, tower, tower-http, uuid
+
+[dev-dependencies]
+claxon = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true
