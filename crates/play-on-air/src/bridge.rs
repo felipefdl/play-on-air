@@ -93,7 +93,7 @@ impl Bridge {
           }
         },
         AirPlaySessionEvent::Ended { device_id } => {
-          self.handle_session_end(&device_id);
+          self.handle_session_end(&device_id).await;
         },
         AirPlaySessionEvent::Volume { device_id, volume_db } => {
           self.handle_volume(&device_id, volume_db);
@@ -110,7 +110,7 @@ impl Bridge {
     rings: Arc<dyn RingLookup>,
   ) -> Result<()> {
     // Tear down any previous session for this device first.
-    self.handle_session_end(device_id);
+    self.handle_session_end(device_id).await;
 
     let device = self
       .registry
@@ -212,7 +212,7 @@ impl Bridge {
     }
   }
 
-  fn handle_session_end(&self, device_id: &str) {
+  async fn handle_session_end(&self, device_id: &str) {
     let removed = {
       let mut guard = self.sessions.lock();
       guard.remove(device_id)
@@ -220,7 +220,10 @@ impl Bridge {
     let Some(active) = removed else {
       return;
     };
-    end_active_session(active);
+    // Cast STOP can block up to its timeout; keep it off the runtime thread.
+    if tokio::task::spawn_blocking(move || end_active_session(active)).await.is_err() {
+      tracing::warn!(%device_id, "session teardown task panicked");
+    }
     tracing::info!(%device_id, "bridge session ended (media dropped; Cast STOP best-effort)");
   }
 
@@ -231,9 +234,14 @@ impl Bridge {
     if !has_session {
       return;
     }
-    if let Err(err) = self.cast_pool.set_volume(device_id, level) {
-      tracing::debug!(%device_id, error = %err, "Cast volume sync failed");
-    }
+    // set_volume blocks on the warm-worker reply; keep the event loop responsive.
+    let pool = Arc::clone(&self.cast_pool);
+    let id = device_id.to_owned();
+    drop(tokio::task::spawn_blocking(move || {
+      if let Err(err) = pool.set_volume(&id, level) {
+        tracing::debug!(device_id = %id, error = %err, "Cast volume sync failed");
+      }
+    }));
   }
 }
 
@@ -357,7 +365,7 @@ mod tests {
     let start = Instant::now();
     // Shipped path: session_end_steps() → MediaShutdown then timed CastStopBestEffort.
     // No warm worker → STOP is an immediate no-op (must not hang).
-    bridge.handle_session_end("dev-1");
+    bridge.handle_session_end("dev-1").await;
     let elapsed = start.elapsed();
     assert!(
       elapsed < Duration::from_secs(4),
