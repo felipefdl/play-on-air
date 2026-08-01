@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- End Cast bridge only when the **audio** session drops, not on every RTSP
+  disconnect (Remote Control teardown was killing multi-speaker after seconds).
+- Start one process-global AP2 PTP sink (UDP 319/320) shared by all receivers.
+
 ## 0.1.2
 
 - Ignore noisy `mdns-sd` ServiceRemoved events that were withdrawing AirPlay ads

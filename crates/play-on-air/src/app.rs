@@ -42,6 +42,11 @@ impl App {
     let registry = Arc::clone(&self.registry);
     let config = self.config;
 
+    // Bind AP2 PTP (319/320) once before any RaopServer starts.
+    crate::net::ensure_global_ptp_sink();
+    // Give the sink thread a beat to bind before AirPlay ads race it.
+    sleep(Duration::from_millis(50)).await;
+
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
     let cast_pool = Arc::new(CastPool::new());

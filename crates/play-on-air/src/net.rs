@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::Once;
 use std::time::Duration;
 
 use if_addrs::{IfAddr, get_if_addrs};
@@ -13,6 +14,62 @@ const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CAST_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Short TCP SYN used only to warm ARP / routes during wake.
 const CAST_WAKE_TCP_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Start a process-global AP2 PTP drain on UDP 319/320 (once).
+///
+/// shairplay also tries to bind these ports on every `RaopServer::start`. Only
+/// the first bind wins; the rest log EADDRINUSE. Binding early means every
+/// virtual speaker shares one host sink so iOS multi-select PTP traffic is
+/// accepted (avoids `ICMPv6` port-unreachable stalls).
+pub fn ensure_global_ptp_sink() {
+  static START: Once = Once::new();
+  START.call_once(|| {
+    let handle = std::thread::Builder::new().name("ap2-ptp-sink".into()).spawn(|| {
+      let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        tracing::warn!("PTP sink: failed to build runtime");
+        return;
+      };
+      rt.block_on(async {
+        let mut bound = 0_u8;
+        for port in [319_u16, 320_u16] {
+          match tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).await {
+            Ok(sock) => {
+              bound = bound.saturating_add(1);
+              // Detached for the process lifetime; do not join.
+              drop(tokio::spawn(async move {
+                let mut buf = [0_u8; 1024];
+                loop {
+                  match sock.recv_from(&mut buf).await {
+                    Ok(_) => {},
+                    Err(err) => {
+                      tracing::debug!(port, error = %err, "PTP sink recv ended");
+                      break;
+                    },
+                  }
+                }
+              }));
+            },
+            Err(err) => {
+              tracing::warn!(
+                port,
+                error = %err,
+                "global PTP sink bind failed (may need CAP_NET_BIND_SERVICE)"
+              );
+            },
+          }
+        }
+        if bound > 0 {
+          tracing::info!(ports = bound, "global AP2 PTP sink active on 319/320 (shared by all receivers)");
+        }
+        // Keep the runtime alive for the recv tasks.
+        std::future::pending::<()>().await;
+      });
+    });
+    if let Err(err) = handle {
+      tracing::warn!(error = %err, "PTP sink thread spawn failed");
+    }
+  });
+}
 
 /// Best-effort non-loopback IPv4 for media URLs Chromecasts can pull.
 pub fn advertise_host_ip() -> String {

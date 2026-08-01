@@ -69,7 +69,13 @@ impl DeviceAudioState {
 }
 
 /// Forwards decoded f32 PCM into the current [`PcmRing`].
+///
+/// `Ended` is emitted from [`Drop`]: that is the end of the **audio** stream.
+/// RTSP Remote-Control connections also call [`AudioHandler::on_client_disconnected`]
+/// when they close; those must not stop Cast (multi-speaker iOS opens/closes RC
+/// links while audio keeps running on another connection).
 struct RingSession {
+  state: Arc<DeviceAudioState>,
   ring: Arc<PcmRing>,
 }
 
@@ -80,6 +86,19 @@ impl AudioSession for RingSession {
 
   fn audio_flush(&mut self) {
     self.ring.clear();
+  }
+}
+
+impl Drop for RingSession {
+  fn drop(&mut self) {
+    self.ring.clear();
+    if let Some(tx) = &self.state.event_tx {
+      drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
+    }
+    tracing::debug!(
+      device_id = %self.state.device_id,
+      "AirPlay audio session dropped (bridge should Cast-STOP)"
+    );
   }
 }
 
@@ -107,7 +126,7 @@ impl AudioHandler for RingHandler {
         ring: Arc::clone(&ring),
       }));
     }
-    Box::new(RingSession { ring })
+    Box::new(RingSession { state: Arc::clone(&self.state), ring })
   }
 
   fn on_volume(&self, volume: f32) {
@@ -119,11 +138,20 @@ impl AudioHandler for RingHandler {
     }
   }
 
-  fn on_client_disconnected(&self, _addr: &str) {
-    self.state.current_ring().clear();
-    if let Some(tx) = &self.state.event_tx {
-      drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
-    }
+  fn on_client_connected(&self, addr: &str) {
+    tracing::debug!(device_id = %self.state.device_id, %addr, "AirPlay RTSP client connected");
+  }
+
+  fn on_client_disconnected(&self, addr: &str) {
+    // Do **not** send `Ended` or clear the ring here. shairplay calls this for
+    // every RTSP TCP close, including short-lived Remote Control (type 130)
+    // probes. Ending the bridge here is what killed multi-speaker after a few
+    // seconds while the first speaker kept playing.
+    tracing::debug!(
+      device_id = %self.state.device_id,
+      %addr,
+      "AirPlay RTSP client disconnected (audio session may still be active)"
+    );
   }
 }
 
