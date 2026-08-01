@@ -69,6 +69,7 @@ pub struct MediaServerHandle {
   /// Shared content slot for the active stream.
   content: Arc<RwLock<MediaContent>>,
   shutdown_tx: Option<oneshot::Sender<()>>,
+  serve_task: tokio::task::JoinHandle<()>,
 }
 
 impl MediaServerHandle {
@@ -82,11 +83,12 @@ impl MediaServerHandle {
     *self.content.write() = content;
   }
 
-  /// Request graceful shutdown of the HTTP server task.
-  pub fn shutdown(mut self) {
-    if let Some(tx) = self.shutdown_tx.take() {
-      let _sent = tx.send(());
-    }
+  /// Shut down the HTTP server task.
+  ///
+  /// Graceful shutdown alone would wait on in-flight requests, and a `LiveWav`
+  /// body never completes — abort so the stream (and its PCM ring) is released.
+  pub fn shutdown(self) {
+    drop(self);
   }
 }
 
@@ -95,6 +97,7 @@ impl Drop for MediaServerHandle {
     if let Some(tx) = self.shutdown_tx.take() {
       let _sent = tx.send(());
     }
+    self.serve_task.abort();
   }
 }
 
@@ -125,7 +128,7 @@ impl MediaServer {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    let _join = tokio::spawn(async move {
+    let serve_task = tokio::spawn(async move {
       let serve = axum::serve(listener, app).with_graceful_shutdown(async {
         let _shutdown = shutdown_rx.await;
       });
@@ -148,6 +151,7 @@ impl MediaServer {
       addr,
       content,
       shutdown_tx: Some(shutdown_tx),
+      serve_task,
     })
   }
 }
