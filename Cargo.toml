@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT"
 publish = false
 
@@ -21,6 +21,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 log = "0.4"
+mdns-sd = "0.20"
 parking_lot = "0.12"
 rust_cast = "0.21"
 serde = { version = "1", features = ["derive"] }
