@@ -620,6 +620,9 @@ impl CastController {
   {
     const ATTEMPTS: u32 = 8;
     let mut last_err: Option<Error> = None;
+    // `self.host` doubles as the per-candidate connect target below; remember the
+    // original so total failure does not leave the controller on a bad candidate.
+    let original_host = self.host.clone();
     let candidates = crate::net::cast_connect_hosts(self.host.as_str(), self.hostname.as_deref());
     // Wake ARP on every candidate once up front.
     for c in &candidates {
@@ -662,6 +665,7 @@ impl CastController {
         std::thread::sleep(std::time::Duration::from_millis(400 * u64::from(attempt)));
       }
     }
+    self.host = original_host;
     Err(last_err.unwrap_or_else(|| Error::Cast("Cast connect failed with no error detail".to_owned())))
   }
 }
