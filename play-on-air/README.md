@@ -6,4 +6,6 @@ PlayOnAir discovers Google Cast devices, advertises each as an AirPlay 2 receive
 
 **Requires host network** so mDNS discovery and AirPlay/Cast traffic work on the LAN.
 
-See [DOCS.md](DOCS.md) for install steps and limits.
+Optional **Configuration** tab: log level, rename or hide devices. Defaults work with zero setup.
+
+See [DOCS.md](DOCS.md) for install steps, Configuration fields, troubleshooting, and limits.

@@ -1,2 +1,22 @@
-# No user options schema; config is optional TOML on the addon config share.
-configuration: {}
+configuration:
+  log_level:
+    name: Log level
+    description: >
+      Verbosity written to the app Log tab (RUST_LOG). Use debug or trace only while
+      troubleshooting; info is the recommended default.
+  devices:
+    name: Devices
+    description: >
+      Optional rename or hide overrides for discovered Chromecasts. Leave empty for
+      zero-setup defaults (each Cast name appears as-is in the AirPlay picker).
+      id is a case-insensitive substring of the Cast friendly name or UUID.
+    fields:
+      id:
+        name: Match id
+        description: Case-insensitive substring of the Chromecast name or UUID.
+      name:
+        name: AirPlay name
+        description: Optional display name in the AirPlay picker. Leave empty to keep the Cast name.
+      hide:
+        name: Hide
+        description: When enabled, do not advertise this device as AirPlay.

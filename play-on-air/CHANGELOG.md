@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6
+
+- Home Assistant **Configuration** tab: `log_level` and optional `devices` (rename / hide).
+- Container entrypoint reads `/data/options.json`, sets `RUST_LOG`, and regenerates `play-on-air.toml` on each start (HA options are the source of truth).
+- User docs polish (install, Configuration fields, troubleshooting). Asset guidance for `icon.png` / `logo.png`.
+
 ## 0.1.5
 
 - Volume: do not force Cast receiver to 100% on stream start; leave device volume alone.

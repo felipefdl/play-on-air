@@ -1,5 +1,5 @@
 name: PlayOnAir
-version: "0.1.5"
+version: "0.1.6"
 slug: play_on_air
 description: >
   Chromecast devices as AirPlay 2 speakers on the local network.
@@ -14,8 +14,15 @@ boot: auto
 host_network: true
 stage: stable
 image: "ghcr.io/felipefdl/play-on-air"
-options: {}
-schema: false
+options:
+  log_level: info
+  devices: []
+schema:
+  log_level: list(trace|debug|info|warn|error)
+  devices:
+    - id: str
+      name: "str?"
+      hide: "bool?"
 map:
   - type: addon_config
     read_only: false

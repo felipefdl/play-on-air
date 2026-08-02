@@ -3,7 +3,7 @@
 # PlayOnAir multi-stage image (glibc). Used by Home Assistant OS via GHCR.
 # Build args: BUILD_VERSION, BUILD_ARCH (HA: amd64 | aarch64)
 
-ARG BUILD_VERSION=0.1.5
+ARG BUILD_VERSION=0.1.6
 ARG BUILD_ARCH=amd64
 
 # -----------------------------------------------------------------------------
@@ -44,9 +44,12 @@ ARG BUILD_ARCH
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
+    jq \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /tmp/play-on-air /usr/local/bin/play-on-air
+COPY play-on-air/run.sh /usr/local/bin/play-on-air-entrypoint
+RUN chmod +x /usr/local/bin/play-on-air-entrypoint
 
 # Home Assistant Supervisor labels + OCI metadata.
 LABEL org.opencontainers.image.title="PlayOnAir" \
@@ -64,4 +67,4 @@ LABEL org.opencontainers.image.title="PlayOnAir" \
 ENV PLAY_ON_AIR_CONFIG=/config/play-on-air.toml
 
 # Host network is required at runtime (set by HAOS config.yaml host_network).
-CMD ["play-on-air"]
+CMD ["/usr/local/bin/play-on-air-entrypoint"]

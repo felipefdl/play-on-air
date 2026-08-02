@@ -2,7 +2,53 @@
 
 Chromecast devices as AirPlay 2 speakers on the local network.
 
-See [VISION.md](VISION.md) for product intent and non-goals.
+PlayOnAir discovers Google Cast devices, exposes each as an **AirPlay 2** receiver, and bridges audio from iPhone, iPad, or Mac to the matching Chromecast. One process on your LAN. No accounts, no cloud, no telemetry.
+
+See [VISION.md](VISION.md) for product intent and non-goals. License: [LICENSE.md](LICENSE.md) (MIT, Felipe Lima).
+
+---
+
+## Home Assistant OS (recommended)
+
+1. **Settings → Add-ons → Add-on store → ⋮ → Repositories**
+2. Add `https://github.com/felipefdl/play-on-air`
+3. Install **PlayOnAir**, then **Start**
+
+Zero setup: Cast devices appear in the AirPlay picker under their Cast names.
+
+The app uses **host network** (`host_network: true`) so mDNS discovery, AirPlay advertisement, and Cast control work on the LAN. That shares the host network namespace with the container (not an isolated bridge). Details: [play-on-air/DOCS.md](play-on-air/DOCS.md).
+
+### Configuration tab
+
+In the app UI you can set:
+
+- **Log level** — `info` by default (`trace` / `debug` / `info` / `warn` / `error`)
+- **Devices** — optional list to **rename** or **hide** Chromecasts in the AirPlay picker
+
+Empty devices list = product defaults. Configuration options regenerate the in-container TOML on every start (HA UI is the source of truth). Full field reference and examples: [play-on-air/DOCS.md](play-on-air/DOCS.md).
+
+Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.png` — see [play-on-air/ASSETS.md](play-on-air/ASSETS.md).
+
+### Container image
+
+| Image | Notes |
+|-------|--------|
+| `ghcr.io/felipefdl/play-on-air:0.1.6` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
+| `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
+
+Architectures: `linux/amd64`, `linux/arm64` (HA arch names `amd64`, `aarch64`).
+
+Standalone run (host network required for mDNS):
+
+```bash
+docker run --rm --network host \
+  -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
+  -v "$PWD/config:/config" \
+  ghcr.io/felipefdl/play-on-air:0.1.6
+```
+
+Without Home Assistant options (`/data/options.json`), the entrypoint starts the binary with product defaults (and any existing file at `PLAY_ON_AIR_CONFIG`).
 
 ---
 
@@ -27,38 +73,7 @@ No config file and no flags are required. PlayOnAir discovers Chromecasts on the
 
 **Linux / HAOS:** use host networking so mDNS multicast reaches the LAN. No Avahi package is required.
 
-## Home Assistant OS
-
-PlayOnAir is published as a Home Assistant app (add-on) with a multi-arch image on GHCR.
-
-### Install from this repository
-
-1. **Settings → Add-ons → Add-on store → ⋮ → Repositories**
-2. Add `https://github.com/felipefdl/play-on-air`
-3. Install **PlayOnAir**, then start it
-
-The app uses **host network** (`host_network: true`) so mDNS discovery, AirPlay advertisement, and Cast control work on the LAN. That shares the host network namespace with the container (not an isolated bridge). Details and optional rename config: [play-on-air/DOCS.md](play-on-air/DOCS.md).
-
-### Container image
-
-| Image | Notes |
-|-------|--------|
-| `ghcr.io/felipefdl/play-on-air:0.1.5` | Version tag (matches app `config.yaml` / Cargo package version) |
-| `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
-| `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
-
-Architectures: `linux/amd64`, `linux/arm64` (HA arch names `amd64`, `aarch64`).
-
-Standalone run (host network required for mDNS):
-
-```bash
-docker run --rm --network host \
-  -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
-  -v "$PWD/config:/config" \
-  ghcr.io/felipefdl/play-on-air:0.1.5
-```
-
-## Optional config
+## Optional config (CLI / non-HA)
 
 Optional TOML may **rename** or **hide** devices. It is never required to play audio.
 
@@ -82,6 +97,8 @@ Missing file → product defaults (identity name map, nothing hidden).
 ```
 
 Match `id` is a case-insensitive substring of the Cast friendly name or UUID.
+
+On Home Assistant, prefer the **Configuration** tab instead of hand-editing the generated file.
 
 ## Limits
 
@@ -112,6 +129,11 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
+
+## Security and contributing
+
+- [SECURITY.md](SECURITY.md) — LAN-only model, host network tradeoff, reporting issues
+- [CONTRIBUTING.md](CONTRIBUTING.md) — MSRV, quality gate, conventions
 
 ## License
 
