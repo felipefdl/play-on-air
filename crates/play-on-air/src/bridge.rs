@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -34,6 +34,14 @@ const ROLLOVER_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// Cast pool `COMMAND_TIMEOUT` is 20s; keep margin so a slow LOAD is joined instead of detached.
 const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ignore queued AirPlay pause events for this long after Cast LOAD succeeds.
+///
+/// Pause-watch can enqueue `Paused` while `handle_session_start` blocks on prebuffer + LOAD
+/// (1–3+ s). That stale event would Cast-PAUSE a brand-new session and leave Nest silent
+/// while HTTP still pulls. ~2 s is above typical post-load settle and ~2× pause-idle (750 ms).
+const PAUSE_GRACE: Duration = Duration::from_secs(2);
+/// Ring frames above this ⇒ AirPlay still has PCM buffered; treat pause as false idle.
+const PAUSE_RING_PCM_THRESHOLD: usize = 256;
 
 /// How Cast volume is applied after a progressive WAV LOAD.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,6 +136,8 @@ struct ActiveSession {
   media: MediaServerHandle,
   device_id: String,
   pool: Arc<CastPool>,
+  /// PCM ring feeding this session's `LiveWav` body (for pause re-validation).
+  ring: Arc<PcmRing>,
   /// Drop / send to stop the `LiveWav` Content-Length rollover re-LOAD loop.
   rollover_cancel: Option<oneshot::Sender<()>>,
   rollover_task: Option<tokio::task::JoinHandle<()>>,
@@ -137,6 +147,50 @@ struct ActiveSession {
   last_volume_linear: Arc<Mutex<Option<f32>>>,
   /// In-flight blocking Cast LOAD (rollover); awaited on teardown before media STOP.
   inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+  /// Earliest instant at which AirPlay pause/flush may Cast-PAUSE this session.
+  ///
+  /// Set to `now + PAUSE_GRACE` when the session becomes active after a successful LOAD so
+  /// stale idle events queued during the blocking start path cannot pause a fresh load.
+  pause_eligible_at: Instant,
+}
+
+/// Why a queued AirPlay pause must not drive Cast PAUSE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseSkipReason {
+  /// Session just became active; idle events from the load window are still in flight.
+  WithinGrace,
+  /// Ring still holds substantial PCM (playback / prebuffer, not a true idle).
+  RingHasPcm,
+}
+
+impl PauseSkipReason {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::WithinGrace => "grace",
+      Self::RingHasPcm => "ring_has_pcm",
+    }
+  }
+}
+
+/// Decide whether an AirPlay pause/flush event should pause Cast media.
+///
+/// Returns `Ok(())` to pause, or `Err(reason)` when the event is stale or false idle.
+///
+/// Uses `std::result::Result` so the crate [`Result`] alias (`Error`) is not involved.
+fn should_pause_cast(
+  now: Instant,
+  pause_eligible_at: Instant,
+  ring_frames: usize,
+  ring_pcm_threshold: usize,
+) -> std::result::Result<(), PauseSkipReason> {
+  // Active/buffered PCM wins over grace: if audio is still in the ring, do not pause.
+  if ring_frames > ring_pcm_threshold {
+    return Err(PauseSkipReason::RingHasPcm);
+  }
+  if now < pause_eligible_at {
+    return Err(PauseSkipReason::WithinGrace);
+  }
+  Ok(())
 }
 
 /// Ordered teardown steps for an active bridge session.
@@ -308,6 +362,8 @@ impl Bridge {
       "starting Cast progressive WAV bridge"
     );
 
+    // Keep a ring handle for pause re-validation after LOAD; LiveWav also holds Arc.
+    let session_ring = Arc::clone(&ring);
     media.set_content(MediaContent::LiveWav {
       ring,
       channels: stream_channels,
@@ -349,6 +405,8 @@ impl Bridge {
           Arc::clone(&last_volume_linear),
           Arc::clone(&inflight_load),
         );
+        let pause_eligible_at = Instant::now() + PAUSE_GRACE;
+        let ring_frames = session_ring.available_frames();
         {
           let mut guard = self.sessions.lock();
           drop(guard.insert(
@@ -357,13 +415,26 @@ impl Bridge {
               media,
               device_id: device_id.to_owned(),
               pool: Arc::clone(&self.cast_pool),
+              ring: session_ring,
               rollover_cancel: Some(rollover_cancel),
               rollover_task: Some(rollover_task),
               session_alive,
               last_volume_linear,
               inflight_load,
+              pause_eligible_at,
             },
           ));
+        }
+        // LOAD starts PLAYING; if the ring still has PCM, a stale pause queued during the
+        // blocking start path must not win. Defensive PLAY is unnecessary when the ring is
+        // empty (true underrun / client already idle).
+        if ring_frames > PAUSE_RING_PCM_THRESHOLD {
+          tracing::debug!(
+            %device_id,
+            ring_frames,
+            grace_ms = PAUSE_GRACE.as_millis(),
+            "Cast session active; pause grace armed (ring has PCM)"
+          );
         }
         Ok(())
       },
@@ -469,8 +540,26 @@ impl Bridge {
   }
 
   /// Pause Cast media immediately (AirPlay rate=0 / flush). Keeps HTTP + session warm.
+  ///
+  /// Stale idle `Paused` events queued while start blocked on Cast LOAD are dropped when
+  /// still inside [`PAUSE_GRACE`] or when the session ring still holds PCM.
   async fn handle_pause(&self, device_id: &str) {
-    if !self.sessions.lock().contains_key(device_id) {
+    let decision = {
+      let guard = self.sessions.lock();
+      let Some(session) = guard.get(device_id) else {
+        return;
+      };
+      let pause_eligible_at = session.pause_eligible_at;
+      let ring_frames = session.ring.available_frames();
+      drop(guard);
+      should_pause_cast(Instant::now(), pause_eligible_at, ring_frames, PAUSE_RING_PCM_THRESHOLD)
+    };
+    if let Err(reason) = decision {
+      tracing::info!(
+        %device_id,
+        reason = reason.as_str(),
+        "skipping Cast pause (stale idle or false idle)"
+      );
       return;
     }
     tracing::info!(%device_id, "AirPlay paused; pausing Cast media");
@@ -783,6 +872,28 @@ mod tests {
   use crate::registry::Device;
   use std::time::{Duration, Instant};
 
+  /// Minimal active session for teardown / pause tests (no live Cast worker).
+  fn test_active_session(
+    media: MediaServerHandle,
+    device_id: &str,
+    pool: Arc<CastPool>,
+    ring: Arc<PcmRing>,
+    pause_eligible_at: Instant,
+  ) -> ActiveSession {
+    ActiveSession {
+      media,
+      device_id: device_id.to_owned(),
+      pool,
+      ring,
+      rollover_cancel: None,
+      rollover_task: None,
+      session_alive: Arc::new(AtomicBool::new(true)),
+      last_volume_linear: Arc::new(Mutex::new(None)),
+      inflight_load: Arc::new(Mutex::new(None)),
+      pause_eligible_at,
+    }
+  }
+
   #[test]
   fn session_end_steps_media_before_cast_stop() {
     let steps = session_end_steps();
@@ -799,6 +910,126 @@ mod tests {
       volume_after_load(LoadVolumePolicy::Rollover { last_volume: Some(0.42) }),
       Some(0.42)
     );
+  }
+
+  #[test]
+  fn should_pause_cast_skips_within_grace_when_ring_empty() {
+    let now = Instant::now();
+    let eligible = now + Duration::from_secs(2);
+    assert_eq!(
+      should_pause_cast(now, eligible, 0, PAUSE_RING_PCM_THRESHOLD),
+      Err(PauseSkipReason::WithinGrace)
+    );
+  }
+
+  #[test]
+  fn should_pause_cast_skips_when_ring_has_pcm_even_after_grace() {
+    let now = Instant::now();
+    let eligible = now; // already eligible
+    assert_eq!(
+      should_pause_cast(now, eligible, PAUSE_RING_PCM_THRESHOLD + 1, PAUSE_RING_PCM_THRESHOLD),
+      Err(PauseSkipReason::RingHasPcm)
+    );
+    // Ring check wins over grace (stale pause after load with prebuffer still present).
+    let future_eligible = now + Duration::from_secs(2);
+    assert_eq!(
+      should_pause_cast(now, future_eligible, PAUSE_RING_PCM_THRESHOLD + 1, PAUSE_RING_PCM_THRESHOLD),
+      Err(PauseSkipReason::RingHasPcm)
+    );
+  }
+
+  #[test]
+  fn should_pause_cast_allows_when_eligible_and_ring_drained() {
+    let now = Instant::now();
+    let eligible = now;
+    assert_eq!(should_pause_cast(now, eligible, 0, PAUSE_RING_PCM_THRESHOLD), Ok(()));
+    assert_eq!(
+      should_pause_cast(now, eligible, PAUSE_RING_PCM_THRESHOLD, PAUSE_RING_PCM_THRESHOLD),
+      Ok(())
+    );
+    // Exactly at eligible boundary is allowed (`now < eligible` is the skip).
+    assert_eq!(should_pause_cast(eligible, eligible, 0, PAUSE_RING_PCM_THRESHOLD), Ok(()));
+  }
+
+  #[test]
+  fn should_pause_cast_table() {
+    let t0 = Instant::now();
+    let cases = [
+      // (now_offset_from_t0, eligible_offset, ring_frames, threshold, expected)
+      (Duration::ZERO, PAUSE_GRACE, 0, 256, Err(PauseSkipReason::WithinGrace)),
+      (PAUSE_GRACE, PAUSE_GRACE, 0, 256, Ok(())),
+      (PAUSE_GRACE + Duration::from_millis(1), PAUSE_GRACE, 0, 256, Ok(())),
+      (Duration::ZERO, PAUSE_GRACE, 257, 256, Err(PauseSkipReason::RingHasPcm)),
+      (PAUSE_GRACE, PAUSE_GRACE, 257, 256, Err(PauseSkipReason::RingHasPcm)),
+      (PAUSE_GRACE, PAUSE_GRACE, 256, 256, Ok(())),
+      (PAUSE_GRACE, PAUSE_GRACE, 1, 0, Err(PauseSkipReason::RingHasPcm)),
+      (PAUSE_GRACE, PAUSE_GRACE, 0, 0, Ok(())),
+    ];
+    for (i, (now_off, elig_off, frames, threshold, expected)) in cases.iter().enumerate() {
+      let now = t0 + *now_off;
+      let eligible = t0 + *elig_off;
+      assert_eq!(
+        should_pause_cast(now, eligible, *frames, *threshold),
+        *expected,
+        "case {i}: now_off={now_off:?} elig_off={elig_off:?} frames={frames} thr={threshold}"
+      );
+    }
+    // Reason strings are stable for HA log grepping.
+    assert_eq!(PauseSkipReason::WithinGrace.as_str(), "grace");
+    assert_eq!(PauseSkipReason::RingHasPcm.as_str(), "ring_has_pcm");
+  }
+
+  #[tokio::test]
+  async fn handle_pause_skips_within_grace_without_cast_call() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let ring = Arc::new(PcmRing::new(2, 64));
+
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert(
+        "dev-grace".to_owned(),
+        test_active_session(media, "dev-grace", Arc::clone(&pool), ring, Instant::now() + PAUSE_GRACE),
+      ));
+    }
+
+    // Empty ring + within grace → skip (no panic; no warm worker so pause would no-op anyway).
+    bridge.handle_pause("dev-grace").await;
+    assert!(bridge.sessions.lock().contains_key("dev-grace"));
+    bridge.handle_session_end("dev-grace").await;
+  }
+
+  #[tokio::test]
+  async fn handle_pause_skips_when_ring_has_pcm() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let ring = Arc::new(PcmRing::new(2, 1024));
+    // More than PAUSE_RING_PCM_THRESHOLD complete stereo frames.
+    let samples = vec![0.01_f32; (PAUSE_RING_PCM_THRESHOLD + 10) * 2];
+    ring.push_f32(&samples);
+    assert!(ring.available_frames() > PAUSE_RING_PCM_THRESHOLD);
+
+    {
+      let mut guard = bridge.sessions.lock();
+      drop(guard.insert(
+        "dev-pcm".to_owned(),
+        test_active_session(
+          media,
+          "dev-pcm",
+          Arc::clone(&pool),
+          Arc::clone(&ring),
+          Instant::now(), // already eligible; ring must still block pause
+        ),
+      ));
+    }
+
+    bridge.handle_pause("dev-pcm").await;
+    assert!(bridge.sessions.lock().contains_key("dev-pcm"));
+    bridge.handle_session_end("dev-pcm").await;
   }
 
   #[tokio::test]
@@ -823,16 +1054,7 @@ mod tests {
       let mut guard = bridge.sessions.lock();
       drop(guard.insert(
         "dev-1".to_owned(),
-        ActiveSession {
-          media,
-          device_id: "dev-1".to_owned(),
-          pool: Arc::clone(&pool),
-          rollover_cancel: None,
-          rollover_task: None,
-          session_alive: Arc::new(AtomicBool::new(true)),
-          last_volume_linear: Arc::new(Mutex::new(None)),
-          inflight_load: Arc::new(Mutex::new(None)),
-        },
+        test_active_session(media, "dev-1", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)), Instant::now()),
       ));
     }
 
@@ -883,11 +1105,13 @@ mod tests {
           media,
           device_id: "dev-roll".to_owned(),
           pool,
+          ring: Arc::new(PcmRing::new(2, 64)),
           rollover_cancel: Some(cancel_tx),
           rollover_task: Some(task),
           session_alive: Arc::new(AtomicBool::new(true)),
           last_volume_linear: Arc::new(Mutex::new(None)),
           inflight_load: Arc::new(Mutex::new(None)),
+          pause_eligible_at: Instant::now(),
         },
       ));
     }
@@ -927,11 +1151,13 @@ mod tests {
           media,
           device_id: "dev-inflight".to_owned(),
           pool,
+          ring: Arc::new(PcmRing::new(2, 64)),
           rollover_cancel: None,
           rollover_task: None,
           session_alive: Arc::clone(&session_alive),
           last_volume_linear: Arc::new(Mutex::new(None)),
           inflight_load: Arc::clone(&inflight_load),
+          pause_eligible_at: Instant::now(),
         },
       ));
     }
@@ -988,11 +1214,13 @@ mod tests {
           media,
           device_id: "dev-join-order".to_owned(),
           pool,
+          ring: Arc::new(PcmRing::new(2, 64)),
           rollover_cancel: Some(cancel_tx),
           rollover_task: Some(task),
           session_alive: Arc::clone(&session_alive),
           last_volume_linear: Arc::new(Mutex::new(None)),
           inflight_load: Arc::clone(&inflight_load),
+          pause_eligible_at: Instant::now(),
         },
       ));
     }
@@ -1071,11 +1299,13 @@ mod tests {
           media,
           device_id: "dev-vol".to_owned(),
           pool,
+          ring: Arc::new(PcmRing::new(2, 64)),
           rollover_cancel: None,
           rollover_task: None,
           session_alive: Arc::new(AtomicBool::new(true)),
           last_volume_linear: Arc::clone(&last_volume_linear),
           inflight_load: Arc::new(Mutex::new(None)),
+          pause_eligible_at: Instant::now(),
         },
       ));
     }

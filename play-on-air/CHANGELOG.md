@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.11
+
+- After Cast load, ignore stale AirPlay pause events (grace window + ring still has PCM) so re-cast after Hey Google steal is not immediately Cast-PAUSEd into silence.
+
 ## 0.1.10
 
 - Hard kick after Cast steal: vendored shairplay aborts live RTSP + AP2 session tasks on `stop()` (iPhone Now Playing actually drops).
