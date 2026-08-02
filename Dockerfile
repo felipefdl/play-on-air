@@ -44,6 +44,7 @@ ARG BUILD_ARCH
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
+    iproute2 \
     jq \
   && rm -rf /var/lib/apt/lists/*
 

@@ -474,72 +474,50 @@ const fn is_advertiseable_v4(ip: Ipv4Addr) -> bool {
 
 /// Force-close open TCP sockets bound to `local_port` (accepted RTSP conns).
 ///
-/// shairplay's `RaopServer::stop` only stops the accept loop; live `process_connection`
-/// tasks keep their TCP streams open, so iOS stays in Now Playing after a kick.
-/// On Linux we `shutdown(SHUT_RDWR)` every local fd whose `getsockname` port matches.
+/// shairplay's `RaopServer::stop` only stops the accept loop; live connection tasks
+/// keep TCP streams open, so iOS stays in Now Playing after a kick. On Linux we use
+/// `ss -K` (iproute2) — no `unsafe` (workspace `unsafe_code = forbid`).
 ///
-/// No-op on non-Linux hosts (macOS dev); Drop still stops accepting new conns.
-#[expect(
-  clippy::missing_const_for_fn,
-  reason = "Linux path is not const; keep one signature for all targets"
-)]
+/// No-op on non-Linux hosts. Requires `ss` in PATH (HA image installs `iproute2`).
 pub fn force_close_tcp_on_local_port(local_port: u16) {
   #[cfg(target_os = "linux")]
   force_close_tcp_on_local_port_linux(local_port);
   #[cfg(not(target_os = "linux"))]
-  let _ = local_port;
+  {
+    tracing::trace!(local_port, "force_close: no-op on this OS");
+  }
 }
 
+/// Kill sockets with local port `local_port` via `ss -K` (safe, no unsafe).
 #[cfg(target_os = "linux")]
 fn force_close_tcp_on_local_port_linux(local_port: u16) {
-  let Ok(dir) = std::fs::read_dir("/proc/self/fd") else {
-    tracing::debug!(local_port, "force_close: cannot read /proc/self/fd");
-    return;
-  };
-  let mut closed = 0_u32;
-  for ent in dir.flatten() {
-    let name = ent.file_name();
-    let Some(fd_str) = name.to_str() else {
-      continue;
-    };
-    let Ok(fd) = fd_str.parse::<libc::c_int>() else {
-      continue;
-    };
-    // Skip stdin/out/err.
-    if fd < 3 {
-      continue;
-    }
-    // SAFETY: fd is from /proc/self/fd; getsockname/shutdown only touch our process.
-    unsafe {
-      let mut addr = std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
-      let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>()).unwrap_or(0);
-      if libc::getsockname(fd, addr.as_mut_ptr().cast::<libc::sockaddr>(), &mut len) != 0 {
-        continue;
+  // Filter: any socket whose source port is our RAOP listen/accept port.
+  let filter = format!("sport = :{local_port}");
+  match std::process::Command::new("ss").args(["-K", filter.as_str()]).output() {
+    Ok(out) => {
+      let stdout = String::from_utf8_lossy(&out.stdout);
+      let stderr = String::from_utf8_lossy(&out.stderr);
+      if out.status.success() {
+        // ss -K prints closed sockets; count non-empty lines as a rough signal.
+        let lines = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+        tracing::info!(local_port, lines, "force-closed TCP sockets on AirPlay port via ss -K (kick)");
+      } else {
+        tracing::warn!(
+          local_port,
+          status = ?out.status,
+          stdout = %stdout.trim(),
+          stderr = %stderr.trim(),
+          "ss -K failed while kicking AirPlay sockets"
+        );
       }
-      let addr = addr.assume_init();
-      let port = match i32::from(addr.ss_family) {
-        libc::AF_INET => {
-          let sin = *std::ptr::addr_of!(addr).cast::<libc::sockaddr_in>();
-          u16::from_be(sin.sin_port)
-        },
-        libc::AF_INET6 => {
-          let sin6 = *std::ptr::addr_of!(addr).cast::<libc::sockaddr_in6>();
-          u16::from_be(sin6.sin6_port)
-        },
-        _ => continue,
-      };
-      if port != local_port {
-        continue;
-      }
-      if libc::shutdown(fd, libc::SHUT_RDWR) == 0 {
-        closed = closed.saturating_add(1);
-      }
-    }
-  }
-  if closed > 0 {
-    tracing::info!(local_port, closed, "force-closed TCP sockets on AirPlay port (kick)");
-  } else {
-    tracing::debug!(local_port, "force_close: no matching sockets on port");
+    },
+    Err(err) => {
+      tracing::warn!(
+        local_port,
+        error = %err,
+        "ss not available for RTSP kick; install iproute2 (HA image should include it)"
+      );
+    },
   }
 }
 

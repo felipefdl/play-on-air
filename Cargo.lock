@@ -1338,7 +1338,6 @@ dependencies = [
  "futures-util",
  "hound",
  "if-addrs 0.13.4",
- "libc",
  "mdns-sd",
  "parking_lot",
  "rust_cast",
