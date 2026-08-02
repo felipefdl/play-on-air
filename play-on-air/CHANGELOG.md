@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+
+- Kick fix: after Cast steal, call `RaopServer::stop` and force-close live RTSP TCP sockets on the RAOP port (shairplay stop alone left iPhone Now Playing connected). Brief pause before re-advertise.
+
 ## 0.1.8
 
 - Cast ownership: probe **media** status (with transport CONNECT), not only receiver apps — Google/YouTube steal is detected when the session goes IDLE interrupted or disappears.

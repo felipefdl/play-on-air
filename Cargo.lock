@@ -1328,7 +1328,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "play-on-air"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "bytes",
@@ -1338,6 +1338,7 @@ dependencies = [
  "futures-util",
  "hound",
  "if-addrs 0.13.4",
+ "libc",
  "mdns-sd",
  "parking_lot",
  "rust_cast",

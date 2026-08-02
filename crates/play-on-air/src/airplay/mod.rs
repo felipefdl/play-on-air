@@ -295,6 +295,8 @@ pub struct AirPlayReceiver {
   pub device_id: String,
   /// Advertised AirPlay name.
   pub name: String,
+  /// TCP port the RAOP listener uses (stable per device id).
+  pub port: u16,
   state: Arc<DeviceAudioState>,
   server: RaopServer,
 }
@@ -304,6 +306,7 @@ impl std::fmt::Debug for AirPlayReceiver {
     f.debug_struct("AirPlayReceiver")
       .field("device_id", &self.device_id)
       .field("name", &self.name)
+      .field("port", &self.port)
       .field("ring_channels", &self.state.current_ring().channels())
       .finish_non_exhaustive()
   }
@@ -349,6 +352,7 @@ impl AirPlayReceiver {
     Ok(Self {
       device_id: device_id_owned,
       name: name_owned,
+      port,
       state,
       server,
     })
@@ -368,6 +372,14 @@ impl AirPlayReceiver {
       .map_err(|err| Error::AirPlay(format!("start {}: {err}", self.name)))?;
     tracing::info!(device_id = %self.device_id, name = %self.name, "AirPlay 2 receiver started");
     Ok(())
+  }
+
+  /// Stop mDNS + accept loop, then force-close live RTSP sockets on this port.
+  ///
+  /// Required for kick: dropping `RaopServer` alone leaves accepted TCP streams open.
+  pub async fn shutdown_hard(&mut self) {
+    self.server.stop().await;
+    crate::net::force_close_tcp_on_local_port(self.port);
   }
 }
 
@@ -409,39 +421,57 @@ impl AirPlayManager {
     Ok(())
   }
 
-  /// Stop and drop the receiver for `device_id`.
+  /// Stop and drop the receiver for `device_id` (best-effort hard stop when in a runtime).
   pub fn remove(&self, device_id: &str) {
     let removed = {
       let mut guard = self.receivers.lock();
       guard.remove(device_id)
     };
-    if let Some(rx) = removed {
+    if let Some(mut rx) = removed {
       tracing::info!(device_id = %rx.device_id, name = %rx.name, "AirPlay receiver withdrawn");
-      drop(rx);
+      // Prefer async stop + socket force-close when a tokio runtime is available.
+      if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        drop(handle.spawn(async move {
+          rx.shutdown_hard().await;
+        }));
+      } else {
+        crate::net::force_close_tcp_on_local_port(rx.port);
+        drop(rx);
+      }
     }
   }
 
   /// Force-drop RTSP clients for `device_id` after Cast ownership loss, then re-advertise.
   ///
-  /// Drops the live [`RaopServer`] (closes listeners/connections so the iPhone leaves
-  /// Now Playing), then starts a fresh receiver with the same AirPlay name so other
-  /// users can still connect. Does not run when no receiver exists for the id.
+  /// shairplay `stop` alone does not abort live RTSP streams — we also force-close
+  /// TCP sockets on the RAOP port so the phone leaves Now Playing, wait briefly, then
+  /// re-advertise under the same name.
   pub async fn kick_clients(&self, device_id: &str) -> Result<()> {
-    let maybe_name = {
-      let guard = self.receivers.lock();
-      guard.get(device_id).map(|rx| rx.name.clone())
+    let removed = {
+      let mut guard = self.receivers.lock();
+      guard.remove(device_id)
     };
-    let Some(airplay_name) = maybe_name else {
+    let Some(mut rx) = removed else {
       tracing::debug!(%device_id, "kick_clients: no AirPlay receiver for device");
       return Ok(());
     };
-
-    self.remove(device_id);
+    let airplay_name = rx.name.clone();
+    let port = rx.port;
+    tracing::info!(
+      %device_id,
+      airplay_name = %airplay_name,
+      port,
+      "kicking AirPlay clients (stop + force-close RTSP sockets)"
+    );
+    rx.shutdown_hard().await;
+    drop(rx);
+    // Give iOS a beat to observe TCP shutdown before the same name reappears.
+    tokio::time::sleep(Duration::from_millis(750)).await;
     self.ensure(device_id, &airplay_name).await?;
     tracing::info!(
       %device_id,
       airplay_name = %airplay_name,
-      "kicked AirPlay clients after Cast ownership loss"
+      "kicked AirPlay clients after Cast ownership loss; re-advertised"
     );
     Ok(())
   }
