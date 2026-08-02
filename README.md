@@ -1,3 +1,8 @@
+<br/>
+<p align="center">
+  <img src="play-on-air/logo.png" width="200px" alt="PlayOnAir"></img>
+</p>
+
 # PlayOnAir
 
 Chromecast devices as AirPlay 2 speakers on the local network.
@@ -22,12 +27,12 @@ The app uses **host network** (`host_network: true`) so mDNS discovery, AirPlay 
 
 In the app UI you can set:
 
-- **Log level** — `info` by default (`trace` / `debug` / `info` / `warn` / `error`)
-- **Devices** — optional list to **rename** or **hide** Chromecasts in the AirPlay picker
+- **Log level:** `info` by default (`trace` / `debug` / `info` / `warn` / `error`)
+- **Devices:** optional list to **rename** or **hide** Chromecasts in the AirPlay picker
 
 Empty devices list = product defaults. Configuration options regenerate the in-container TOML on every start (HA UI is the source of truth). Full field reference and examples: [play-on-air/DOCS.md](play-on-air/DOCS.md).
 
-Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.png` — see [play-on-air/ASSETS.md](play-on-air/ASSETS.md).
+Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.png`. Specs: [play-on-air/ASSETS.md](play-on-air/ASSETS.md).
 
 ### Container image
 
@@ -86,7 +91,7 @@ Path resolution:
 Missing file → product defaults (identity name map, nothing hidden).
 
 ```toml
-# Example only — rename this file or point --config at it.
+# Example only: rename this file or point --config at it.
 # [[device]]
 # id = "Living Room"
 # name = "TV"
@@ -134,9 +139,13 @@ cargo test --workspace
 
 ## Security and contributing
 
-- [SECURITY.md](SECURITY.md) — LAN-only model, host network tradeoff, reporting issues
-- [CONTRIBUTING.md](CONTRIBUTING.md) — MSRV, quality gate, conventions
+- [SECURITY.md](SECURITY.md): LAN-only model, host network tradeoff, reporting issues
+- [CONTRIBUTING.md](CONTRIBUTING.md): MSRV, quality gate, conventions
+
+## Sponsors
+
+If PlayOnAir is useful, you can [sponsor the maintainer on GitHub](https://github.com/sponsors/felipefdl).
 
 ## License
 
-MIT — Copyright (c) 2026 Felipe Lima. See [LICENSE.md](LICENSE.md).
+MIT. Copyright (c) 2026 Felipe Lima. See [LICENSE.md](LICENSE.md).
