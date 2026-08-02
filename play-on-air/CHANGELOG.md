@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.10
+
+- Hard kick after Cast steal: vendored shairplay aborts live RTSP + AP2 session tasks on `stop()` (iPhone Now Playing actually drops).
+- Kick lock: maintain loop cannot re-advertise a speaker mid-kick.
+- Honest `ss -K` logging (no false success from column headers).
+
 ## 0.1.9
 
 - Kick fix: after Cast steal, call `RaopServer::stop` and force-close live RTSP TCP sockets on the RAOP port (shairplay stop alone left iPhone Now Playing connected). Brief pause before re-advertise.

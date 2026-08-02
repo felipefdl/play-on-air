@@ -3,7 +3,7 @@
 # PlayOnAir multi-stage image (glibc). Used by Home Assistant OS via GHCR.
 # Build args: BUILD_VERSION, BUILD_ARCH (HA: amd64 | aarch64)
 
-ARG BUILD_VERSION=0.1.9
+ARG BUILD_VERSION=0.1.10
 ARG BUILD_ARCH=amd64
 
 # -----------------------------------------------------------------------------
@@ -26,6 +26,8 @@ WORKDIR /src
 
 COPY Cargo.toml Cargo.lock rustfmt.toml clippy.toml deny.toml ./
 COPY crates/play-on-air crates/play-on-air
+# Path dep (not a workspace member): hard-stop fork of shairplay — see vendor/shairplay/PLAYONAIR.md.
+COPY vendor/shairplay vendor/shairplay
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

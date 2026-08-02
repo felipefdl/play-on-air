@@ -71,7 +71,7 @@ hide = true
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:
 
-`ghcr.io/felipefdl/play-on-air:0.1.9`
+`ghcr.io/felipefdl/play-on-air:0.1.10`
 
 Architectures: `amd64`, `aarch64`.
 
@@ -85,7 +85,7 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 |---------|----------------|
 | iOS/macOS AirPlay picker is empty | App is **Started**; host and phone on the same LAN; wait a few seconds after start for discovery; Log tab for discovery errors. |
 | Device name wrong or still visible | Configuration **Optional rename / hide** match id is a substring of the real Cast name; app was restarted after save. |
-| Ghost AirPlay after Hey Google | Use 0.1.9+; Log should show `Cast ownership lost` then kick. Restart app if still on an older image. |
+| Ghost AirPlay after Hey Google | Use 0.1.10+; Log should show `Cast ownership lost` then kick. Restart app if still on an older image. |
 | Nest Mini / Nest speakers cut out or sound wrong | Use a current image (playback pacing and underrun handling are fixed). Prefer stable LAN Wi‑Fi; avoid forcing extreme log levels during normal listening. |
 | Nothing after install | Confirm `host_network: true` is still set in the published app config; do not run PlayOnAir on a bridge-only network without multicast. |
 | Config changes ignored | Restart the app after saving Configuration. |

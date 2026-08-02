@@ -1328,7 +1328,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "play-on-air"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "bytes",
@@ -1897,8 +1897,6 @@ dependencies = [
 [[package]]
 name = "shairplay"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c792c7751a561e8df0d0fb7d5da96f0345e15a392b11e7f5485587f54cf99d23"
 dependencies = [
  "aes",
  "astro-dnssd",

@@ -474,9 +474,10 @@ const fn is_advertiseable_v4(ip: Ipv4Addr) -> bool {
 
 /// Force-close open TCP sockets bound to `local_port` (accepted RTSP conns).
 ///
-/// shairplay's `RaopServer::stop` only stops the accept loop; live connection tasks
-/// keep TCP streams open, so iOS stays in Now Playing after a kick. On Linux we use
-/// `ss -K` (iproute2) — no `unsafe` (workspace `unsafe_code = forbid`).
+/// Vendored shairplay aborts accept + connection tasks on `stop`; `ss -K` is a
+/// best-effort kernel-side kill for any remaining ESTAB sockets so iOS leaves
+/// Now Playing. On Linux we use `ss -K` (iproute2) — no `unsafe`
+/// (workspace `unsafe_code = forbid`).
 ///
 /// No-op on non-Linux hosts. Requires `ss` in PATH (HA image installs `iproute2`).
 pub fn force_close_tcp_on_local_port(local_port: u16) {
@@ -488,27 +489,55 @@ pub fn force_close_tcp_on_local_port(local_port: u16) {
   }
 }
 
+/// True when a line from `ss` stdout is a real socket row (not blank / column header).
+///
+/// Pure helper so unit tests can lock classification without spawning `ss`.
+#[cfg(any(test, target_os = "linux"))]
+fn is_ss_socket_line(line: &str) -> bool {
+  let trimmed = line.trim();
+  if trimmed.is_empty() {
+    return false;
+  }
+  // Header rows look like: "Netid  State  Recv-Q  Send-Q  Local Address:Port  …"
+  let first = trimmed.split_whitespace().next().unwrap_or("");
+  let first_lower = first.to_ascii_lowercase();
+  first_lower != "netid" && first_lower != "state"
+}
+
+/// Count closed-socket rows in `ss -K` stdout (excludes blanks and headers).
+#[cfg(any(test, target_os = "linux"))]
+fn count_ss_socket_lines(stdout: &str) -> usize {
+  stdout.lines().filter(|line| is_ss_socket_line(line)).count()
+}
+
 /// Kill sockets with local port `local_port` via `ss -K` (safe, no unsafe).
 #[cfg(target_os = "linux")]
 fn force_close_tcp_on_local_port_linux(local_port: u16) {
-  // Filter: any socket whose source port is our RAOP listen/accept port.
+  // Filter: any TCP socket whose source port is our RAOP listen/accept port.
   let filter = format!("sport = :{local_port}");
-  match std::process::Command::new("ss").args(["-K", filter.as_str()]).output() {
-    Ok(out) => {
-      let stdout = String::from_utf8_lossy(&out.stdout);
-      let stderr = String::from_utf8_lossy(&out.stderr);
-      if out.status.success() {
-        // ss -K prints closed sockets; count non-empty lines as a rough signal.
-        let lines = stdout.lines().filter(|l| !l.trim().is_empty()).count();
-        tracing::info!(local_port, lines, "force-closed TCP sockets on AirPlay port via ss -K (kick)");
-      } else {
-        tracing::warn!(
-          local_port,
-          status = ?out.status,
-          stdout = %stdout.trim(),
-          stderr = %stderr.trim(),
-          "ss -K failed while kicking AirPlay sockets"
-        );
+  // Prefer no-header (`-H`), TCP only (`-t`), numeric (`-n`). Older iproute2 may
+  // reject `-H`; fall back without it and filter headers in the line counter.
+  let primary = std::process::Command::new("ss")
+    .args(["-K", "-H", "-t", "-n", filter.as_str()])
+    .output();
+
+  let out = match primary {
+    Ok(out) if out.status.success() => out,
+    Ok(_failed_with_h) => {
+      // Older iproute2 may reject `-H`; retry without it and filter headers when counting.
+      match std::process::Command::new("ss")
+        .args(["-K", "-t", "-n", filter.as_str()])
+        .output()
+      {
+        Ok(fallback) => fallback,
+        Err(err) => {
+          tracing::warn!(
+            local_port,
+            error = %err,
+            "ss not available for RTSP kick; install iproute2 (HA image should include it)"
+          );
+          return;
+        },
       }
     },
     Err(err) => {
@@ -517,7 +546,37 @@ fn force_close_tcp_on_local_port_linux(local_port: u16) {
         error = %err,
         "ss not available for RTSP kick; install iproute2 (HA image should include it)"
       );
+      return;
     },
+  };
+
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  if !out.status.success() {
+    tracing::warn!(
+      local_port,
+      status = ?out.status,
+      stdout = %stdout.trim(),
+      stderr = %stderr.trim(),
+      "ss -K failed while kicking AirPlay sockets"
+    );
+    return;
+  }
+
+  let closed_count = count_ss_socket_lines(&stdout);
+  if closed_count > 0 {
+    tracing::info!(
+      local_port,
+      closed_count,
+      "force-closed TCP sockets on AirPlay port via ss -K (kick)"
+    );
+  } else {
+    tracing::warn!(
+      local_port,
+      closed_count,
+      "ss -K reported success but closed zero sockets; kick may rely on task abort alone \
+       (NET_ADMIN / host_network / ss version / already-closed sockets)"
+    );
   }
 }
 
@@ -564,6 +623,35 @@ mod tests {
   #[test]
   fn preferred_local_ipv4s_does_not_panic() {
     drop(preferred_local_ipv4s());
+  }
+
+  #[test]
+  fn is_ss_socket_line_filters_headers_and_blanks() {
+    assert!(!is_ss_socket_line(""));
+    assert!(!is_ss_socket_line("   "));
+    assert!(!is_ss_socket_line(
+      "Netid  State      Recv-Q Send-Q Local Address:Port Peer Address:Port"
+    ));
+    assert!(!is_ss_socket_line("State Recv-Q Send-Q"));
+    assert!(is_ss_socket_line(
+      "tcp   ESTAB      0      0 192.168.1.10:7000 192.168.1.20:54321"
+    ));
+    assert!(is_ss_socket_line("u_str ESTAB 0 0 * 12345 * 0"));
+  }
+
+  #[test]
+  fn count_ss_socket_lines_ignores_header_only_output() {
+    let header_only = "Netid  State      Recv-Q Send-Q Local Address:Port Peer Address:Port\n";
+    assert_eq!(count_ss_socket_lines(header_only), 0);
+    assert_eq!(count_ss_socket_lines(""), 0);
+    let with_sock = "\
+Netid  State      Recv-Q Send-Q Local Address:Port Peer Address:Port
+tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40000
+tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
+";
+    assert_eq!(count_ss_socket_lines(with_sock), 2);
+    // -H (no header): only socket rows.
+    assert_eq!(count_ss_socket_lines("tcp   ESTAB 0 0 0.0.0.0:7000 192.168.1.5:40000\n"), 1);
   }
 
   #[test]

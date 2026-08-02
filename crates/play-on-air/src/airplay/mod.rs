@@ -1,6 +1,6 @@
 //! AirPlay 2 receiver wrappers (one `RaopServer` per Chromecast).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -383,10 +383,15 @@ impl AirPlayReceiver {
   }
 }
 
+/// How long a speaker stays withdrawn after a hard kick before re-advertise.
+const KICK_WITHDRAW_HOLD: Duration = Duration::from_millis(1_500);
+
 /// Manages the set of live AirPlay receivers keyed by Cast device id.
 #[derive(Debug, Default)]
 pub struct AirPlayManager {
   receivers: Mutex<HashMap<String, AirPlayReceiver>>,
+  /// Device ids mid-kick: [`Self::ensure`] must not recreate them (maintain race).
+  kicking: Mutex<HashSet<String>>,
   event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
 }
 
@@ -395,12 +400,17 @@ impl AirPlayManager {
   pub fn new(event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>) -> Self {
     Self {
       receivers: Mutex::new(HashMap::new()),
+      kicking: Mutex::new(HashSet::new()),
       event_tx,
     }
   }
 
   /// Ensure a receiver exists for `device_id` with the given AirPlay name.
   pub async fn ensure(&self, device_id: &str, airplay_name: &str) -> Result<()> {
+    if self.kicking.lock().contains(device_id) {
+      tracing::debug!(%device_id, "ensure skipped: device is being kicked");
+      return Ok(());
+    }
     {
       let guard = self.receivers.lock();
       if let Some(existing) = guard.get(device_id)
@@ -429,7 +439,7 @@ impl AirPlayManager {
     };
     if let Some(mut rx) = removed {
       tracing::info!(device_id = %rx.device_id, name = %rx.name, "AirPlay receiver withdrawn");
-      // Prefer async stop + socket force-close when a tokio runtime is available.
+      // Prefer async hard stop when a tokio runtime is available.
       if let Ok(handle) = tokio::runtime::Handle::try_current() {
         drop(handle.spawn(async move {
           rx.shutdown_hard().await;
@@ -441,12 +451,27 @@ impl AirPlayManager {
     }
   }
 
-  /// Force-drop RTSP clients for `device_id` after Cast ownership loss, then re-advertise.
+  /// Force-drop all AP2 sessions for `device_id` after Cast ownership loss, then re-advertise.
   ///
-  /// shairplay `stop` alone does not abort live RTSP streams — we also force-close
-  /// TCP sockets on the RAOP port so the phone leaves Now Playing, wait briefly, then
-  /// re-advertise under the same name.
+  /// Marks the device as **kicking** so [`Self::ensure`] (maintain loop) cannot recreate
+  /// the receiver during the withdrawal hold. Uses vendored shairplay hard-stop (abort
+  /// RTSP + session tasks) plus best-effort `ss -K` on the RAOP port.
   pub async fn kick_clients(&self, device_id: &str) -> Result<()> {
+    {
+      let mut kicking = self.kicking.lock();
+      let _inserted = kicking.insert(device_id.to_owned());
+    }
+
+    let result = self.kick_clients_inner(device_id).await;
+
+    {
+      let mut kicking = self.kicking.lock();
+      let _removed = kicking.remove(device_id);
+    }
+    result
+  }
+
+  async fn kick_clients_inner(&self, device_id: &str) -> Result<()> {
     let removed = {
       let mut guard = self.receivers.lock();
       guard.remove(device_id)
@@ -461,13 +486,21 @@ impl AirPlayManager {
       %device_id,
       airplay_name = %airplay_name,
       port,
-      "kicking AirPlay clients (stop + force-close RTSP sockets)"
+      "kicking AirPlay clients (hard-stop RTSP + session tasks)"
     );
     rx.shutdown_hard().await;
     drop(rx);
-    // Give iOS a beat to observe TCP shutdown before the same name reappears.
-    tokio::time::sleep(Duration::from_millis(750)).await;
-    self.ensure(device_id, &airplay_name).await?;
+
+    // Hold advertisement withdrawn so iOS observes disconnect before re-appear.
+    tokio::time::sleep(KICK_WITHDRAW_HOLD).await;
+
+    // Re-advertise under same name (kicking flag still set — use direct insert path).
+    let mut replacement = AirPlayReceiver::build(device_id, &airplay_name, self.event_tx.clone())?;
+    replacement.start().await?;
+    {
+      let mut guard = self.receivers.lock();
+      drop(guard.insert(device_id.to_owned(), replacement));
+    }
     tracing::info!(
       %device_id,
       airplay_name = %airplay_name,
