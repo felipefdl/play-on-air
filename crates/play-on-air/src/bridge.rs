@@ -375,6 +375,14 @@ impl Bridge {
     }
   }
 
+  /// End the bridge session for `device_id` if any (media down + Cast STOP best-effort).
+  ///
+  /// Used by the Cast ownership-loss path so the app can tear media without waiting
+  /// for the AirPlay stack to emit `Ended`.
+  pub async fn end_session(&self, device_id: &str) {
+    self.handle_session_end(device_id).await;
+  }
+
   async fn handle_session_end(&self, device_id: &str) {
     let removed = {
       let mut guard = self.sessions.lock();
@@ -804,7 +812,7 @@ mod tests {
       port: 9,
       last_seen: Instant::now(),
     });
-    let pool = Arc::new(CastPool::new());
+    let pool = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(Arc::clone(&registry), Arc::clone(&pool));
 
     let media = MediaServer::start("127.0.0.1").await.expect("media");
@@ -848,7 +856,7 @@ mod tests {
   #[tokio::test]
   async fn session_end_cancels_rollover_reload_loop() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new());
+    let pool = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
 
     let media = MediaServer::start("127.0.0.1").await.expect("media");
@@ -891,7 +899,7 @@ mod tests {
   #[tokio::test]
   async fn session_end_joins_inflight_load_and_marks_session_dead() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new());
+    let pool = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
 
@@ -947,7 +955,7 @@ mod tests {
   #[tokio::test]
   async fn session_end_joins_rollover_task_then_inflight_load() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new());
+    let pool = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
 
@@ -1018,7 +1026,7 @@ mod tests {
   #[tokio::test]
   async fn rollover_signal_invokes_reload_path_without_panic() {
     // Exercise the shared LOAD helper + rollover wait wiring without a Cast device.
-    let pool = Arc::new(CastPool::new());
+    let pool = Arc::new(CastPool::new(None));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let rollover = media.rollover_signal();
     let rollover_for_task = Arc::clone(&rollover);
@@ -1050,7 +1058,7 @@ mod tests {
   #[tokio::test]
   async fn handle_volume_updates_last_volume_on_active_session() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new());
+    let pool = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let last_volume_linear = Arc::new(Mutex::new(None));
@@ -1134,7 +1142,7 @@ mod tests {
 
   #[tokio::test]
   async fn stale_session_start_skips_without_prebuffer_or_session() {
-    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new()));
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
     let event_ring = Arc::new(PcmRing::new(2, 64));
     let rebuilt_ring = Arc::new(PcmRing::new(2, 64));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(rebuilt_ring) });
@@ -1153,7 +1161,7 @@ mod tests {
 
   #[tokio::test]
   async fn session_start_with_receiver_gone_skips() {
-    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new()));
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
     let event_ring = Arc::new(PcmRing::new(2, 64));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: None });
 
@@ -1181,7 +1189,7 @@ mod tests {
       });
     }
 
-    let bridge = Arc::new(Bridge::new(registry, Arc::new(CastPool::new())));
+    let bridge = Arc::new(Bridge::new(registry, Arc::new(CastPool::new(None))));
     bridge.set_start_barrier(Arc::clone(&barrier));
 
     let mut ring_map = HashMap::new();
@@ -1233,7 +1241,7 @@ mod tests {
 
   #[tokio::test]
   async fn aborting_bridge_run_aborts_device_workers() {
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new())));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None))));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: None });
     let (tx, rx) = mpsc::unbounded_channel();
     // Keep the channel open so run stays in recv; abort must still tear down workers.

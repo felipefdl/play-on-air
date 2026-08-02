@@ -33,7 +33,7 @@ Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/felipefdl/play-on-air:0.1.6` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:0.1.7` | Version tag (matches app `config.yaml` / Cargo package version) |
 | `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
 | `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
 
@@ -45,7 +45,7 @@ Standalone run (host network required for mDNS):
 docker run --rm --network host \
   -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
   -v "$PWD/config:/config" \
-  ghcr.io/felipefdl/play-on-air:0.1.6
+  ghcr.io/felipefdl/play-on-air:0.1.7
 ```
 
 Without Home Assistant options (`/data/options.json`), the entrypoint starts the binary with product defaults (and any existing file at `PLAY_ON_AIR_CONFIG`).
@@ -110,6 +110,8 @@ On Home Assistant, prefer the **Configuration** tab instead of hand-editing the 
 | LAN process | Same network as the Cast devices; no cloud or accounts |
 | Quality path | Decode AirPlay once; Cast hop is lossless WAV (continuous live) with FLAC encode kept exercised on session snapshots. Never defaults to MP3/AAC for Cast egress |
 | Timing | No multi-room clock sync promises across vendors |
+| Cast steal | If Google Assistant, YouTube, or another Cast app takes the speaker, PlayOnAir ends the bridge and disconnects AirPlay clients so the phone leaves Now Playing |
+| AirPlay supersede | If another phone AirPlays to the same speaker, the new stream wins; prior audio is aborted (iOS may take a moment to clear Now Playing) |
 
 ## Commands
 

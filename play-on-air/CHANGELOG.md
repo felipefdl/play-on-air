@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7
+
+- Cast ownership watch: when another Cast app takes the speaker (Assistant, YouTube, native Cast), end the LiveWav bridge and kick AirPlay clients so the phone leaves Now Playing.
+- AirPlay supersede logging: new exclusive audio session logs at info when the stack aborts a prior stream (no `max_clients=1`; multi-connection iOS stays supported).
+
 ## 0.1.6
 
 - Home Assistant **Configuration** tab: `log_level` and optional `devices` (rename / hide).

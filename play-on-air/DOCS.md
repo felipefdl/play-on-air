@@ -66,7 +66,7 @@ hide = true
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:
 
-`ghcr.io/felipefdl/play-on-air:0.1.6`
+`ghcr.io/felipefdl/play-on-air:0.1.7`
 
 Architectures: `amd64`, `aarch64`.
 
@@ -94,6 +94,8 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | LAN process | Same network as the Cast devices; no cloud or accounts |
 | Host network | Required for mDNS / AirPlay / Cast |
 | Quality path | Decode AirPlay once; Cast hop is lossless (FLAC or WAV/LPCM). Never defaults to MP3/AAC for Cast egress |
+| Cast steal | If Google Assistant, YouTube, or another Cast app takes the speaker while PlayOnAir was bridging, the bridge ends and AirPlay clients are disconnected so the phone leaves Now Playing |
+| AirPlay supersede | If another phone AirPlays to the same speaker, the new stream wins; prior audio is aborted (iOS may take a moment to clear Now Playing) |
 
 ## Store assets
 

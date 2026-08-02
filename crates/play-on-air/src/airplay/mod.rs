@@ -243,7 +243,15 @@ impl AudioHandler for RingHandler {
       .saturating_mul(2)
       .max(DEFAULT_RING_FRAMES);
     let ring = Arc::new(PcmRing::new(channels, capacity_frames));
+    // shairplay aborts any prior audio session before this callback (exclusive
+    // active audio). We always replace the ring; the stack drops the old session.
     self.state.replace_ring(Arc::clone(&ring));
+    tracing::info!(
+      device_id = %self.state.device_id,
+      sample_rate,
+      channels,
+      "AirPlay audio session started (exclusive; prior stream aborted by stack if any)"
+    );
 
     if let Some(tx) = &self.state.event_tx {
       drop(tx.send(AirPlaySessionEvent::Started {
@@ -411,6 +419,31 @@ impl AirPlayManager {
       tracing::info!(device_id = %rx.device_id, name = %rx.name, "AirPlay receiver withdrawn");
       drop(rx);
     }
+  }
+
+  /// Force-drop RTSP clients for `device_id` after Cast ownership loss, then re-advertise.
+  ///
+  /// Drops the live [`RaopServer`] (closes listeners/connections so the iPhone leaves
+  /// Now Playing), then starts a fresh receiver with the same AirPlay name so other
+  /// users can still connect. Does not run when no receiver exists for the id.
+  pub async fn kick_clients(&self, device_id: &str) -> Result<()> {
+    let maybe_name = {
+      let guard = self.receivers.lock();
+      guard.get(device_id).map(|rx| rx.name.clone())
+    };
+    let Some(airplay_name) = maybe_name else {
+      tracing::debug!(%device_id, "kick_clients: no AirPlay receiver for device");
+      return Ok(());
+    };
+
+    self.remove(device_id);
+    self.ensure(device_id, &airplay_name).await?;
+    tracing::info!(
+      %device_id,
+      airplay_name = %airplay_name,
+      "kicked AirPlay clients after Cast ownership loss"
+    );
+    Ok(())
   }
 
   /// Active device ids currently advertised.

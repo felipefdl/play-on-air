@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::{Error, Result};
 use crate::registry::Device;
@@ -25,6 +26,20 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Best-effort wait when joining a worker after `Shutdown`.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Skip ownership checks for this long after a successful LOAD (Cast settle time).
+const OWNERSHIP_GRACE: Duration = Duration::from_secs(8);
+
+/// Consecutive heartbeats with our transport absent before declaring ownership lost.
+const OWNERSHIP_LOSS_CONFIRMATIONS: u8 = 2;
+
+/// Whether our Cast media transport is still listed among receiver applications.
+///
+/// Pure helper for unit tests and the ownership-watch path.
+#[must_use]
+pub(crate) fn cast_transport_still_owned(applications_transport_ids: &[&str], ours: &str) -> bool {
+  applications_transport_ids.contains(&ours)
+}
 
 /// Commands processed on a per-device Cast worker thread.
 enum CastWorkerCmd {
@@ -69,22 +84,39 @@ struct CastWorkerHandle {
 ///
 /// Workers are started when devices appear (see app maintain loop) and torn down
 /// only when the device leaves — not when an AirPlay media session ends.
-#[derive(Default)]
 pub struct CastPool {
   workers: Mutex<HashMap<String, CastWorkerHandle>>,
+  /// Notifies the app when a warm LOAD session loses Cast media ownership
+  /// (another app took the receiver). Payload is the registry device id.
+  ownership_lost: Option<UnboundedSender<String>>,
+}
+
+impl Default for CastPool {
+  fn default() -> Self {
+    Self::new(None)
+  }
 }
 
 impl std::fmt::Debug for CastPool {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("CastPool").field("workers", &self.workers.lock().len()).finish()
+    f.debug_struct("CastPool")
+      .field("workers", &self.workers.lock().len())
+      .field("ownership_watch", &self.ownership_lost.is_some())
+      .finish()
   }
 }
 
 impl CastPool {
   /// Create an empty pool (no workers yet).
+  ///
+  /// When `ownership_lost` is set, workers notify it with the device id after
+  /// confirmed Cast media ownership loss (another app took the receiver).
   #[must_use]
-  pub fn new() -> Self {
-    Self { workers: Mutex::new(HashMap::new()) }
+  pub fn new(ownership_lost: Option<UnboundedSender<String>>) -> Self {
+    Self {
+      workers: Mutex::new(HashMap::new()),
+      ownership_lost,
+    }
   }
 
   /// Ensure a warm worker exists for `device` (start one if missing).
@@ -113,11 +145,12 @@ impl CastPool {
     let host = device.host.clone();
     let hostname = device.hostname.clone();
     let port = device.port;
+    let ownership_lost = self.ownership_lost.clone();
     let thread_name = format!("cast-warm-{}", short_id(&device_id));
     let join = std::thread::Builder::new()
       .name(thread_name)
       .spawn(move || {
-        worker_main(device_id, host, hostname, port, cmd_rx);
+        worker_main(device_id, host, hostname, port, cmd_rx, ownership_lost);
       })
       .ok();
 
@@ -291,13 +324,26 @@ struct WorkerState {
   device: Option<rust_cast::CastDevice<'static>>,
   /// Media session after a successful warm LOAD.
   active: Option<ActiveCastSession>,
+  /// When `active` was last set by a successful LOAD (ownership grace clock).
+  active_since: Option<Instant>,
+  /// Consecutive heartbeats where status succeeded but our transport was absent.
+  ownership_loss_streak: u8,
+  /// App channel for confirmed ownership loss (`device_id` payload).
+  ownership_lost: Option<UnboundedSender<String>>,
 }
 
 #[expect(
   clippy::needless_pass_by_value,
   reason = "worker thread owns the command receiver for its full lifetime"
 )]
-fn worker_main(device_id: String, host: String, hostname: String, port: u16, cmd_rx: mpsc::Receiver<CastWorkerCmd>) {
+fn worker_main(
+  device_id: String,
+  host: String,
+  hostname: String,
+  port: u16,
+  cmd_rx: mpsc::Receiver<CastWorkerCmd>,
+  ownership_lost: Option<UnboundedSender<String>>,
+) {
   let mut state = WorkerState {
     device_id,
     host,
@@ -305,6 +351,9 @@ fn worker_main(device_id: String, host: String, hostname: String, port: u16, cmd
     port,
     device: None,
     active: None,
+    active_since: None,
+    ownership_loss_streak: 0,
+    ownership_lost,
   };
 
   // Connect while idle (before any AirPlay session).
@@ -399,8 +448,20 @@ fn worker_main(device_id: String, host: String, hostname: String, port: u16, cmd
 
 impl WorkerState {
   fn drop_device(&mut self) {
-    self.active = None;
+    self.clear_active_session();
     self.device = None;
+  }
+
+  fn clear_active_session(&mut self) {
+    self.active = None;
+    self.active_since = None;
+    self.ownership_loss_streak = 0;
+  }
+
+  fn set_active_session(&mut self, session: ActiveCastSession) {
+    self.active = Some(session);
+    self.active_since = Some(Instant::now());
+    self.ownership_loss_streak = 0;
   }
 
   /// Establish or re-establish the warm control plane.
@@ -484,6 +545,74 @@ impl WorkerState {
           "warm Cast reconnect after heartbeat failure failed"
         );
       }
+      return;
+    }
+    self.check_ownership();
+  }
+
+  /// Confirm we still own Cast media while a warm LOAD session is active.
+  ///
+  /// Another app (Assistant, `YouTube`, native Cast) replaces our transport id on
+  /// the receiver. We require two consecutive successful status replies that omit
+  /// our transport (status I/O errors alone never fire). Grace period after LOAD
+  /// avoids racing Cast's own app settle.
+  fn check_ownership(&mut self) {
+    let (transport_id, since) = match (self.active.as_ref(), self.active_since) {
+      (Some(session), Some(since)) => (session.transport_id.clone(), since),
+      (None, _) => {
+        self.ownership_loss_streak = 0;
+        return;
+      },
+      (Some(_), None) => return,
+    };
+    if since.elapsed() < OWNERSHIP_GRACE {
+      return;
+    }
+
+    let status = {
+      let Some(device) = self.device.as_ref() else {
+        return;
+      };
+      match device.receiver.get_status() {
+        Ok(status) => status,
+        Err(err) => {
+          tracing::debug!(
+            device_id = %self.device_id,
+            error = %err,
+            "Cast ownership get_status failed; not treating as loss"
+          );
+          return;
+        },
+      }
+    };
+
+    let ids: Vec<&str> = status.applications.iter().map(|app| app.transport_id.as_str()).collect();
+    if cast_transport_still_owned(&ids, &transport_id) {
+      self.ownership_loss_streak = 0;
+      return;
+    }
+
+    self.ownership_loss_streak = self.ownership_loss_streak.saturating_add(1);
+    if self.ownership_loss_streak < OWNERSHIP_LOSS_CONFIRMATIONS {
+      tracing::debug!(
+        device_id = %self.device_id,
+        transport_id = %transport_id,
+        streak = self.ownership_loss_streak,
+        "Cast transport absent from receiver status; waiting for confirmation"
+      );
+      return;
+    }
+
+    tracing::info!(
+      device_id = %self.device_id,
+      transport_id = %transport_id,
+      "Cast ownership lost (another app took the receiver)"
+    );
+    self.clear_active_session();
+    if let Some(tx) = &self.ownership_lost
+      && tx.send(self.device_id.clone()).is_err()
+    {
+      tracing::debug!(device_id = %self.device_id, "ownership-lost channel closed");
     }
   }
 
@@ -491,7 +620,7 @@ impl WorkerState {
     let media = request.to_media();
     match self.load_once(&media) {
       Ok(session) => {
-        self.active = Some(session.clone());
+        self.set_active_session(session.clone());
         tracing::info!(
           host = %self.host,
           device_id = %self.device_id,
@@ -526,7 +655,7 @@ impl WorkerState {
           );
           retry_err
         })?;
-        self.active = Some(session.clone());
+        self.set_active_session(session.clone());
         tracing::info!(
           host = %self.host,
           device_id = %self.device_id,
@@ -612,6 +741,8 @@ impl WorkerState {
     let Some(session) = self.active.take() else {
       return Ok(());
     };
+    self.active_since = None;
+    self.ownership_loss_streak = 0;
     let Some(device) = self.device.as_ref() else {
       // No warm TCP — nothing to STOP on-device; session already cleared.
       return Ok(());
@@ -764,8 +895,25 @@ mod tests {
   }
 
   #[test]
+  fn cast_transport_still_owned_true_when_present() {
+    let apps = ["receiver-0", "our-transport", "other"];
+    assert!(cast_transport_still_owned(&apps, "our-transport"));
+  }
+
+  #[test]
+  fn cast_transport_still_owned_false_when_absent() {
+    let apps = ["youtube-app", "receiver-0"];
+    assert!(!cast_transport_still_owned(&apps, "our-transport"));
+  }
+
+  #[test]
+  fn cast_transport_still_owned_false_when_empty() {
+    assert!(!cast_transport_still_owned(&[], "our-transport"));
+  }
+
+  #[test]
   fn worker_shutdown_joins_without_panic() {
-    let pool = CastPool::new();
+    let pool = CastPool::new(None);
     let device = sample_device("nest-shutdown-test");
     pool.ensure(&device);
     assert!(pool.device_ids().contains(&device.id));
@@ -775,7 +923,7 @@ mod tests {
 
   #[test]
   fn load_without_worker_errors() {
-    let pool = CastPool::new();
+    let pool = CastPool::new(None);
     let request = MediaLoadRequest::wav("http://127.0.0.1:9/stream", CastStreamKind::Buffered);
     let err = pool.load("missing-device", request).unwrap_err();
     let msg = err.to_string();
@@ -784,13 +932,13 @@ mod tests {
 
   #[test]
   fn stop_best_effort_without_worker_is_noop() {
-    let pool = CastPool::new();
+    let pool = CastPool::new(None);
     pool.stop_best_effort("no-such", Duration::from_millis(100));
   }
 
   #[test]
   fn ensure_idempotent_same_endpoint() {
-    let pool = CastPool::new();
+    let pool = CastPool::new(None);
     let device = sample_device("nest-idempotent");
     pool.ensure(&device);
     pool.ensure(&device);
@@ -801,7 +949,7 @@ mod tests {
 
   #[test]
   fn remove_unknown_is_ok() {
-    let pool = CastPool::new();
+    let pool = CastPool::new(None);
     pool.remove("never-existed");
   }
 }

@@ -48,8 +48,9 @@ impl App {
     sleep(Duration::from_millis(50)).await;
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
+    let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
-    let cast_pool = Arc::new(CastPool::new());
+    let cast_pool = Arc::new(CastPool::new(Some(ownership_tx)));
     let bridge = Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)));
 
     let discovery = Discovery::new(Arc::clone(&registry));
@@ -62,6 +63,23 @@ impl App {
         bridge_for_task.run(event_rx, bridge_rings).await;
       })
     };
+
+    // Cast steal: worker confirmed another app took the receiver → end bridge + kick AP2.
+    let ownership_bridge = Arc::clone(&bridge);
+    let ownership_airplay = Arc::clone(&airplay);
+    let ownership_watch = tokio::spawn(async move {
+      while let Some(device_id) = ownership_rx.recv().await {
+        tracing::info!(%device_id, "Cast ownership lost; ending bridge and kicking AirPlay clients");
+        ownership_bridge.end_session(&device_id).await;
+        if let Err(err) = ownership_airplay.kick_clients(&device_id).await {
+          tracing::warn!(
+            %device_id,
+            error = %err,
+            "failed to re-advertise AirPlay after ownership-loss kick"
+          );
+        }
+      }
+    });
 
     let mut maintain_shutdown = shutdown.clone();
     let maintain_pool = Arc::clone(&cast_pool);
@@ -103,6 +121,7 @@ impl App {
     drop(maintain.await);
     discovery_handle.abort();
     bridge_task.abort();
+    ownership_watch.abort();
     cast_pool.shutdown();
     Ok(())
   }
