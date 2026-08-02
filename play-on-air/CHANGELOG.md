@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8
+
+- Cast ownership: probe **media** status (with transport CONNECT), not only receiver apps — Google/YouTube steal is detected when the session goes IDLE interrupted or disappears.
+- Ownership kick fires when warm TCP dies mid-bridge as well.
+- HA Configuration: rename list to **Optional rename / hide** (`device_overrides`); empty = auto-discover, do not register devices.
+- Deploy: docker workflow creates/updates GitHub Release `vX.Y.Z` in lockstep with GHCR; document ship flow in AGENTS.md.
+
 ## 0.1.7
 
 - Cast ownership watch: when another Cast app takes the speaker (Assistant, YouTube, native Cast), end the LiveWav bridge and kick AirPlay clients so the phone leaves Now Playing.

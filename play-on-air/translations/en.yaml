@@ -4,19 +4,22 @@ configuration:
     description: >
       Verbosity written to the app Log tab (RUST_LOG). Use debug or trace only while
       troubleshooting; info is the recommended default.
-  devices:
-    name: Devices
+  device_overrides:
+    name: Optional rename / hide
     description: >
-      Optional rename or hide overrides for discovered Chromecasts. Leave empty for
-      zero-setup defaults (each Cast name appears as-is in the AirPlay picker).
-      id is a case-insensitive substring of the Cast friendly name or UUID.
+      Leave this list empty for normal use. Chromecasts are discovered automatically
+      and appear in AirPlay with their Cast names — you do not register devices here.
+      Add a row only when you want to rename a speaker in the AirPlay picker or hide
+      one entirely. Match id is a case-insensitive substring of the Cast name or UUID.
     fields:
       id:
         name: Match id
-        description: Case-insensitive substring of the Chromecast name or UUID.
+        description: >
+          Case-insensitive substring of the Chromecast friendly name or UUID
+          (for example "Living" or part of the device id).
       name:
         name: AirPlay name
         description: Optional display name in the AirPlay picker. Leave empty to keep the Cast name.
       hide:
-        name: Hide
-        description: When enabled, do not advertise this device as AirPlay.
+        name: Hide from AirPlay
+        description: When enabled, do not advertise this Chromecast as an AirPlay speaker.

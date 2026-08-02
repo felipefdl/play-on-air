@@ -13,24 +13,29 @@ Host networking is enabled in the app config (`host_network: true`). That is req
 
 ## Configuration tab
 
-Open the app → **Configuration**. Options are optional cosmetics and logging only; discovery and playback work with defaults.
+Open the app → **Configuration**. Everything here is optional. Discovery and playback work with empty defaults — **you do not register Chromecasts in this tab**.
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| **Log level** | `info` | Verbosity for the Log tab (`trace`, `debug`, `info`, `warn`, `error`). Prefer `info` day to day; use `debug`/`trace` only while troubleshooting. |
-| **Devices** | empty list | Optional rename or hide entries for discovered Chromecasts. |
+| **Log level** | `info` | Verbosity for the Log tab (`trace`, `debug`, `info`, `warn`, `error`). Prefer `info` day to day. |
+| **Optional rename / hide** | empty list | Cosmetics only. Leave empty unless you need a custom AirPlay name or want to hide a speaker. |
 
-### Devices (rename / hide)
+### Optional rename / hide (not a device registry)
 
-Each list entry:
+Chromecasts appear automatically via mDNS. This list is **not** an inventory of speakers to add.
+
+Only add a row when you want to:
+
+- **Rename** how a speaker shows in the AirPlay picker, or
+- **Hide** a Chromecast so it is not advertised as AirPlay at all
 
 | Field | Required | Meaning |
 |-------|----------|---------|
 | **Match id** | yes | Case-insensitive substring of the Cast friendly name or UUID |
 | **AirPlay name** | no | Name shown in the AirPlay picker; leave empty to keep the Cast name |
-| **Hide** | no | When enabled, do not advertise this device as AirPlay |
+| **Hide from AirPlay** | no | When enabled, do not advertise this device as AirPlay |
 
-Example ideas:
+Examples:
 
 - Match id `Living Room`, AirPlay name `TV` → picker shows **TV**.
 - Match id `bedroom`, Hide enabled → that speaker never appears in AirPlay.
@@ -43,12 +48,12 @@ On every container start the entrypoint:
 
 1. Reads `/data/options.json` (what you set in the Configuration tab).
 2. Sets `RUST_LOG` from **Log level** unless `RUST_LOG` is already set in the environment.
-3. Writes `$PLAY_ON_AIR_CONFIG` (default `/config/play-on-air.toml`) from the **Devices** list.
+3. Writes `$PLAY_ON_AIR_CONFIG` (default `/config/play-on-air.toml`) from the **Optional rename / hide** list.
 4. Starts `play-on-air --config …`.
 
 **Home Assistant Configuration is the source of truth.** The generated TOML is overwritten on each start. Do not hand-edit that file while using the Configuration tab.
 
-Empty **Devices** → comment-only / empty cosmetics file → product defaults (identity names, nothing hidden). Missing config is never an error.
+Empty **Optional rename / hide** → product defaults (identity names, nothing hidden). Missing config is never an error.
 
 Advanced path (without the UI): the same TOML format can live at `/config/play-on-air.toml` when not using generated options, for example:
 
@@ -66,7 +71,7 @@ hide = true
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:
 
-`ghcr.io/felipefdl/play-on-air:0.1.7`
+`ghcr.io/felipefdl/play-on-air:0.1.8`
 
 Architectures: `amd64`, `aarch64`.
 
@@ -79,7 +84,8 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Symptom | What to check |
 |---------|----------------|
 | iOS/macOS AirPlay picker is empty | App is **Started**; host and phone on the same LAN; wait a few seconds after start for discovery; Log tab for discovery errors. |
-| Device name wrong or still visible | Configuration **Devices** match id is a substring of the real Cast name; app was restarted after save. |
+| Device name wrong or still visible | Configuration **Optional rename / hide** match id is a substring of the real Cast name; app was restarted after save. |
+| Ghost AirPlay after Hey Google | Use 0.1.8+; Log should show `Cast ownership lost` then kick. Restart app if still on an older image. |
 | Nest Mini / Nest speakers cut out or sound wrong | Use a current image (playback pacing and underrun handling are fixed). Prefer stable LAN Wi‑Fi; avoid forcing extreme log levels during normal listening. |
 | Nothing after install | Confirm `host_network: true` is still set in the published app config; do not run PlayOnAir on a bridge-only network without multicast. |
 | Config changes ignored | Restart the app after saving Configuration. |

@@ -3,7 +3,7 @@
 # PlayOnAir multi-stage image (glibc). Used by Home Assistant OS via GHCR.
 # Build args: BUILD_VERSION, BUILD_ARCH (HA: amd64 | aarch64)
 
-ARG BUILD_VERSION=0.1.7
+ARG BUILD_VERSION=0.1.8
 ARG BUILD_ARCH=amd64
 
 # -----------------------------------------------------------------------------

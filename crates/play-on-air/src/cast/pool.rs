@@ -28,17 +28,58 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Skip ownership checks for this long after a successful LOAD (Cast settle time).
-const OWNERSHIP_GRACE: Duration = Duration::from_secs(8);
+const OWNERSHIP_GRACE: Duration = Duration::from_secs(3);
 
-/// Consecutive heartbeats with our transport absent before declaring ownership lost.
+/// Consecutive heartbeats that look stolen before declaring ownership lost.
 const OWNERSHIP_LOSS_CONFIRMATIONS: u8 = 2;
 
 /// Whether our Cast media transport is still listed among receiver applications.
-///
-/// Pure helper for unit tests and the ownership-watch path.
 #[must_use]
 pub(crate) fn cast_transport_still_owned(applications_transport_ids: &[&str], ours: &str) -> bool {
   applications_transport_ids.contains(&ours)
+}
+
+/// Result of one ownership probe (pure; used by tests and the worker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnershipProbe {
+  /// Still our session (playing / buffering / paused, or transport listed).
+  Owned,
+  /// Another app took the device or our media session is gone / interrupted.
+  Lost,
+  /// Inconclusive (skip streak; do not count as owned or lost).
+  Unknown,
+}
+
+/// Combine receiver-app and media-session signals into a probe result.
+///
+/// - `transport_listed`: our LOAD `transport_id` appears in receiver apps.
+/// - `media_session_present`: media status returned an entry for our session id.
+/// - `media_idle_interrupted`: entry is IDLE with INTERRUPTED/ERROR/FINISHED.
+/// - `media_query_failed`: media status call failed (often means session is dead).
+#[must_use]
+pub(crate) fn ownership_from_signals(
+  transport_listed: bool,
+  media_session_present: Option<bool>,
+  media_idle_interrupted: bool,
+  media_query_failed: bool,
+) -> OwnershipProbe {
+  if media_idle_interrupted {
+    return OwnershipProbe::Lost;
+  }
+  if media_session_present == Some(false) {
+    return OwnershipProbe::Lost;
+  }
+  if media_query_failed {
+    // Media channel is the source of truth for "are we still playing".
+    return OwnershipProbe::Lost;
+  }
+  if media_session_present == Some(true) || transport_listed {
+    return OwnershipProbe::Owned;
+  }
+  if !transport_listed {
+    return OwnershipProbe::Lost;
+  }
+  OwnershipProbe::Unknown
 }
 
 /// Commands processed on a per-device Cast worker thread.
@@ -537,6 +578,10 @@ impl WorkerState {
         error = %ping_err,
         "warm Cast heartbeat failed; reconnecting"
       );
+      // TCP died mid-bridge: treat as ownership loss so AirPlay is kicked.
+      if let Some(session) = self.active.clone() {
+        self.declare_ownership_lost(&session.transport_id, session.media_session_id);
+      }
       self.drop_device();
       if let Err(reconnect_err) = self.ensure_connected(true) {
         tracing::debug!(
@@ -552,13 +597,11 @@ impl WorkerState {
 
   /// Confirm we still own Cast media while a warm LOAD session is active.
   ///
-  /// Another app (Assistant, `YouTube`, native Cast) replaces our transport id on
-  /// the receiver. We require two consecutive successful status replies that omit
-  /// our transport (status I/O errors alone never fire). Grace period after LOAD
-  /// avoids racing Cast's own app settle.
+  /// Assistant / Cast apps often leave Default Media Receiver listed while our
+  /// media session goes IDLE(INTERRUPTED) or dies. Prefer **media** status.
   fn check_ownership(&mut self) {
-    let (transport_id, since) = match (self.active.as_ref(), self.active_since) {
-      (Some(session), Some(since)) => (session.transport_id.clone(), since),
+    let (transport_id, media_session_id, since) = match (self.active.as_ref(), self.active_since) {
+      (Some(session), Some(since)) => (session.transport_id.clone(), session.media_session_id, since),
       (None, _) => {
         self.ownership_loss_streak = 0;
         return;
@@ -568,51 +611,111 @@ impl WorkerState {
     if since.elapsed() < OWNERSHIP_GRACE {
       return;
     }
-
-    let status = {
-      let Some(device) = self.device.as_ref() else {
-        return;
-      };
-      match device.receiver.get_status() {
-        Ok(status) => status,
-        Err(err) => {
-          tracing::debug!(
-            device_id = %self.device_id,
-            error = %err,
-            "Cast ownership get_status failed; not treating as loss"
-          );
-          return;
-        },
-      }
+    let Some(device) = self.device.as_ref() else {
+      return;
     };
 
-    let ids: Vec<&str> = status.applications.iter().map(|app| app.transport_id.as_str()).collect();
-    if cast_transport_still_owned(&ids, &transport_id) {
-      self.ownership_loss_streak = 0;
-      return;
+    let transport_listed = Self::probe_transport_listed(device, &self.device_id, &transport_id);
+    let (media_present, media_idle_interrupted, media_failed) =
+      Self::probe_media_session(device, &self.device_id, &transport_id, media_session_id);
+
+    let probe = ownership_from_signals(transport_listed, media_present, media_idle_interrupted, media_failed);
+    match probe {
+      OwnershipProbe::Owned => {
+        self.ownership_loss_streak = 0;
+      },
+      OwnershipProbe::Unknown => {},
+      OwnershipProbe::Lost => {
+        self.ownership_loss_streak = self.ownership_loss_streak.saturating_add(1);
+        if self.ownership_loss_streak < OWNERSHIP_LOSS_CONFIRMATIONS {
+          tracing::info!(
+            device_id = %self.device_id,
+            transport_id = %transport_id,
+            media_session_id,
+            streak = self.ownership_loss_streak,
+            "Cast ownership look stolen; waiting for confirmation"
+          );
+          return;
+        }
+        self.declare_ownership_lost(&transport_id, media_session_id);
+      },
+    }
+  }
+
+  fn probe_transport_listed(device: &rust_cast::CastDevice<'_>, device_id: &str, transport_id: &str) -> bool {
+    match device.receiver.get_status() {
+      Ok(status) => {
+        let ids: Vec<&str> = status.applications.iter().map(|app| app.transport_id.as_str()).collect();
+        let listed = cast_transport_still_owned(&ids, transport_id);
+        tracing::debug!(%device_id, %transport_id, apps = ?ids, listed, "Cast ownership receiver status");
+        listed
+      },
+      Err(err) => {
+        tracing::debug!(%device_id, error = %err, "Cast ownership receiver get_status failed");
+        false
+      },
+    }
+  }
+
+  fn probe_media_session(
+    device: &rust_cast::CastDevice<'_>,
+    device_id: &str,
+    transport_id: &str,
+    media_session_id: i32,
+  ) -> (Option<bool>, bool, bool) {
+    // Media channel requires CONNECT to the app transport (same as PAUSE/PLAY).
+    if let Err(err) = device.connection.connect(transport_id) {
+      tracing::debug!(%device_id, %transport_id, error = %err, "Cast ownership media connect failed");
     }
 
-    self.ownership_loss_streak = self.ownership_loss_streak.saturating_add(1);
-    if self.ownership_loss_streak < OWNERSHIP_LOSS_CONFIRMATIONS {
-      tracing::debug!(
-        device_id = %self.device_id,
-        transport_id = %transport_id,
-        streak = self.ownership_loss_streak,
-        "Cast transport absent from receiver status; waiting for confirmation"
-      );
-      return;
+    match device.media.get_status(transport_id, Some(media_session_id)) {
+      Ok(status) => {
+        let entry = status.entries.iter().find(|e| e.media_session_id == media_session_id);
+        if let Some(e) = entry {
+          use rust_cast::channels::media::{IdleReason, PlayerState};
+          let interrupted = matches!(e.player_state, PlayerState::Idle)
+            && matches!(
+              e.idle_reason,
+              Some(IdleReason::Interrupted | IdleReason::Error | IdleReason::Finished)
+            );
+          tracing::debug!(
+            %device_id,
+            media_session_id,
+            player_state = %e.player_state,
+            idle_reason = ?e.idle_reason,
+            interrupted,
+            "Cast ownership media status"
+          );
+          (Some(true), interrupted, false)
+        } else {
+          tracing::debug!(
+            %device_id,
+            media_session_id,
+            entries = status.entries.len(),
+            "Cast ownership media status has no matching session"
+          );
+          (Some(false), false, false)
+        }
+      },
+      Err(err) => {
+        tracing::debug!(%device_id, media_session_id, error = %err, "Cast ownership media get_status failed");
+        (None, false, true)
+      },
     }
+  }
 
+  fn declare_ownership_lost(&mut self, transport_id: &str, media_session_id: i32) {
     tracing::info!(
       device_id = %self.device_id,
       transport_id = %transport_id,
+      media_session_id,
       "Cast ownership lost (another app took the receiver)"
     );
     self.clear_active_session();
     if let Some(tx) = &self.ownership_lost
       && tx.send(self.device_id.clone()).is_err()
     {
-      tracing::debug!(device_id = %self.device_id, "ownership-lost channel closed");
+      tracing::warn!(device_id = %self.device_id, "ownership-lost channel closed; cannot kick AirPlay");
     }
   }
 
@@ -909,6 +1012,26 @@ mod tests {
   #[test]
   fn cast_transport_still_owned_false_when_empty() {
     assert!(!cast_transport_still_owned(&[], "our-transport"));
+  }
+
+  #[test]
+  fn ownership_from_signals_interrupted_media_is_lost() {
+    assert_eq!(ownership_from_signals(true, Some(true), true, false), OwnershipProbe::Lost);
+  }
+
+  #[test]
+  fn ownership_from_signals_playing_with_transport_is_owned() {
+    assert_eq!(ownership_from_signals(true, Some(true), false, false), OwnershipProbe::Owned);
+  }
+
+  #[test]
+  fn ownership_from_signals_missing_session_is_lost() {
+    assert_eq!(ownership_from_signals(true, Some(false), false, false), OwnershipProbe::Lost);
+  }
+
+  #[test]
+  fn ownership_from_signals_media_fail_without_transport_is_lost() {
+    assert_eq!(ownership_from_signals(false, None, false, true), OwnershipProbe::Lost);
   }
 
   #[test]

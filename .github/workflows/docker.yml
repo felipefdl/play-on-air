@@ -15,7 +15,7 @@ env:
   IMAGE_NAME: play-on-air
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -195,3 +195,72 @@ jobs:
             "${digests[@]}"
 
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+  # GitHub Release must match the GHCR image version (same config.yaml / tag).
+  release:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - version
+      - merge
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or update GitHub Release for this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          IMAGE: ${{ needs.version.outputs.image }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          TITLE="PlayOnAir ${VERSION}"
+
+          # Body: CHANGELOG section for this version (fallback to short pointer).
+          BODY_FILE="$(mktemp)"
+          {
+            echo "## Container"
+            echo ""
+            echo "\`\`\`"
+            echo "${IMAGE}:${VERSION}"
+            echo "${IMAGE}:latest"
+            echo "\`\`\`"
+            echo ""
+            echo "Home Assistant app version in \`play-on-air/config.yaml\` must match this tag."
+            echo ""
+            if [[ -f play-on-air/CHANGELOG.md ]]; then
+              # Extract "## x.y.z" section until next "## ".
+              awk -v ver="${VERSION}" '
+                $0 == "## " ver {p=1; next}
+                p && /^## / {exit}
+                p {print}
+              ' play-on-air/CHANGELOG.md | sed '/./,$!d' > /tmp/changelog-section.txt || true
+              if [[ -s /tmp/changelog-section.txt ]]; then
+                echo "## Changes"
+                echo ""
+                cat /tmp/changelog-section.txt
+              fi
+            fi
+          } > "${BODY_FILE}"
+
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "${TITLE}"
+            git push origin "${TAG}"
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --title "${TITLE}" --notes-file "${BODY_FILE}"
+            echo "Updated GitHub Release ${TAG}"
+          else
+            gh release create "${TAG}" --title "${TITLE}" --notes-file "${BODY_FILE}" --target "${GITHUB_SHA}"
+            echo "Created GitHub Release ${TAG}"
+          fi

@@ -121,6 +121,34 @@ Do not claim done on green unit tests alone if format, clippy, or supply-chain g
 - Never amend published history; never add `Co-Authored-By`.
 - On public GitHub: never mention AI/LLMs/tooling in commits, PR bodies, or comments.
 
+## Deploy and release (version sync — hard)
+
+One version string everywhere. Never ship GHCR without a matching GitHub Release (and never leave a Release for a version that was not built).
+
+| Surface | Source of truth |
+|---------|-----------------|
+| Cargo workspace | root `Cargo.toml` → `[workspace.package] version` |
+| Cargo.lock package | same after `cargo update -p play-on-air` / build |
+| HA app | `play-on-air/config.yaml` → `version` |
+| Docker default | `Dockerfile` → `ARG BUILD_VERSION` |
+| Docs image tags | root `README.md`, `play-on-air/DOCS.md` |
+| Changelog | `play-on-air/CHANGELOG.md` section `## x.y.z` |
+| GHCR tags | `ghcr.io/felipefdl/play-on-air:x.y.z` (+ `latest` on main) |
+| Git tag + GitHub Release | `vX.Y.Z` created by `.github/workflows/docker.yml` **release** job after image merge |
+
+### Ship flow (agents and humans)
+
+1. Bump **all** version surfaces in the same change (list above).
+2. Add a `## x.y.z` block at the top of `play-on-air/CHANGELOG.md`.
+3. Merge to `main` (or push tag `vX.Y.Z`).
+4. Wait for **docker** workflow: build → multi-arch merge → **release** job.
+5. Confirm:
+   - GHCR: `ghcr.io/felipefdl/play-on-air:x.y.z`
+   - GitHub Releases: `vX.Y.Z` with the same version and changelog notes
+6. Only then tell users to upgrade the HA app / pull the image.
+
+Do **not** create ad-hoc GitHub Releases by hand with a different version than `config.yaml`. Do **not** bump GHCR-only without the release job. If the release job fails, fix and re-run; do not claim the version shipped.
+
 ## README and repo files
 
 Personal MIT project. Do **not** apply TagoIO `repo-standards` branding (no assets.tago.io logos, no “Built by the TagoIO team”).
