@@ -3,6 +3,7 @@
 //! Offline snapshot encode ([`encode_pcm_i16_to_flac`]) and live streaming helpers
 //! (STREAMINFO header + per-block frames via [`encode_fixed_size_frame`]).
 
+use bytes::BytesMut;
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, Stream, StreamInfo};
 use flacenc::config;
@@ -11,6 +12,9 @@ use flacenc::error::{Verified, Verify};
 use flacenc::source::{Fill, FrameBuf};
 
 use crate::error::{Error, Result};
+
+/// Re-export for live stream state that reuses the frame write sink.
+pub use flacenc::bitsink::ByteSink as FlacByteSink;
 
 /// Fixed FLAC block size used for live streaming (flacenc default).
 pub const FLAC_BLOCK_SIZE: usize = 4096;
@@ -98,8 +102,12 @@ pub fn live_frame_buf(channels: u16) -> Result<FrameBuf> {
 
 /// Encode one interleaved i16 PCM block (≤ [`FLAC_BLOCK_SIZE`] frames) into a single FLAC frame.
 ///
-/// `i16_samples` length must be `frames * channels`. Shorter than a full block is allowed for a
-/// preroll tail; steady-state live encode should pass full blocks.
+/// Writes frame bytes into `out`, reusing its capacity (`out` is cleared first). Callers that
+/// need owned `Bytes` should hold a `BytesMut` and `split().freeze()` after this returns.
+///
+/// `i16_samples` length must be `frames * channels`. Live STREAMINFO uses fixed
+/// `min_block_size = max_block_size = FLAC_BLOCK_SIZE`; steady-state live encode must pass full
+/// blocks only (see live stream partial-pop policy).
 #[expect(
   clippy::too_many_arguments,
   reason = "encoder state is threaded explicitly for reusable live stream buffers"
@@ -112,7 +120,9 @@ pub fn encode_i16_block_to_frame(
   stream_info: &StreamInfo,
   framebuf: &mut FrameBuf,
   i32_scratch: &mut Vec<i32>,
-) -> Result<Vec<u8>> {
+  frame_sink: &mut ByteSink,
+  out: &mut BytesMut,
+) -> Result<()> {
   let ch = usize::from(channels.max(1));
   if ch == 0 || !i16_samples.len().is_multiple_of(ch) {
     return Err(Error::Audio(format!(
@@ -143,11 +153,13 @@ pub fn encode_i16_block_to_frame(
   let frame = encode_fixed_size_frame(encoder_config, framebuf, frame_number, stream_info)
     .map_err(|err| Error::Audio(format!("FLAC frame encode failed: {err}")))?;
 
-  let mut sink = ByteSink::new();
+  frame_sink.clear();
   frame
-    .write(&mut sink)
+    .write(frame_sink)
     .map_err(|err| Error::Audio(format!("FLAC frame write failed: {err}")))?;
-  Ok(sink.as_slice().to_vec())
+  out.clear();
+  out.extend_from_slice(frame_sink.as_slice());
+  Ok(())
 }
 
 /// Round frame count up to a whole number of [`FLAC_BLOCK_SIZE`] blocks (fixed-size live stream).
@@ -176,11 +188,24 @@ mod tests {
     out
   }
 
+  /// Distinct L/R pattern so a channel swap fails bit-exact checks.
+  fn stereo_distinct_i16(frames: usize) -> Vec<i16> {
+    let mut out = Vec::with_capacity(frames.saturating_mul(2));
+    for n in 0..frames {
+      // L rises slowly; R is a fixed negative constant — never equal after swap.
+      let phase = i32::try_from(n % 3_000).unwrap_or(0);
+      let left = i16::try_from(phase - 1_500).unwrap_or(0);
+      out.push(left);
+      out.push(-12_000);
+    }
+    out
+  }
+
   #[test]
   fn encode_stereo_roundtrip_claxon() {
     let sample_rate = 44_100_u32;
     let channels = 2_u16;
-    let pcm = sine_i16(4096, channels, 440.0, sample_rate);
+    let pcm = stereo_distinct_i16(4096);
     let flac = encode_pcm_i16_to_flac(&pcm, channels, sample_rate).expect("encode");
     assert!(flac.len() > 42, "FLAC should be non-trivial");
     // fLaC magic
@@ -196,6 +221,16 @@ mod tests {
     assert_eq!(decoded.len(), pcm.len());
     for (i, (&orig, &dec)) in pcm.iter().zip(decoded.iter()).enumerate() {
       assert_eq!(i32::from(orig), dec, "mismatch at sample {i}");
+    }
+    // Explicit L/R check: even = L pattern, odd = R constant.
+    assert_ne!(decoded[0], decoded[1], "L/R must differ so swap is detectable");
+    for frame in 0..4096 {
+      let left = decoded[frame * 2];
+      let right = decoded[frame * 2 + 1];
+      assert_eq!(right, i32::from(-12_000_i16), "R channel swapped or corrupted at frame {frame}");
+      let phase = i32::try_from(frame % 3_000).unwrap_or(0);
+      let expected_l = i32::from(i16::try_from(phase - 1_500).unwrap_or(0));
+      assert_eq!(left, expected_l, "L channel mismatch at frame {frame}");
     }
   }
 
@@ -229,13 +264,25 @@ mod tests {
     let config = verified_encoder_config().expect("config");
     let mut framebuf = live_frame_buf(channels).expect("framebuf");
     let mut i32_scratch = Vec::new();
+    let mut frame_sink = ByteSink::new();
+    let mut frame_out = BytesMut::new();
 
     let pcm = sine_i16(FLAC_BLOCK_SIZE, channels, 440.0, sample_rate);
-    let frame =
-      encode_i16_block_to_frame(&pcm, channels, 0, &config, &info, &mut framebuf, &mut i32_scratch).expect("frame");
+    encode_i16_block_to_frame(
+      &pcm,
+      channels,
+      0,
+      &config,
+      &info,
+      &mut framebuf,
+      &mut i32_scratch,
+      &mut frame_sink,
+      &mut frame_out,
+    )
+    .expect("frame");
 
     let mut bitstream = header;
-    bitstream.extend_from_slice(&frame);
+    bitstream.extend_from_slice(&frame_out);
 
     let mut reader = claxon::FlacReader::new(std::io::Cursor::new(&bitstream)).expect("claxon");
     let decoded: Vec<i32> = reader.samples().map(|r| r.expect("sample")).collect();

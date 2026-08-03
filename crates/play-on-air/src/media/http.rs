@@ -21,8 +21,8 @@ use tokio::sync::{Notify, oneshot};
 use tokio::time::sleep;
 
 use crate::audio::{
-  FLAC_BLOCK_SIZE, PcmRing, continuous_wav_header, encode_i16_block_to_frame, live_frame_buf, live_stream_header_bytes,
-  live_stream_info, round_up_to_flac_blocks, verified_encoder_config,
+  FLAC_BLOCK_SIZE, FlacByteSink, PcmRing, continuous_wav_header, encode_i16_block_to_frame, live_frame_buf,
+  live_stream_header_bytes, live_stream_info, round_up_to_flac_blocks, verified_encoder_config,
 };
 use crate::error::{Error, Result};
 
@@ -720,6 +720,8 @@ fn live_flac_byte_stream(
     preroll_frames_left: preroll_frames,
     i16_buf: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
     i32_scratch: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
+    frame_sink: FlacByteSink::new(),
+    frame_bytes: BytesMut::new(),
     channels: ch,
     sample_rate: sample_rate.max(1),
     live_generation,
@@ -786,15 +788,24 @@ fn live_flac_byte_stream(
         continue;
       }
       if frames < FLAC_BLOCK_SIZE {
-        // Partial pop should be rare after available_frames check; wait for a full block next.
-        // Put samples back by not encoding — but we already popped. Re-push is not available.
-        // Encode what we have only if frames > 0 after another wait attempt is not possible.
-        // Prefer: if partial, still encode short block so PCM is not lost.
+        // STREAMINFO is fixed min=max=FLAC_BLOCK_SIZE: never encode a short mid-stream frame.
+        // Supersede race after pop: end body without encoding (avoid short frame on dead socket).
+        // Non-superseded partial is a rare TOCTOU after available_frames; re-push is unavailable
+        // and mid-stream silence padding is forbidden — drop the partial samples and wait for a
+        // full block (unbounded live stream has no legitimate last short frame until disconnect).
+        if live.is_superseded() {
+          return None;
+        }
         tracing::debug!(
           frames,
           generation = live.generation,
-          "LiveFlac encoding short block after partial pop"
+          "LiveFlac dropping partial pop below FLAC_BLOCK_SIZE (fixed STREAMINFO)"
         );
+        continue;
+      }
+      // Re-check supersede before encode so a superseded body does not emit another full frame.
+      if live.is_superseded() {
+        return None;
       }
       live.pace_realtime(frames).await;
       match live.encode_current_i16_buf() {
@@ -814,6 +825,10 @@ struct LiveFlacState {
   preroll_frames_left: usize,
   i16_buf: Vec<i16>,
   i32_scratch: Vec<i32>,
+  /// Reusable flacenc bit sink (cleared each frame).
+  frame_sink: FlacByteSink,
+  /// Reusable frame byte buffer; `split().freeze()` for each HTTP chunk.
+  frame_bytes: BytesMut,
   channels: u16,
   sample_rate: u32,
   live_generation: Arc<AtomicU64>,
@@ -838,7 +853,7 @@ impl LiveFlacState {
   }
 
   fn encode_current_i16_buf(&mut self) -> Result<Bytes> {
-    let frame_bytes = encode_i16_block_to_frame(
+    encode_i16_block_to_frame(
       &self.i16_buf,
       self.channels,
       self.frame_number,
@@ -846,9 +861,11 @@ impl LiveFlacState {
       &self.stream_info,
       &mut self.framebuf,
       &mut self.i32_scratch,
+      &mut self.frame_sink,
+      &mut self.frame_bytes,
     )?;
     self.frame_number = self.frame_number.saturating_add(1);
-    Ok(Bytes::from(frame_bytes))
+    Ok(self.frame_bytes.split().freeze())
   }
 
   fn maybe_log_ring_drops(&mut self) {
@@ -1243,6 +1260,89 @@ mod tests {
     }
     assert!(unpaced >= 20, "expected multi-chunk unpaced catch-up, got {unpaced}");
     assert!(reengaged, "pacing re-engages after unpaced catch-up");
+  }
+
+  /// Async integration: `pace_realtime_shared` holds origin with backlog, rebaselines when empty,
+  /// and re-engages sleep after catch-up.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn pace_realtime_shared_holds_origin_with_backlog_then_rebaselines() {
+    let rate = 48_000_u32;
+    let next_frames = LIVE_CHUNK_FRAMES;
+    let backlog_threshold = LIVE_CHUNK_FRAMES;
+    // Capacity large enough to hold a full backlog threshold of silence.
+    let ring = PcmRing::new(1, backlog_threshold.saturating_mul(4));
+    let silence = vec![0.0_f32; backlog_threshold];
+    ring.push_f32(&silence);
+    assert!(
+      ring.occupancy_frames() >= backlog_threshold,
+      "occupancy={} threshold={backlog_threshold}",
+      ring.occupancy_frames()
+    );
+
+    // 96_000 frames @ 48 kHz with LIVE_LEAD 2 s → wake_at ≈ origin.
+    // Origin 300 ms in the past → late beyond PACE_LATE_SLACK, rebaseline candidate.
+    let origin = Instant::now()
+      .checked_sub(Duration::from_millis(300))
+      .expect("instant subtract");
+    let mut pace_origin = Some(origin);
+    let frames_emitted = 96_000_u64;
+
+    // (a)+(b) Late + backlog: origin held, call returns unpaced (no long sleep).
+    let t0 = Instant::now();
+    pace_realtime_shared(frames_emitted, &mut pace_origin, rate, next_frames, &ring, backlog_threshold).await;
+    let elapsed_backlog = t0.elapsed();
+    assert_eq!(pace_origin, Some(origin), "origin must be held while ring has backlog");
+    assert!(
+      elapsed_backlog < Duration::from_millis(50),
+      "late+backlog must be unpaced, elapsed={elapsed_backlog:?}"
+    );
+
+    // Drain ring below threshold; still late → origin advances (rebaseline).
+    let mut drain = Vec::new();
+    let drained = ring.pop_i16(backlog_threshold.saturating_mul(4), &mut drain);
+    assert!(drained >= backlog_threshold, "drained={drained}");
+    assert!(
+      ring.occupancy_frames() < backlog_threshold,
+      "occupancy after drain={}",
+      ring.occupancy_frames()
+    );
+
+    let origin_before_empty = pace_origin;
+    let t1 = Instant::now();
+    pace_realtime_shared(frames_emitted, &mut pace_origin, rate, next_frames, &ring, backlog_threshold).await;
+    let elapsed_empty = t1.elapsed();
+    assert!(
+      elapsed_empty < Duration::from_millis(50),
+      "late+empty rebaseline tick is unpaced, elapsed={elapsed_empty:?}"
+    );
+    let after_rebaseline = pace_origin.expect("origin set");
+    let before = origin_before_empty.expect("origin set");
+    assert!(
+      after_rebaseline > before,
+      "late+empty must advance origin: before={before:?} after={after_rebaseline:?}"
+    );
+
+    // After rebaseline, schedule is current; advance frames far enough that plan wants sleep,
+    // then the shared call must actually sleep (pacing re-engages).
+    // 96_000 + several chunks of next_frames with fixed wall ≈ rebaselined origin → ahead.
+    let mut frames = frames_emitted;
+    // Push schedule ~80 ms ahead of wall: audio_ms grows while wall barely moves.
+    // wake_at = origin + audio_ms - lead; after rebaseline wake ≈ now; adding frames
+    // makes wake_at > now → sleep.
+    let advance_frames = u64::from(rate) * 80 / 1_000; // ~80 ms of audio
+    frames = frames.saturating_add(advance_frames);
+
+    let t2 = Instant::now();
+    pace_realtime_shared(frames, &mut pace_origin, rate, next_frames, &ring, backlog_threshold).await;
+    let elapsed_pace = t2.elapsed();
+    assert!(
+      elapsed_pace >= Duration::from_millis(20),
+      "pacing must re-engage with sleep after rebaseline catch-up, elapsed={elapsed_pace:?}"
+    );
+    assert!(
+      elapsed_pace < Duration::from_millis(200),
+      "sleep should be ~tens of ms, elapsed={elapsed_pace:?}"
+    );
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1848,6 +1948,76 @@ mod tests {
     let after = &decoded[preroll..preroll + pattern_frames];
     for (i, (&orig, &dec)) in expected_i16.iter().zip(after.iter()).enumerate() {
       assert_eq!(i32::from(orig), dec, "PCM mismatch at sample {i}");
+    }
+
+    handle.shutdown();
+  }
+
+  /// Stereo `LiveFlac`: distinct L/R so a channel swap fails bit-exact claxon decode.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn live_flac_stereo_channel_order_bit_exact() {
+    use crate::audio::{FLAC_BLOCK_SIZE, round_up_to_flac_blocks};
+
+    let sample_rate = 8_000_u32;
+    let channels = 2_u16;
+    let preroll = round_up_to_flac_blocks(silence_preroll_frames(sample_rate));
+    // preroll is in frames; decoded samples = preroll * channels.
+    let preroll_samples = preroll.saturating_mul(usize::from(channels));
+
+    let pattern_frames = FLAC_BLOCK_SIZE;
+    // Distinct L/R: L = +0.5, R = -0.5 (interleaved f32).
+    let mut pattern_f32 = Vec::with_capacity(pattern_frames.saturating_mul(2));
+    for _ in 0..pattern_frames {
+      pattern_f32.push(0.5);
+      pattern_f32.push(-0.5);
+    }
+    let probe = PcmRing::new(channels, pattern_frames);
+    probe.push_f32(&pattern_f32);
+    let mut expected_i16 = Vec::new();
+    assert_eq!(probe.pop_i16(pattern_frames, &mut expected_i16), pattern_frames);
+    assert_ne!(expected_i16[0], expected_i16[1], "L/R must differ");
+
+    let ring = Arc::new(PcmRing::new(channels, pattern_frames.saturating_mul(4)));
+    ring.push_f32(&pattern_f32);
+
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac {
+      ring: Arc::clone(&ring),
+      channels,
+      sample_rate,
+    });
+
+    let url = handle.stream_url();
+    let body = http_get_body_timed(&url, Duration::from_secs(8)).await;
+    assert!(body.len() > 42, "expected STREAMINFO + frames, got {}", body.len());
+    assert_eq!(&body[0..4], b"fLaC");
+
+    let (got_rate, got_ch, decoded) = claxon_decode_prefix(&body);
+    assert_eq!(got_rate, sample_rate);
+    assert_eq!(got_ch, u32::from(channels));
+
+    let need = preroll_samples.saturating_add(expected_i16.len());
+    assert!(
+      decoded.len() >= need,
+      "decoded {} samples, need at least {need}; body={}",
+      decoded.len(),
+      body.len()
+    );
+
+    for (i, &s) in decoded.iter().take(preroll_samples).enumerate() {
+      assert_eq!(s, 0, "preroll sample {i} must be silence, got {s}");
+    }
+
+    let after = &decoded[preroll_samples..preroll_samples + expected_i16.len()];
+    for (i, (&orig, &dec)) in expected_i16.iter().zip(after.iter()).enumerate() {
+      assert_eq!(i32::from(orig), dec, "PCM mismatch at sample {i}");
+    }
+    // Channel order: even = L (+), odd = R (−). Swap would fail here.
+    for frame in 0..pattern_frames {
+      let left = after[frame * 2];
+      let right = after[frame * 2 + 1];
+      assert!(left > 0, "L must be positive at frame {frame}, got {left}");
+      assert!(right < 0, "R must be negative at frame {frame}, got {right}");
     }
 
     handle.shutdown();
