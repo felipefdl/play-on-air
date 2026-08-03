@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.14
+
+- Stop Cast-PAUSE on PCM idle/underrun (iPhone could keep Streaming while Nest stayed paused forever). Cast PAUSE only on explicit AirPlay FLUSH; PCM again resumes Cast.
+
 ## 0.1.13
 
 - Idle Cast PAUSE only after **2.5s** without PCM **and** an empty ring (stops mid-track PAUSE/PLAY thrash on buffered AP2). Explicit pause/FLUSH still pauses promptly.

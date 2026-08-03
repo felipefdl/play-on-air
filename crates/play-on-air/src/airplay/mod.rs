@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use shairplay::{AirPlayMode, AudioFormat, AudioHandler, AudioSession, RaopServer};
@@ -20,15 +20,6 @@ const RAOP_PORT_SPAN: u64 = 1000;
 const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
-/// No PCM for this long **and** an empty ring ⇒ treat AirPlay as paused (Cast PAUSE).
-///
-/// Buffered AP2 often gaps 1–2s between chunks while the track is still playing.
-/// A short idle alone was thrashing Nest PAUSE/PLAY mid-song. Explicit AP2 rate=0
-/// and FLUSH still pause immediately via [`AudioSession::audio_flush`].
-const PAUSE_IDLE: Duration = Duration::from_millis(2_500);
-/// Pause-watch poll cadence.
-const PAUSE_POLL: Duration = Duration::from_millis(50);
-
 /// Lifecycle events from an AirPlay receiver toward the bridge.
 #[derive(Debug, Clone)]
 pub enum AirPlaySessionEvent {
@@ -100,47 +91,25 @@ impl DeviceAudioState {
 /// when they close; those must not stop Cast (multi-speaker iOS opens/closes RC
 /// links while audio keeps running on another connection).
 ///
-/// Idle pause is inferred only when PCM stops for [`PAUSE_IDLE`] **and** the ring is
-/// empty (AP2 rate=0 often stops delivery without dropping the session). Flush is
-/// explicit via [`AudioSession::audio_flush`] (immediate Cast PAUSE path).
+/// Forwards PCM; Cast PAUSE only on explicit [`AudioSession::audio_flush`] (FLUSH /
+/// buffer clear). We do **not** Cast-PAUSE on PCM idle: buffered AP2 gaps and underruns
+/// left Nest paused while iPhone still showed Streaming and advanced the scrubber.
 struct RingSession {
   state: Arc<DeviceAudioState>,
   ring: Arc<PcmRing>,
-  last_process_ms: Arc<AtomicU64>,
-  /// At least one PCM buffer has been delivered (avoids false pause before playout).
-  had_pcm: Arc<AtomicBool>,
   cast_paused: Arc<AtomicBool>,
-  watch_cancel: Arc<AtomicBool>,
-  watch: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RingSession {
   fn new(state: Arc<DeviceAudioState>, ring: Arc<PcmRing>) -> Self {
-    let last_process_ms = Arc::new(AtomicU64::new(millis_since_start()));
-    let had_pcm = Arc::new(AtomicBool::new(false));
-    let cast_paused = Arc::new(AtomicBool::new(false));
-    let watch_cancel = Arc::new(AtomicBool::new(false));
-    let watch = spawn_pause_watch(
-      Arc::clone(&state),
-      Arc::clone(&last_process_ms),
-      Arc::clone(&had_pcm),
-      Arc::clone(&cast_paused),
-      Arc::clone(&watch_cancel),
-    );
     Self {
       state,
       ring,
-      last_process_ms,
-      had_pcm,
-      cast_paused,
-      watch_cancel,
-      watch: Some(watch),
+      cast_paused: Arc::new(AtomicBool::new(false)),
     }
   }
 
   fn note_pcm(&self) {
-    self.had_pcm.store(true, Ordering::Release);
-    self.last_process_ms.store(millis_since_start(), Ordering::Release);
     if self.cast_paused.swap(false, Ordering::AcqRel)
       && let Some(tx) = &self.state.event_tx
     {
@@ -157,7 +126,6 @@ impl AudioSession for RingSession {
 
   fn audio_flush(&mut self) {
     self.ring.clear();
-    self.last_process_ms.store(millis_since_start(), Ordering::Release);
     if let Some(tx) = &self.state.event_tx {
       drop(tx.send(AirPlaySessionEvent::Flushed { device_id: self.state.device_id.clone() }));
     }
@@ -171,10 +139,6 @@ impl AudioSession for RingSession {
 
 impl Drop for RingSession {
   fn drop(&mut self) {
-    self.watch_cancel.store(true, Ordering::Release);
-    if let Some(handle) = self.watch.take() {
-      drop(handle.join());
-    }
     self.ring.clear();
     if let Some(tx) = &self.state.event_tx {
       drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
@@ -184,64 +148,6 @@ impl Drop for RingSession {
       "AirPlay audio session dropped (bridge should Cast-STOP)"
     );
   }
-}
-
-fn millis_since_start() -> u64 {
-  static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-  let start = START.get_or_init(Instant::now);
-  u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Whether the idle watcher should emit Cast PAUSE (pure; unit-tested).
-///
-/// Requires long enough silence **and** no residual PCM in the ring so buffered
-/// AP2 chunk gaps do not thrash Nest while audio is still queued for `LiveWav`.
-#[must_use]
-const fn should_emit_idle_pause(idle_ms: u64, idle_threshold_ms: u64, ring_frames: usize) -> bool {
-  idle_ms >= idle_threshold_ms && ring_frames == 0
-}
-
-fn spawn_pause_watch(
-  state: Arc<DeviceAudioState>,
-  last_process_ms: Arc<AtomicU64>,
-  had_pcm: Arc<AtomicBool>,
-  cast_paused: Arc<AtomicBool>,
-  cancel: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-  let idle_threshold_ms = u64::try_from(PAUSE_IDLE.as_millis()).unwrap_or(2_500);
-  std::thread::Builder::new()
-    .name(format!("ap-pause-{}", short_device_id(&state.device_id)))
-    .spawn(move || {
-      while !cancel.load(Ordering::Acquire) {
-        std::thread::sleep(PAUSE_POLL);
-        if cancel.load(Ordering::Acquire) {
-          break;
-        }
-        if !had_pcm.load(Ordering::Acquire) {
-          continue;
-        }
-        let last = last_process_ms.load(Ordering::Acquire);
-        let now = millis_since_start();
-        let idle_ms = now.saturating_sub(last);
-        let ring_frames = state.current_ring().available_frames();
-        if !should_emit_idle_pause(idle_ms, idle_threshold_ms, ring_frames) {
-          continue;
-        }
-        if !cast_paused.swap(true, Ordering::AcqRel)
-          && let Some(tx) = &state.event_tx
-        {
-          drop(tx.send(AirPlaySessionEvent::Paused { device_id: state.device_id.clone() }));
-        }
-      }
-    })
-    .unwrap_or_else(|_| {
-      // Spawn failed: fall back to a no-op join handle via a finished thread.
-      std::thread::spawn(|| {})
-    })
-}
-
-fn short_device_id(id: &str) -> String {
-  id.chars().take(8).collect()
 }
 
 /// Creates ring-backed sessions and notifies the bridge on lifecycle events.
@@ -737,22 +643,31 @@ mod tests {
   }
 
   #[test]
-  fn should_emit_idle_pause_requires_idle_and_empty_ring() {
-    let threshold = 2_500_u64;
-    // Buffered AP2 chunk gap with residual PCM: do not pause Cast.
-    assert!(!should_emit_idle_pause(3_000, threshold, 1));
-    assert!(!should_emit_idle_pause(threshold, threshold, 100));
-    // Short gap under threshold even with empty ring: still playing.
-    assert!(!should_emit_idle_pause(749, threshold, 0));
-    assert!(!should_emit_idle_pause(2_499, threshold, 0));
-    // Long silence and drained ring: real idle / rate=0 with no tail.
-    assert!(should_emit_idle_pause(threshold, threshold, 0));
-    assert!(should_emit_idle_pause(threshold + 1, threshold, 0));
-  }
-
-  #[test]
-  fn pause_idle_is_above_typical_buffered_gaps() {
-    // Documented product bar: longer than the old 750ms thrash threshold.
-    assert!(PAUSE_IDLE.as_millis() >= 2_000);
+  fn flush_emits_pause_and_pcm_resumes() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+      event_tx: Some(tx),
+      device_id: "dev-flush".to_owned(),
+    });
+    let ring = state.current_ring();
+    let mut session = RingSession::new(state, Arc::clone(&ring));
+    session.audio_process(&[0.1_f32, 0.2]);
+    // Drain the Started event is not from RingSession; only flush/pause/resume here.
+    while rx.try_recv().is_ok() {}
+    session.audio_flush();
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Flushed { device_id }) => assert_eq!(device_id, "dev-flush"),
+      other => panic!("expected Flushed, got {other:?}"),
+    }
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Paused { device_id }) => assert_eq!(device_id, "dev-flush"),
+      other => panic!("expected Paused after flush, got {other:?}"),
+    }
+    session.audio_process(&[0.3_f32, 0.4]);
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Resumed { device_id }) => assert_eq!(device_id, "dev-flush"),
+      other => panic!("expected Resumed after PCM, got {other:?}"),
+    }
   }
 }
