@@ -409,8 +409,16 @@ fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
         "Chromecast pending leave"
       );
     },
-    Some(_) => {
-      // Already pending (or unexpected mark): keep quiet to avoid re-remove spam.
+    Some((_id, crate::registry::PendingLeaveMark::AlreadyPending)) => {
+      // Already pending: keep quiet to avoid re-remove spam.
+    },
+    Some((id, crate::registry::PendingLeaveMark::NotFound)) => {
+      // Matched under read lock then vanished before write lock (TOCTOU).
+      tracing::debug!(
+        %id,
+        instance,
+        "pending leave mark lost race (device gone between match and mark)"
+      );
     },
     None => {
       tracing::debug!(instance, "leave for unknown Chromecast instance (ignored)");
