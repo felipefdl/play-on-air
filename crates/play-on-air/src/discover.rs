@@ -172,7 +172,8 @@ struct LookupReachable {
 /// Parse `dns-sd -L` output for host, port, and TXT blob.
 ///
 /// When multiple "can be reached at" lines exist (multi-homed hosts), prefer a
-/// line whose host is a preferred local IPv4, else the first line (deterministic).
+/// line whose host equals or shares a /24 with a preferred local IPv4, else the
+/// first line (deterministic).
 pub fn parse_lookup_output(output: &str) -> Option<ResolveInfo> {
   parse_lookup_output_with_preferred(output, &[])
 }
@@ -234,12 +235,17 @@ fn parse_reachable_line(trimmed: &str, reached_idx: usize) -> Option<LookupReach
   })
 }
 
-/// Pure: pick the best reach line. Preferred local IPv4 match wins (first preferred
-/// that appears); otherwise the first reach line (stable, not last-wins).
+/// Pure: pick the best reach line.
+///
+/// Preference order:
+/// 1. Exact match of a preferred local IPv4 to the reach host/address
+/// 2. Same IPv4 /24 (first three octets) as a preferred local address
+/// 3. First reach line (stable, not last-wins)
 fn choose_reachable(reachables: &[LookupReachable], preferred_ipv4: &[String]) -> Option<LookupReachable> {
   if reachables.is_empty() {
     return None;
   }
+  // Exact host/address match against preferred local IPs.
   for pref in preferred_ipv4 {
     if let Some(hit) = reachables
       .iter()
@@ -248,8 +254,31 @@ fn choose_reachable(reachables: &[LookupReachable], preferred_ipv4: &[String]) -
       return Some(hit.clone());
     }
   }
+  // Same /24 as a preferred local IPv4 (typical LAN multi-homed Cast).
+  for pref in preferred_ipv4 {
+    if let Some(pref_net) = ipv4_slash24_key(pref)
+      && let Some(hit) = reachables.iter().find(|r| {
+        let host = r.address.as_deref().unwrap_or(r.hostname.as_str());
+        ipv4_slash24_key(host) == Some(pref_net)
+      })
+    {
+      return Some(hit.clone());
+    }
+  }
   // First match wins (deterministic; avoids last-line-wins nondeterminism).
   reachables.first().cloned()
+}
+
+/// First three IPv4 octets as a stable key, or `None` if not a dotted-quad.
+fn ipv4_slash24_key(s: &str) -> Option<[u8; 3]> {
+  if !is_ipv4_literal(s) {
+    return None;
+  }
+  let mut parts = s.split('.');
+  let a = parts.next()?.parse().ok()?;
+  let b = parts.next()?.parse().ok()?;
+  let c = parts.next()?.parse().ok()?;
+  Some([a, b, c])
 }
 
 fn is_ipv4_literal(s: &str) -> bool {
@@ -368,16 +397,20 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
 /// Mark a device pending leave when mDNS reports a remove (debounced ~20s).
 ///
 /// Exact match only: by stored TXT `id` or by the instance string recorded at appear.
+/// Info-logs only on the first transition into pending leave (not on re-marks).
 fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
   let now = Instant::now();
   match registry.mark_pending_leave_by_instance(instance, now, DEFAULT_PENDING_LEAVE) {
-    Some(id) => {
+    Some((id, crate::registry::PendingLeaveMark::NewlyMarked)) => {
       tracing::info!(
         %id,
         instance,
         grace_secs = DEFAULT_PENDING_LEAVE.as_secs(),
         "Chromecast pending leave"
       );
+    },
+    Some(_) => {
+      // Already pending (or unexpected mark): keep quiet to avoid re-remove spam.
     },
     None => {
       tracing::debug!(instance, "leave for unknown Chromecast instance (ignored)");
@@ -956,6 +989,23 @@ Lookup multi-homed._googlecast._tcp.local.
     assert_eq!(chosen.hostname, "192.168.1.50");
     assert_eq!(chosen.port, 8009);
     assert_eq!(chosen.address.as_deref(), Some("192.168.1.50"));
+  }
+
+  #[test]
+  fn parse_lookup_prefers_same_slash24_as_local_ip() {
+    // Preferred is the *local* host address (advertise_host_ip), not the Cast address.
+    // Equality match almost never hits; same /24 must select the LAN reach line.
+    let out = r"
+Lookup multi-homed._googlecast._tcp.local.
+10:00:00.001  multi-homed._googlecast._tcp.local. can be reached at 10.0.0.5:8009 (interface 4) Flags: 1
+10:00:00.002  multi-homed._googlecast._tcp.local. can be reached at 192.168.1.50:8009 (interface 15) Flags: 1
+ id=aabbcc fn=Kitchen
+";
+    let preferred = vec!["192.168.1.10".to_owned()];
+    let chosen = parse_lookup_output_with_preferred(out, &preferred).expect("lookup");
+    assert_eq!(chosen.hostname, "192.168.1.50");
+    assert_eq!(chosen.address.as_deref(), Some("192.168.1.50"));
+    assert_eq!(chosen.port, 8009);
   }
 
   #[test]

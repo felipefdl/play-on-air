@@ -87,14 +87,18 @@ pub enum WithdrawDecision {
 ///
 /// - Still desired → [`WithdrawDecision::Keep`]
 /// - Live bridge session → always [`WithdrawDecision::Defer`]
-/// - Not desired, no session, gone for at least `session_guard` → [`WithdrawDecision::Withdraw`]
-/// - Not desired, no session, gone less than `session_guard` → [`WithdrawDecision::Defer`]
+/// - Not desired, no session, gone for at least `min_gone` → [`WithdrawDecision::Withdraw`]
+/// - Not desired, no session, gone less than `min_gone` → [`WithdrawDecision::Defer`]
+///
+/// Callers pass `min_gone = Duration::ZERO` for pure idle leave (withdraw on the next tick
+/// after the device leaves the desired set). Pass [`SESSION_GUARD_GONE`] only when a live
+/// session previously blocked withdraw while the device was already not desired.
 #[must_use]
 pub fn decide_airplay_withdraw(
   is_desired: bool,
   has_session: bool,
   gone_for: Duration,
-  session_guard: Duration,
+  min_gone: Duration,
 ) -> WithdrawDecision {
   if is_desired {
     return WithdrawDecision::Keep;
@@ -102,11 +106,22 @@ pub fn decide_airplay_withdraw(
   if has_session {
     return WithdrawDecision::Defer;
   }
-  if gone_for >= session_guard {
+  if gone_for >= min_gone {
     WithdrawDecision::Withdraw
   } else {
     WithdrawDecision::Defer
   }
+}
+
+/// Outcome of attempting to mark a device for debounced leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingLeaveMark {
+  /// Device id is not in the registry.
+  NotFound,
+  /// First transition into pending leave (deadline set).
+  NewlyMarked,
+  /// Already pending; deadline and `pending_leave_since` unchanged.
+  AlreadyPending,
 }
 
 /// Pure: exact match for leave-by-instance (no substring heuristics).
@@ -155,33 +170,39 @@ impl DeviceRegistry {
     guard.remove(id)
   }
 
-  /// Mark a device pending leave by stable id. Returns `true` if marked (or already pending).
-  pub fn mark_pending_leave(&self, id: &str, now: Instant, grace: Duration) -> bool {
+  /// Mark a device pending leave by stable id.
+  ///
+  /// A second call while already pending does **not** move the deadline.
+  pub fn mark_pending_leave(&self, id: &str, now: Instant, grace: Duration) -> PendingLeaveMark {
     let mut guard = self.inner.write();
     let Some(dev) = guard.get_mut(id) else {
-      return false;
+      return PendingLeaveMark::NotFound;
     };
     if dev.pending_leave_deadline.is_some() {
-      return true;
+      return PendingLeaveMark::AlreadyPending;
     }
     dev.pending_leave_since = Some(now);
     dev.pending_leave_deadline = Some(now + grace);
     drop(guard);
-    true
+    PendingLeaveMark::NewlyMarked
   }
 
-  /// Mark pending leave by exact instance / id match. Returns the device id when marked.
-  pub fn mark_pending_leave_by_instance(&self, instance: &str, now: Instant, grace: Duration) -> Option<String> {
+  /// Mark pending leave by exact instance / id match.
+  ///
+  /// Returns `(device_id, mark)` when a device matched; `None` if no device matches.
+  pub fn mark_pending_leave_by_instance(
+    &self,
+    instance: &str,
+    now: Instant,
+    grace: Duration,
+  ) -> Option<(String, PendingLeaveMark)> {
     let list: Vec<Device> = {
       let guard = self.inner.read();
       guard.values().cloned().collect()
     };
     let id = match_device_for_leave(&list, instance)?.id.clone();
-    if self.mark_pending_leave(&id, now, grace) {
-      Some(id)
-    } else {
-      None
-    }
+    let mark = self.mark_pending_leave(&id, now, grace);
+    Some((id, mark))
   }
 
   /// Cancel pending leave for `id` (e.g. re-appear). Returns `true` if a pending leave was cleared.
@@ -322,7 +343,10 @@ mod tests {
     let reg = DeviceRegistry::new();
     assert!(reg.appear(sample("a", "Old")));
     let now = Instant::now();
-    assert!(reg.mark_pending_leave("a", now, DEFAULT_PENDING_LEAVE));
+    assert_eq!(
+      reg.mark_pending_leave("a", now, DEFAULT_PENDING_LEAVE),
+      PendingLeaveMark::NewlyMarked
+    );
     assert!(reg.is_pending_leave("a"));
     assert!(!reg.appear(sample("a", "New")));
     assert!(!reg.is_pending_leave("a"));
@@ -374,7 +398,10 @@ mod tests {
           .expect("clock");
       }
     }
-    assert!(reg.mark_pending_leave("p", Instant::now(), DEFAULT_PENDING_LEAVE));
+    assert_eq!(
+      reg.mark_pending_leave("p", Instant::now(), DEFAULT_PENDING_LEAVE),
+      PendingLeaveMark::NewlyMarked
+    );
     let removed = reg.expire_stale(DEFAULT_STALE_TTL);
     assert!(removed.is_empty());
     assert!(reg.get("p").is_some());
@@ -385,13 +412,54 @@ mod tests {
     let reg = DeviceRegistry::new();
     let _ = reg.appear(sample("a", "A"));
     let now = Instant::now();
-    assert!(reg.mark_pending_leave("a", now, Duration::from_secs(20)));
+    assert_eq!(
+      reg.mark_pending_leave("a", now, Duration::from_secs(20)),
+      PendingLeaveMark::NewlyMarked
+    );
     assert!(reg.take_due_leaves(now + Duration::from_secs(10)).is_empty());
     assert_eq!(reg.len(), 1);
     let due = reg.take_due_leaves(now + Duration::from_secs(21));
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].id, "a");
     assert!(reg.is_empty());
+  }
+
+  #[test]
+  fn mark_pending_leave_second_call_is_already_pending_and_keeps_deadline() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample("a", "A"));
+    let now = Instant::now();
+    assert_eq!(
+      reg.mark_pending_leave("a", now, Duration::from_secs(20)),
+      PendingLeaveMark::NewlyMarked
+    );
+    let first_deadline = reg
+      .get("a")
+      .and_then(|d| d.pending_leave_deadline)
+      .expect("deadline after first mark");
+    let first_since = reg
+      .get("a")
+      .and_then(|d| d.pending_leave_since)
+      .expect("since after first mark");
+
+    // Later re-mark must not move the deadline or since.
+    let later = now + Duration::from_secs(5);
+    assert_eq!(
+      reg.mark_pending_leave("a", later, Duration::from_secs(20)),
+      PendingLeaveMark::AlreadyPending
+    );
+    let after = reg.get("a").expect("still present");
+    assert_eq!(after.pending_leave_deadline, Some(first_deadline));
+    assert_eq!(after.pending_leave_since, Some(first_since));
+  }
+
+  #[test]
+  fn mark_pending_leave_unknown_id() {
+    let reg = DeviceRegistry::new();
+    assert_eq!(
+      reg.mark_pending_leave("missing", Instant::now(), DEFAULT_PENDING_LEAVE),
+      PendingLeaveMark::NotFound
+    );
   }
 
   #[test]
@@ -405,11 +473,18 @@ mod tests {
         .mark_pending_leave_by_instance("Nest-Audio", now, DEFAULT_PENDING_LEAVE)
         .is_none()
     );
-    let id = reg
+    let (id, mark) = reg
       .mark_pending_leave_by_instance("Nest-Audio-abc123", now, DEFAULT_PENDING_LEAVE)
       .expect("exact instance");
     assert_eq!(id, "abc123");
+    assert_eq!(mark, PendingLeaveMark::NewlyMarked);
     assert!(reg.is_pending_leave("abc123"));
+    // Second mark is already pending (not newly marked).
+    let (id2, mark2) = reg
+      .mark_pending_leave_by_instance("Nest-Audio-abc123", now + Duration::from_secs(1), DEFAULT_PENDING_LEAVE)
+      .expect("still present");
+    assert_eq!(id2, "abc123");
+    assert_eq!(mark2, PendingLeaveMark::AlreadyPending);
   }
 
   #[test]
@@ -417,10 +492,11 @@ mod tests {
     let reg = DeviceRegistry::new();
     let _ = reg.appear(sample_with_instance("abc123", "Gym", "Nest-Audio-abc123"));
     let now = Instant::now();
-    let id = reg
+    let (id, mark) = reg
       .mark_pending_leave_by_instance("abc123", now, DEFAULT_PENDING_LEAVE)
       .expect("id match");
     assert_eq!(id, "abc123");
+    assert_eq!(mark, PendingLeaveMark::NewlyMarked);
   }
 
   #[test]
@@ -439,24 +515,28 @@ mod tests {
 
   #[test]
   fn decide_airplay_withdraw_matrix() {
+    // Still desired.
     assert_eq!(
-      decide_airplay_withdraw(true, false, Duration::from_secs(100), SESSION_GUARD_GONE),
+      decide_airplay_withdraw(true, false, Duration::from_secs(100), Duration::ZERO),
       WithdrawDecision::Keep
     );
+    // Live session always defers, even past any floor.
     assert_eq!(
       decide_airplay_withdraw(false, true, Duration::from_secs(100), SESSION_GUARD_GONE),
       WithdrawDecision::Defer
     );
+    // Pure idle leave: min_gone = 0 → withdraw immediately.
+    assert_eq!(
+      decide_airplay_withdraw(false, false, Duration::ZERO, Duration::ZERO),
+      WithdrawDecision::Withdraw
+    );
+    // Post-session floor: need full SESSION_GUARD_GONE after not-desired.
     assert_eq!(
       decide_airplay_withdraw(false, false, Duration::from_secs(30), SESSION_GUARD_GONE),
       WithdrawDecision::Defer
     );
     assert_eq!(
-      decide_airplay_withdraw(false, false, Duration::from_secs(60), SESSION_GUARD_GONE),
-      WithdrawDecision::Withdraw
-    );
-    assert_eq!(
-      decide_airplay_withdraw(false, false, Duration::ZERO, Duration::ZERO),
+      decide_airplay_withdraw(false, false, SESSION_GUARD_GONE, SESSION_GUARD_GONE),
       WithdrawDecision::Withdraw
     );
   }
@@ -475,7 +555,10 @@ mod tests {
     let reg = DeviceRegistry::new();
     let _ = reg.appear(sample("a", "A"));
     assert!(!reg.cancel_pending_leave("a"));
-    assert!(reg.mark_pending_leave("a", Instant::now(), DEFAULT_PENDING_LEAVE));
+    assert_eq!(
+      reg.mark_pending_leave("a", Instant::now(), DEFAULT_PENDING_LEAVE),
+      PendingLeaveMark::NewlyMarked
+    );
     assert!(reg.cancel_pending_leave("a"));
     assert!(!reg.is_pending_leave("a"));
   }
@@ -485,7 +568,10 @@ mod tests {
     let reg = DeviceRegistry::new();
     let _ = reg.appear(sample("a", "A"));
     let _ = reg.appear(sample("b", "B"));
-    assert!(reg.mark_pending_leave("a", Instant::now(), DEFAULT_PENDING_LEAVE));
+    assert_eq!(
+      reg.mark_pending_leave("a", Instant::now(), DEFAULT_PENDING_LEAVE),
+      PendingLeaveMark::NewlyMarked
+    );
     let present = reg.list_present();
     assert_eq!(present.len(), 1);
     assert_eq!(present[0].id, "b");

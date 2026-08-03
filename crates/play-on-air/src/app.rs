@@ -225,6 +225,9 @@ fn spawn_maintain_loop(
   tokio::spawn(async move {
     let volume_attempts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
     let mut not_desired_since: HashMap<String, Instant> = HashMap::new();
+    // Devices that deferred withdraw because a live session was active.
+    // Only those require the SESSION_GUARD_GONE floor after the session ends.
+    let mut session_blocked: HashSet<String> = HashSet::new();
     // Device ids observed last tick; absence → re-appear resets volume attempts.
     let mut known_ids: HashSet<String> = HashSet::new();
 
@@ -240,6 +243,7 @@ fn spawn_maintain_loop(
         &bridge,
         &volume_attempts,
         &mut not_desired_since,
+        &mut session_blocked,
         &mut known_ids,
       )
       .await
@@ -255,22 +259,10 @@ fn spawn_maintain_loop(
         }
       }
     }
-    // Withdraw all AirPlay ads and warm Cast workers on shutdown.
+    // Withdraw AirPlay ads on shutdown. Cast pool teardown is owned by `App::run`
+    // (single spawn_blocking shutdown — avoid double-shutdown races with the bridge).
     for id in airplay.active_ids() {
       airplay.remove(&id);
-    }
-    let pool = Arc::clone(&cast_pool);
-    match tokio::time::timeout(
-      POOL_BLOCKING_JOIN,
-      tokio::task::spawn_blocking(move || {
-        pool.shutdown();
-      }),
-    )
-    .await
-    {
-      Ok(Ok(())) => {},
-      Ok(Err(err)) => tracing::warn!(error = %err, "cast pool shutdown join error in maintain"),
-      Err(_) => tracing::warn!("cast pool shutdown timed out in maintain"),
     }
   })
 }
@@ -288,39 +280,26 @@ async fn maintain_airplay(
   bridge: &Bridge,
   volume_attempts: &Mutex<HashMap<String, u32>>,
   not_desired_since: &mut HashMap<String, Instant>,
+  session_blocked: &mut HashSet<String>,
   known_ids: &mut HashSet<String>,
 ) -> Result<()> {
-  // Complete debounced leaves whose deadline elapsed.
-  let due = registry.take_due_leaves(Instant::now());
-  for dev in &due {
-    tracing::info!(
-      id = %dev.id,
-      name = %dev.name,
-      instance = %dev.instance,
-      "Chromecast left"
-    );
-    let since = dev.pending_leave_since.unwrap_or_else(Instant::now);
-    let _ = not_desired_since.insert(dev.id.clone(), since);
-    let _ = known_ids.remove(&dev.id);
-  }
-
-  // Drop devices that never received a remove event but stopped advertising.
-  let expired = registry.expire_stale(DEFAULT_STALE_TTL);
-  for dev in &expired {
-    tracing::info!(id = %dev.id, name = %dev.name, "expired stale Chromecast");
-    let ancient = Instant::now().checked_sub(SESSION_GUARD_GONE).unwrap_or_else(Instant::now);
-    let _ = not_desired_since.insert(dev.id.clone(), ancient);
-    let _ = known_ids.remove(&dev.id);
-    // Stale expiry is not mid-session recovery; withdraw immediately when no live session.
-    if !bridge.has_session(&dev.id) {
-      airplay.remove(&dev.id);
-      remove_cast_worker(cast_pool, &dev.id).await;
-    }
-  }
+  apply_due_leaves(registry, not_desired_since, known_ids);
+  apply_stale_expiry(
+    registry,
+    airplay,
+    cast_pool,
+    bridge,
+    not_desired_since,
+    session_blocked,
+    known_ids,
+  )
+  .await;
 
   let devices = registry.list();
   let mut desired: HashSet<String> = HashSet::new();
   let mut present_ids: HashSet<String> = HashSet::new();
+  // Snapshot before ensure so we can log advertise transitions once.
+  let previously_advertised: HashSet<String> = airplay.active_ids().into_iter().collect();
 
   for device in &devices {
     let _ = present_ids.insert(device.id.clone());
@@ -347,38 +326,143 @@ async fn maintain_airplay(
   }
   *known_ids = present_ids;
 
+  log_new_advertisements(airplay, config, &devices, &previously_advertised);
   sync_volume_seeds(airplay, cast_pool, volume_attempts, &devices).await;
+  withdraw_undesired(airplay, cast_pool, bridge, &desired, not_desired_since, session_blocked).await;
+  drop_orphan_cast_workers(cast_pool, bridge, airplay, &desired).await;
 
-  // Withdraw receivers that are no longer desired, with live-session guard.
+  Ok(())
+}
+
+fn apply_due_leaves(
+  registry: &DeviceRegistry,
+  not_desired_since: &mut HashMap<String, Instant>,
+  known_ids: &mut HashSet<String>,
+) {
+  let due = registry.take_due_leaves(Instant::now());
+  for dev in &due {
+    tracing::info!(
+      id = %dev.id,
+      name = %dev.name,
+      instance = %dev.instance,
+      "Chromecast left"
+    );
+    let since = dev.pending_leave_since.unwrap_or_else(Instant::now);
+    let _ = not_desired_since.insert(dev.id.clone(), since);
+    let _ = known_ids.remove(&dev.id);
+  }
+}
+
+#[expect(
+  clippy::too_many_arguments,
+  reason = "stale-expiry needs registry + ad/pool + session bookkeeping maps"
+)]
+async fn apply_stale_expiry(
+  registry: &DeviceRegistry,
+  airplay: &AirPlayManager,
+  cast_pool: &Arc<CastPool>,
+  bridge: &Bridge,
+  not_desired_since: &mut HashMap<String, Instant>,
+  session_blocked: &mut HashSet<String>,
+  known_ids: &mut HashSet<String>,
+) {
+  let expired = registry.expire_stale(DEFAULT_STALE_TTL);
+  for dev in &expired {
+    tracing::info!(id = %dev.id, name = %dev.name, "expired stale Chromecast");
+    // Stale expiry: no session → withdraw immediately (min_gone effectively already met).
+    let ancient = Instant::now().checked_sub(SESSION_GUARD_GONE).unwrap_or_else(Instant::now);
+    let _ = not_desired_since.insert(dev.id.clone(), ancient);
+    let _ = known_ids.remove(&dev.id);
+    if bridge.has_session(&dev.id) {
+      // Live session during silent disappear: require the post-session floor later.
+      let _ = session_blocked.insert(dev.id.clone());
+    } else {
+      airplay.remove(&dev.id);
+      remove_cast_worker(cast_pool, &dev.id).await;
+      let _ = session_blocked.remove(&dev.id);
+      let _ = not_desired_since.remove(&dev.id);
+    }
+  }
+}
+
+fn log_new_advertisements(
+  airplay: &AirPlayManager,
+  config: &Config,
+  devices: &[Device],
+  previously_advertised: &HashSet<String>,
+) {
+  for id in airplay.active_ids() {
+    if previously_advertised.contains(&id) {
+      continue;
+    }
+    let name = devices
+      .iter()
+      .find(|d| d.id == id)
+      .map_or_else(|| id.clone(), |d| airplay_name_with_id(&d.name, &d.id, config));
+    tracing::info!(%id, airplay_name = %name, "AirPlay receiver advertised");
+  }
+}
+
+/// Withdraw receivers that are no longer desired.
+///
+/// Idle leave: withdraw immediately when `!has_session`.
+/// Session-blocked leave: require `gone_for >= SESSION_GUARD_GONE` after `not_desired_since`.
+async fn withdraw_undesired(
+  airplay: &AirPlayManager,
+  cast_pool: &Arc<CastPool>,
+  bridge: &Bridge,
+  desired: &HashSet<String>,
+  not_desired_since: &mut HashMap<String, Instant>,
+  session_blocked: &mut HashSet<String>,
+) {
   let active_ids = airplay.active_ids();
   for active in &active_ids {
     if desired.contains(active) {
       let _ = not_desired_since.remove(active);
+      let _ = session_blocked.remove(active);
       continue;
     }
     let since = *not_desired_since.entry(active.clone()).or_insert_with(Instant::now);
     let gone_for = Instant::now().saturating_duration_since(since);
     let has_session = bridge.has_session(active);
-    match decide_airplay_withdraw(false, has_session, gone_for, SESSION_GUARD_GONE) {
+    if has_session {
+      let _ = session_blocked.insert(active.clone());
+    }
+    let min_gone = if session_blocked.contains(active) {
+      SESSION_GUARD_GONE
+    } else {
+      Duration::ZERO
+    };
+    match decide_airplay_withdraw(false, has_session, gone_for, min_gone) {
       WithdrawDecision::Keep => {},
       WithdrawDecision::Defer => {
         tracing::debug!(
           id = %active,
           has_session,
+          session_blocked = session_blocked.contains(active),
           gone_secs = gone_for.as_secs(),
+          min_gone_secs = min_gone.as_secs(),
           "deferring AirPlay withdraw"
         );
       },
       WithdrawDecision::Withdraw => {
-        tracing::info!(id = %active, "AirPlay receiver withdrawn (device no longer desired)");
+        // airplay.remove logs the info-level withdraw; keep maintain at debug to avoid double info.
+        tracing::debug!(id = %active, "withdrawing AirPlay receiver (device no longer desired)");
         airplay.remove(active);
         remove_cast_worker(cast_pool, active).await;
         let _ = not_desired_since.remove(active);
+        let _ = session_blocked.remove(active);
       },
     }
   }
+}
 
-  // Drop warm workers for devices no longer desired when no session and no AirPlay ad.
+async fn drop_orphan_cast_workers(
+  cast_pool: &Arc<CastPool>,
+  bridge: &Bridge,
+  airplay: &AirPlayManager,
+  desired: &HashSet<String>,
+) {
   let still_active: HashSet<String> = airplay.active_ids().into_iter().collect();
   for id in cast_pool.device_ids() {
     if desired.contains(&id) || bridge.has_session(&id) || still_active.contains(&id) {
@@ -386,8 +470,6 @@ async fn maintain_airplay(
     }
     remove_cast_worker(cast_pool, &id).await;
   }
-
-  Ok(())
 }
 
 /// Concurrent volume seeds with attempt cap and per-call timeout.
@@ -494,7 +576,20 @@ mod tests {
   }
 
   #[test]
-  fn withdraw_decision_after_guard_without_session() {
+  fn withdraw_decision_idle_leave_immediate() {
+    // Pure idle leave: min_gone = 0 → withdraw without the 60s floor.
+    assert_eq!(
+      decide_airplay_withdraw(false, false, Duration::ZERO, Duration::ZERO),
+      WithdrawDecision::Withdraw
+    );
+  }
+
+  #[test]
+  fn withdraw_decision_after_session_guard_floor() {
+    assert_eq!(
+      decide_airplay_withdraw(false, false, Duration::from_secs(30), SESSION_GUARD_GONE),
+      WithdrawDecision::Defer
+    );
     assert_eq!(
       decide_airplay_withdraw(false, false, SESSION_GUARD_GONE, SESSION_GUARD_GONE),
       WithdrawDecision::Withdraw
