@@ -74,7 +74,9 @@ No config file and no flags are required. PlayOnAir discovers Chromecasts on the
 | macOS | system `dns-sd` (Bonjour) |
 | Linux | in-process `mdns-sd` (multicast UDP; no Avahi daemon) |
 
-**macOS:** keep the process running on a machine on the same LAN as the Chromecasts and the iPhone. Allow **Local Network** access if macOS prompts for the binary. On the iPhone Control Center AirPlay list, look for names matching your Cast devices (for example speaker names from the Google Home app).
+**macOS:** keep the process running on a machine on the same LAN as the Chromecasts and the iPhone. On the iPhone Control Center AirPlay list, look for names matching your Cast devices (for example speaker names from the Google Home app).
+
+macOS requires the **Local Network** permission for the app that hosts `play-on-air` (Terminal, iTerm, your IDE, and so on). Without it, mDNS discovery still works (it goes through the system daemon) but every Cast TCP connection fails with `No route to host`. Grant access in **System Settings → Privacy & Security → Local Network**. If the hosting app is not listed yet, run `play-on-air` once from Terminal.app so macOS can show the permission prompt.
 
 **Linux / HAOS:** use host networking so mDNS multicast reaches the LAN. No Avahi package is required.
 

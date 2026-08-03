@@ -294,10 +294,82 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
     },
     Err(err) => {
       tracing::warn!(%dest, error = %err, "Cast TCP unbound connect failed");
+      #[cfg(target_os = "macos")]
+      note_macos_local_network_diag(dest_ip, &err);
       Err(last_err.unwrap_or(err))
     },
   }
 }
+
+/// macOS `EHOSTUNREACH` raw OS error (BSD errno 65). Local Network denial surfaces as this
+/// on every LAN TCP connect while mDNS discovery still works via the system daemon.
+#[cfg(target_os = "macos")]
+const MACOS_EHOSTUNREACH: i32 = 65;
+
+/// True when observed EHOSTUNREACH failures match the macOS Local Network permission signature.
+///
+/// - `distinct_hosts`: distinct Cast destinations that hit OS error 65
+/// - `consecutive_on_host`: consecutive EHOSTUNREACH failures on the same destination
+///
+/// Broad signature only: a single powered-off device must not trigger the one-shot diagnostic.
+#[cfg(any(test, target_os = "macos"))]
+const fn macos_local_network_permission_signature(distinct_hosts: usize, consecutive_on_host: u32) -> bool {
+  distinct_hosts >= 2 || consecutive_on_host >= 3
+}
+
+/// Record a failed Cast dial on macOS; emit one process-lifetime error when the signature is broad.
+#[cfg(target_os = "macos")]
+fn note_macos_local_network_diag(dest: Ipv4Addr, err: &io::Error) {
+  let should_emit = {
+    let mut state = MACOS_LOCAL_NETWORK_DIAG.lock();
+    if err.raw_os_error() == Some(MACOS_EHOSTUNREACH) {
+      if !state.hosts_with_ehostunreach.contains(&dest) {
+        state.hosts_with_ehostunreach.push(dest);
+      }
+      if state.last_host == Some(dest) {
+        state.consecutive_on_host = state.consecutive_on_host.saturating_add(1);
+      } else {
+        state.last_host = Some(dest);
+        state.consecutive_on_host = 1;
+      }
+      macos_local_network_permission_signature(state.hosts_with_ehostunreach.len(), state.consecutive_on_host)
+    } else {
+      state.consecutive_on_host = 0;
+      state.last_host = None;
+      false
+    }
+  };
+
+  if !should_emit {
+    return;
+  }
+
+  MACOS_LOCAL_NETWORK_DIAG_ONCE.call_once(|| {
+    tracing::error!(
+      "every LAN connect fails with 'No route to host' while discovery works: this is the macOS \
+       Local Network permission. Fix: System Settings -> Privacy & Security -> Local Network -> \
+       enable the app hosting play-on-air (Terminal, iTerm, ...). If the app is not listed, run \
+       play-on-air once from Terminal.app so macOS shows the permission prompt."
+    );
+  });
+}
+
+#[cfg(target_os = "macos")]
+struct MacosLocalNetworkDiagState {
+  hosts_with_ehostunreach: Vec<Ipv4Addr>,
+  last_host: Option<Ipv4Addr>,
+  consecutive_on_host: u32,
+}
+
+#[cfg(target_os = "macos")]
+static MACOS_LOCAL_NETWORK_DIAG: Mutex<MacosLocalNetworkDiagState> = Mutex::new(MacosLocalNetworkDiagState {
+  hosts_with_ehostunreach: Vec::new(),
+  last_host: None,
+  consecutive_on_host: 0,
+});
+
+#[cfg(target_os = "macos")]
+static MACOS_LOCAL_NETWORK_DIAG_ONCE: Once = Once::new();
 
 /// Pre-dial Nest with multi-source bind, then expose a one-shot localhost TCP relay
 /// so `rust_cast` (which has no source-bind API) only dials `127.0.0.1`.
@@ -871,6 +943,22 @@ tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
     assert_eq!(count_ss_socket_lines(with_sock), 2);
     // -H (no header): only socket rows.
     assert_eq!(count_ss_socket_lines("tcp   ESTAB 0 0 0.0.0.0:7000 192.168.1.5:40000\n"), 1);
+  }
+
+  #[test]
+  fn macos_local_network_permission_signature_requires_broad_failure() {
+    // Single device, one or two hits: ordinary unreachability (powered off).
+    assert!(!macos_local_network_permission_signature(1, 1));
+    assert!(!macos_local_network_permission_signature(1, 2));
+    // Same device, three consecutive EHOSTUNREACH attempts.
+    assert!(macos_local_network_permission_signature(1, 3));
+    assert!(macos_local_network_permission_signature(1, 4));
+    // Two distinct discovered devices with errno 65.
+    assert!(macos_local_network_permission_signature(2, 1));
+    assert!(macos_local_network_permission_signature(3, 1));
+    // Empty / zero counters never fire.
+    assert!(!macos_local_network_permission_signature(0, 0));
+    assert!(!macos_local_network_permission_signature(0, 2));
   }
 
   #[test]
