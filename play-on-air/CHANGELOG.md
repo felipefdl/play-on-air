@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- AirPlay devices advertise a neutral `PlayOnAir1,1` model, so the iOS picker shows a speaker icon instead of an Apple TV.
+- macOS: when the Local Network permission is denied (discovery works but every Cast connection fails with "No route to host"), one clear error names the fix; the README documents the permission.
+
 ## 0.2.1
 
 - Fix: tearing down a stale AirPlay control connection no longer kills the active audio session (music died seconds after starting on 0.2.0).
