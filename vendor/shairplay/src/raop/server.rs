@@ -288,6 +288,8 @@ impl RaopServerBuilder {
             active_audio: std::sync::Mutex::new(None),
             #[cfg(feature = "ap2")]
             session_tasks: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "ap2")]
+            next_connection_id: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
             reported_volume_db: std::sync::Mutex::new(0.0),

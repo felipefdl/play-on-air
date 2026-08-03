@@ -25,6 +25,12 @@ pub(crate) struct RaopConnection {
     /// Cheap shared handle to server-wide config (identity, keys, handler, settings).
     /// Replaces the ~17 fields that were previously deep-copied into every connection.
     pub(crate) shared: Arc<crate::raop::connection::RaopShared>,
+    /// Monotonic id for this RTSP connection; owns active_audio / session tasks.
+    #[cfg(feature = "ap2")]
+    pub(crate) connection_id: u64,
+    /// Connection-local abort handles for TEARDOWN-scoped stop (dual-tracked globally).
+    #[cfg(feature = "ap2")]
+    pub(crate) session_tasks: Vec<tokio::task::AbortHandle>,
     // AirPlay 2 state
     #[cfg(feature = "ap2")]
     pub(crate) srp_server: Option<SrpServer>,
@@ -47,6 +53,27 @@ pub(crate) struct RaopConnection {
     pub(crate) eiv: Option<[u8; 16]>,
     #[cfg(feature = "hls")]
     pub(crate) hls_state: std::sync::Arc<std::sync::Mutex<crate::raop::hls::HlsState>>,
+}
+
+#[cfg(feature = "ap2")]
+impl RaopConnection {
+    /// Dual-track a detached task: connection-local (TEARDOWN) and global (server stop).
+    pub(crate) fn register_session_task(&mut self, handle: tokio::task::AbortHandle) {
+        self.shared.register_session_task_global(handle.clone());
+        self.session_tasks.push(handle);
+    }
+
+    /// Register active audio owned by this connection.
+    pub(crate) fn set_active_audio(&mut self, stop: Box<dyn FnOnce() + Send>) {
+        self.shared.set_active_audio(self.connection_id, stop);
+    }
+
+    /// TEARDOWN-scoped stop: active audio only if we own it, plus our local tasks.
+    /// Detach-only (no joins). Local AP1 RTP is stopped by the TEARDOWN handler separately.
+    pub(crate) fn stop_connection_sessions(&mut self) {
+        self.shared
+            .stop_connection_sessions(self.connection_id, &mut self.session_tasks);
+    }
 }
 
 /// Returns the connection's local IP address.

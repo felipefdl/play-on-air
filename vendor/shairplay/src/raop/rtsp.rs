@@ -305,11 +305,13 @@ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     }
 }
 
-/// TEARDOWN: stop RTP / AP2 sessions, close connection.
+/// TEARDOWN: stop RTP / AP2 sessions owned by **this** connection, then close.
 ///
-/// AP2 path uses the abort-safe hard-stop (sync active-audio stop, then abort
-/// session tasks) so buffered delivery and realtime UDP both exit. Clearing
-/// `playout_cmd` drops the async command channel handle on this connection.
+/// AP2 path uses connection-scoped stop (sync active-audio stop only when this
+/// connection owns it, then abort this connection's dual-tracked tasks). A
+/// parallel RC-only TEARDOWN must not murder another connection's live audio.
+/// Server-wide stop remains [`crate::raop::connection::RaopShared::hard_stop_sessions`].
+/// Clearing `playout_cmd` drops the async command channel handle on this connection.
 fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: &mut HttpResponse) -> Option<Vec<u8>> {
     response.add_header("Connection", "close");
     response.set_disconnect(true);
@@ -318,7 +320,7 @@ fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: 
     }
     #[cfg(feature = "ap2")]
     {
-        conn.shared.hard_stop_sessions();
+        conn.stop_connection_sessions();
         let _ = conn.playout_cmd.take();
     }
     None

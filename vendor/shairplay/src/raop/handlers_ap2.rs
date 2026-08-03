@@ -40,7 +40,7 @@ impl RaopConnection {
                 crate::raop::event_channel::EventChannel::handle_stream(stream, event_channel_cipher, rx).await;
             }
         });
-        self.shared.register_session_task(handle.abort_handle());
+        self.register_session_task(handle.abort_handle());
     }
 }
 
@@ -508,7 +508,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                         crate::raop::event_channel::EventChannel::handle_stream(stream, event_channel_cipher, rx).await;
                     }
                 });
-                conn.shared.register_session_task(handle.abort_handle());
+                conn.register_session_task(handle.abort_handle());
             }
             sender
         };
@@ -613,9 +613,9 @@ fn setup_stream_realtime(
             handler,
             output_config,
         ));
-        conn.shared.register_session_task(handle.abort_handle());
         let abort = handle.abort_handle();
-        conn.shared.set_active_audio(Box::new(move || abort.abort()));
+        conn.register_session_task(abort.clone());
+        conn.set_active_audio(Box::new(move || abort.abort()));
 
         stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     } else {
@@ -704,12 +704,12 @@ fn setup_stream_buffered(
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
     let (cmd_tx, playout_stop, aborts) = proc.start(shk_arr, output_config, handler);
     for h in aborts {
-        conn.shared.register_session_task(h);
+        conn.register_session_task(h);
     }
     conn.playout_cmd = Some(cmd_tx);
     // Sync stop so hard_stop / TEARDOWN unblocks the delivery thread before
     // aborting the command task (async PlayoutCommand::Stop is not abort-safe).
-    conn.shared.set_active_audio(Box::new(move || {
+    conn.set_active_audio(Box::new(move || {
         playout_stop.stop();
     }));
 
@@ -740,7 +740,7 @@ fn setup_stream_rc(
                     tracing::info!(%addr, "RC data channel client connected");
                 }
             });
-            conn.shared.register_session_task(handle.abort_handle());
+            conn.register_session_task(handle.abort_handle());
         }
 
         stream_resp.insert("streamID".into(), plist::Value::Integer(1_i64.into()));
