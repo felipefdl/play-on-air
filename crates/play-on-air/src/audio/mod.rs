@@ -1,6 +1,5 @@
 //! Audio buffers and lossless encode helpers (FLAC / WAV).
 
-pub mod decode_path;
 pub mod flac;
 pub mod pcm;
 pub mod wav;
