@@ -1341,6 +1341,7 @@ dependencies = [
  "mdns-sd",
  "parking_lot",
  "rust_cast",
+ "rustls",
  "serde",
  "serde_json",
  "shairplay",

@@ -15,8 +15,11 @@ const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CAST_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Short TCP SYN used only to warm ARP / routes during wake.
 const CAST_WAKE_TCP_TIMEOUT: Duration = Duration::from_millis(250);
-/// Read/write timeout on relay sockets so `rust_cast` cannot block forever.
-const CAST_RELAY_IO_TIMEOUT: Duration = Duration::from_secs(12);
+/// Read/write timeout on Cast control sockets so I/O cannot block forever.
+///
+/// Applied on both the device-facing relay half and the `rust_cast` TLS `TcpStream`
+/// (via a dual-owned clone used for `SO_RCVTIMEO` during idle drain).
+pub const CAST_RELAY_IO_TIMEOUT: Duration = Duration::from_secs(12);
 /// TCP keepalive idle before first probe on the device-facing Cast socket.
 const CAST_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 /// TCP keepalive probe interval.

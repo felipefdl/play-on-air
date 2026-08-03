@@ -71,6 +71,12 @@ const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// Max unsolicited `receive()` calls drained per idle tick.
 const UNSOLICITED_DRAIN_LIMIT: u32 = 8;
 
+/// `SO_RCVTIMEO` for idle drain reads on the **real** `rust_cast` TCP socket (must be ≤100 ms).
+///
+/// Applied via a dual-owned `TcpStream` clone of the TLS underlying socket — not the
+/// relay's peer end (that never affected `CastDevice::receive`).
+const DRAIN_READ_TIMEOUT: Duration = Duration::from_millis(50);
+
 /// Whether our Cast media transport is still listed among receiver applications.
 #[must_use]
 pub(crate) fn cast_transport_still_owned(applications_transport_ids: &[&str], ours: &str) -> bool {
@@ -612,7 +618,7 @@ struct WorkerState {
   hostname: String,
   port: u16,
   /// Live Cast device; never leaves this thread (`Rc` inside `rust_cast`).
-  device: Option<rust_cast::CastDevice<'static>>,
+  device: Option<WarmCastDevice>,
   /// Media session after a successful warm LOAD.
   active: Option<ActiveCastSession>,
   /// When `active` was last set by a successful LOAD (ownership grace clock).
@@ -1120,73 +1126,68 @@ impl WorkerState {
 
   /// Drain `rust_cast`'s internal buffer: answer PINGs, note `MEDIA_STATUS`, discard rest.
   ///
-  /// Uses a short client read timeout so an empty buffer does not block for the full
-  /// relay I/O timeout (messages already in `rust_cast`'s buffer return immediately).
+  /// Uses a short `SO_RCVTIMEO` on the **TLS underlying `TcpStream`** (dual-owned clone)
+  /// so an empty socket cannot block for the full command I/O timeout. RAII restores
+  /// the command timeout even if the drain exits early.
   fn drain_unsolicited(&mut self) {
-    if self.device.is_none() {
-      return;
-    }
-    // Short timeout only for this drain; restore afterward.
-    if let Ok(slot) = self.relay_slot.lock()
-      && let Some(relay) = slot.as_ref()
-    {
-      relay.set_client_read_timeout(Some(Duration::from_millis(50)));
-    }
-
-    for _ in 0..UNSOLICITED_DRAIN_LIMIT {
+    let parse_warn = {
       let Some(device) = self.device.as_ref() else {
-        break;
+        return;
       };
-      match device.receive() {
-        Ok(rust_cast::ChannelMessage::Heartbeat(hb)) => {
-          use rust_cast::channels::heartbeat::HeartbeatResponse;
-          if matches!(hb, HeartbeatResponse::Ping)
-            && let Err(err) = device.heartbeat.pong()
-          {
-            tracing::debug!(device_id = %self.device_id, error = %err, "Cast pong failed");
-            break;
-          }
-        },
-        Ok(rust_cast::ChannelMessage::Media(media_msg)) => {
-          tracing::debug!(device_id = %self.device_id, ?media_msg, "Cast unsolicited media message");
-        },
-        Ok(other) => {
-          tracing::debug!(device_id = %self.device_id, msg = ?other, "Cast unsolicited message drained");
-        },
-        Err(err) => {
-          match classify_cast_probe_error(&err) {
-            ProbeFailureKind::Transport => {
-              // Short-timeout idle is expected when nothing is pending/buffered.
-              let msg = err.to_string();
-              if msg.contains("timed out")
-                || msg.contains("os error 35")
-                || msg.contains("os error 60")
-                || msg.contains("WouldBlock")
-                || msg.contains("Resource temporarily unavailable")
-                || msg.contains("Interrupted")
-              {
-                break;
-              }
-              tracing::debug!(
-                device_id = %self.device_id,
-                error = %err,
-                "Cast receive transport error while draining"
-              );
-              break;
-            },
-            ProbeFailureKind::Parse => {
-              self.warn_parse_once(&err.to_string());
-              break;
-            },
-          }
-        },
-      }
-    }
+      // Binds timeout for the duration of this block (including all receive calls).
+      let _timeout_guard = device.begin_short_read(DRAIN_READ_TIMEOUT);
+      let mut parse_warn: Option<String> = None;
 
-    if let Ok(slot) = self.relay_slot.lock()
-      && let Some(relay) = slot.as_ref()
-    {
-      relay.restore_client_read_timeout();
+      for _ in 0..UNSOLICITED_DRAIN_LIMIT {
+        match device.receive() {
+          Ok(rust_cast::ChannelMessage::Heartbeat(hb)) => {
+            use rust_cast::channels::heartbeat::HeartbeatResponse;
+            if matches!(hb, HeartbeatResponse::Ping)
+              && let Err(err) = device.heartbeat.pong()
+            {
+              tracing::debug!(device_id = %self.device_id, error = %err, "Cast pong failed");
+              break;
+            }
+          },
+          Ok(rust_cast::ChannelMessage::Media(media_msg)) => {
+            tracing::debug!(device_id = %self.device_id, ?media_msg, "Cast unsolicited media message");
+          },
+          Ok(other) => {
+            tracing::debug!(device_id = %self.device_id, msg = ?other, "Cast unsolicited message drained");
+          },
+          Err(err) => {
+            match classify_cast_probe_error(&err) {
+              ProbeFailureKind::Transport => {
+                // Short-timeout idle is expected when nothing is pending/buffered.
+                let msg = err.to_string();
+                if msg.contains("timed out")
+                  || msg.contains("os error 35")
+                  || msg.contains("os error 60")
+                  || msg.contains("WouldBlock")
+                  || msg.contains("Resource temporarily unavailable")
+                  || msg.contains("Interrupted")
+                {
+                  break;
+                }
+                tracing::debug!(
+                  device_id = %self.device_id,
+                  error = %err,
+                  "Cast receive transport error while draining"
+                );
+                break;
+              },
+              ProbeFailureKind::Parse => {
+                parse_warn = Some(err.to_string());
+                break;
+              },
+            }
+          },
+        }
+      }
+      parse_warn
+    };
+    if let Some(msg) = parse_warn {
+      self.warn_parse_once(&msg);
     }
   }
 
@@ -1754,13 +1755,16 @@ struct MediaProbe {
 }
 
 /// Connect via source-bound TCP + localhost relay; install shutdown into `relay_slot`.
-fn connect_cast_device(host: &str, port: u16, relay_slot: &SharedRelaySlot) -> Result<rust_cast::CastDevice<'static>> {
+///
+/// Builds a [`WarmCastDevice`] with a dual-owned TCP handle so idle drain can set
+/// `SO_RCVTIMEO` on the socket that `receive()` actually reads (not the relay peer).
+fn connect_cast_device(host: &str, port: u16, relay_slot: &SharedRelaySlot) -> Result<WarmCastDevice> {
   let (relay_host, relay_port, shutdown) = crate::net::spawn_cast_connect_relay(host, port)
     .map_err(|err| Error::Cast(format!("connect {host}:{port}: {err}")))?;
   if let Ok(mut slot) = relay_slot.lock() {
     *slot = Some(shutdown);
   }
-  rust_cast::CastDevice::connect_without_host_verification("127.0.0.1", relay_port).map_err(|err| {
+  WarmCastDevice::connect_local_relay(relay_port).map_err(|err| {
     // Connect failed after relay up — shut it down.
     if let Ok(mut slot) = relay_slot.lock()
       && let Some(relay) = slot.take()
@@ -1771,6 +1775,119 @@ fn connect_cast_device(host: &str, port: u16, relay_slot: &SharedRelaySlot) -> R
       "connect {host}:{port} (via local relay {relay_host}:{relay_port}): {err}"
     ))
   })
+}
+
+type CastTlsStream = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
+
+/// Cast control-plane client with a dual-owned TCP handle for `SO_RCVTIMEO` control.
+///
+/// Mirrors `rust_cast::CastDevice` (public channel constructors + `MessageManager`) so
+/// we can set read timeouts on the same kernel socket the TLS `receive()` path uses.
+/// `CastDevice`'s internal stream is private, so the stock connect path cannot do this.
+struct WarmCastDevice {
+  /// Shared by channels; also used by [`Self::receive`].
+  message_manager: std::rc::Rc<rust_cast::message_manager::MessageManager<CastTlsStream>>,
+  connection: rust_cast::channels::connection::ConnectionChannel<'static, CastTlsStream>,
+  heartbeat: rust_cast::channels::heartbeat::HeartbeatChannel<'static, CastTlsStream>,
+  media: rust_cast::channels::media::MediaChannel<'static, CastTlsStream>,
+  receiver: rust_cast::channels::receiver::ReceiverChannel<'static, CastTlsStream>,
+  /// Clone of the raw TCP socket under the TLS stream; `SO_RCVTIMEO` applies to both.
+  tcp_for_timeout: std::net::TcpStream,
+}
+
+/// RAII: short `SO_RCVTIMEO` for drain, always restore command I/O timeout on drop.
+struct ShortReadTimeout<'a> {
+  tcp: &'a std::net::TcpStream,
+  restore: Duration,
+}
+
+impl Drop for ShortReadTimeout<'_> {
+  fn drop(&mut self) {
+    if let Err(err) = self.tcp.set_read_timeout(Some(self.restore)) {
+      tracing::debug!(error = %err, "restore Cast read timeout failed");
+    }
+  }
+}
+
+impl WarmCastDevice {
+  /// TLS connect to the localhost Cast relay without host verification (same posture as
+  /// `CastDevice::connect_without_host_verification`), keeping a dual-owned TCP clone.
+  fn connect_local_relay(relay_port: u16) -> std::result::Result<Self, String> {
+    use rust_cast::NoCertificateVerification;
+    use rust_cast::channels::connection::ConnectionChannel;
+    use rust_cast::channels::heartbeat::HeartbeatChannel;
+    use rust_cast::channels::media::MediaChannel;
+    use rust_cast::channels::receiver::ReceiverChannel;
+    use rust_cast::message_manager::MessageManager;
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, ClientConnection, StreamOwned};
+    use std::net::TcpStream;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let tcp = TcpStream::connect(("127.0.0.1", relay_port)).map_err(|err| format!("tcp connect: {err}"))?;
+    tcp
+      .set_read_timeout(Some(crate::net::CAST_RELAY_IO_TIMEOUT))
+      .map_err(|err| format!("set_read_timeout: {err}"))?;
+    tcp
+      .set_write_timeout(Some(crate::net::CAST_RELAY_IO_TIMEOUT))
+      .map_err(|err| format!("set_write_timeout: {err}"))?;
+    let tcp_for_timeout = tcp.try_clone().map_err(|err| format!("tcp try_clone: {err}"))?;
+
+    let config = ClientConfig::builder()
+      .dangerous()
+      .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+      .with_no_client_auth();
+    let server_name = ServerName::try_from("127.0.0.1")
+      .map_err(|err| format!("server name: {err}"))?
+      .to_owned();
+    let conn = ClientConnection::new(Arc::new(config), server_name).map_err(|err| format!("tls client: {err}"))?;
+    let ssl = StreamOwned::new(conn, tcp);
+
+    let message_manager = Rc::new(MessageManager::new(ssl));
+    let connection = ConnectionChannel::new("sender-0", Rc::clone(&message_manager));
+    let heartbeat = HeartbeatChannel::new("sender-0", "receiver-0", Rc::clone(&message_manager));
+    let receiver = ReceiverChannel::new("sender-0", "receiver-0", Rc::clone(&message_manager));
+    let media = MediaChannel::new("sender-0", Rc::clone(&message_manager));
+
+    Ok(Self {
+      message_manager,
+      connection,
+      heartbeat,
+      media,
+      receiver,
+      tcp_for_timeout,
+    })
+  }
+
+  /// Temporarily set `SO_RCVTIMEO` for idle drain; restores command timeout on drop.
+  fn begin_short_read(&self, timeout: Duration) -> ShortReadTimeout<'_> {
+    if let Err(err) = self.tcp_for_timeout.set_read_timeout(Some(timeout)) {
+      tracing::debug!(error = %err, "set Cast drain read timeout failed");
+    }
+    ShortReadTimeout {
+      tcp: &self.tcp_for_timeout,
+      restore: crate::net::CAST_RELAY_IO_TIMEOUT,
+    }
+  }
+
+  /// Same dispatch as `rust_cast::CastDevice::receive`.
+  fn receive(&self) -> std::result::Result<rust_cast::ChannelMessage, rust_cast::errors::Error> {
+    let cast_message = self.message_manager.receive()?;
+    if self.connection.can_handle(&cast_message) {
+      return Ok(rust_cast::ChannelMessage::Connection(self.connection.parse(&cast_message)?));
+    }
+    if self.heartbeat.can_handle(&cast_message) {
+      return Ok(rust_cast::ChannelMessage::Heartbeat(self.heartbeat.parse(&cast_message)?));
+    }
+    if self.media.can_handle(&cast_message) {
+      return Ok(rust_cast::ChannelMessage::Media(self.media.parse(&cast_message)?));
+    }
+    if self.receiver.can_handle(&cast_message) {
+      return Ok(rust_cast::ChannelMessage::Receiver(self.receiver.parse(&cast_message)?));
+    }
+    Ok(rust_cast::ChannelMessage::Raw(cast_message))
+  }
 }
 
 fn short_id(device_id: &str) -> &str {
@@ -1879,6 +1996,77 @@ mod tests {
       reload_attempted: false,
       load_within_guard: false,
     }
+  }
+
+  #[test]
+  fn drain_read_timeout_is_at_most_100ms() {
+    assert!(
+      DRAIN_READ_TIMEOUT <= Duration::from_millis(100),
+      "idle drain SO_RCVTIMEO must be ≤100ms (got {DRAIN_READ_TIMEOUT:?})"
+    );
+    assert!(
+      DRAIN_READ_TIMEOUT < crate::net::CAST_RELAY_IO_TIMEOUT,
+      "drain timeout must be far below the 12s command I/O timeout"
+    );
+  }
+
+  /// Silent peer: short `SO_RCVTIMEO` on the **client** socket must return fast
+  /// (the pre-fix path set the relay peer end, which never bounded `receive()`).
+  #[test]
+  fn silent_socket_short_read_timeout_completes_fast() {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    // Accept but never write — models empty Cast idle drain.
+    let _acceptor = std::thread::spawn(move || {
+      let (_stream, _) = listener.accept().expect("accept");
+      std::thread::sleep(Duration::from_secs(30));
+    });
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client.set_read_timeout(Some(DRAIN_READ_TIMEOUT)).expect("set_read_timeout");
+    // Dual-owned clone (same as WarmCastDevice::tcp_for_timeout).
+    let timeout_handle = client.try_clone().expect("clone");
+    timeout_handle
+      .set_read_timeout(Some(DRAIN_READ_TIMEOUT))
+      .expect("clone set_read_timeout");
+
+    let start = Instant::now();
+    let mut buf = [0_u8; 1];
+    let result = client.read(&mut buf);
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "silent socket should not yield data, got {result:?}");
+    // Bound well under the old 12s relay I/O timeout and the 30s hard deadline.
+    assert!(
+      elapsed < Duration::from_secs(2),
+      "short SO_RCVTIMEO on client socket must complete fast, took {elapsed:?}"
+    );
+
+    // RAII restore pattern: after short drain, restore command timeout.
+    {
+      let _guard = ShortReadTimeout {
+        tcp: &timeout_handle,
+        restore: crate::net::CAST_RELAY_IO_TIMEOUT,
+      };
+    }
+    let restored = timeout_handle.read_timeout().expect("get timeout");
+    assert_eq!(
+      restored,
+      Some(crate::net::CAST_RELAY_IO_TIMEOUT),
+      "ShortReadTimeout Drop must restore CAST_RELAY_IO_TIMEOUT"
+    );
+  }
+
+  #[test]
+  fn heartbeat_interval_is_about_four_seconds() {
+    assert_eq!(
+      HEARTBEAT_INTERVAL,
+      Duration::from_secs(4),
+      "PING cadence must stay ~4s after idle-drain fix"
+    );
   }
 
   #[test]
