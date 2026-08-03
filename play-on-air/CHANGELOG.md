@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.12
+
+- AirPlay volume UI: report Cast/Nest level on `GET_PARAMETER` (no hardcoded 100%); seed from warm Cast and after LOAD. Still preserve device volume on stream start.
+
 ## 0.1.11
 
 - After Cast load, ignore stale AirPlay pause events (grace window + ring still has PCM) so re-cast after Hey Google steal is not immediately Cast-PAUSEd into silence.

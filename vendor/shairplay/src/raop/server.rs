@@ -268,6 +268,7 @@ impl RaopServerBuilder {
             session_tasks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
+            reported_volume_db: std::sync::Mutex::new(0.0),
         });
 
         let mut httpd = HttpServer::new(shared.clone(), self.max_clients);
@@ -284,6 +285,14 @@ impl RaopServerBuilder {
             mode: self.mode,
         })
     }
+}
+
+/// Clamp an AirPlay volume to the wire range (`-144.0..=0.0`).
+fn clamp_airplay_volume_db(volume_db: f32) -> f32 {
+    if !volume_db.is_finite() {
+        return 0.0;
+    }
+    volume_db.clamp(super::connection::AIRPLAY_VOLUME_DB_MIN, 0.0)
 }
 
 /// The main AirPlay/RAOP server.
@@ -306,6 +315,22 @@ impl RaopServer {
     /// Create a new server builder.
     pub fn builder() -> RaopServerBuilder {
         RaopServerBuilder::new()
+    }
+
+    /// Volume reported by `GET_PARAMETER volume` (AirPlay dB: `0.0` = max, `-144.0` = mute).
+    ///
+    /// Hosts should set this from the physical sink so clients show the real device level
+    /// instead of always advertising max.
+    pub fn set_reported_volume_db(&self, volume_db: f32) {
+        let clamped = clamp_airplay_volume_db(volume_db);
+        if let Ok(mut guard) = self.shared.reported_volume_db.lock() {
+            *guard = clamped;
+        }
+    }
+
+    /// Current reported AirPlay volume in dB (`0.0` if the lock is poisoned).
+    pub fn reported_volume_db(&self) -> f32 {
+        self.shared.reported_volume_db.lock().map(|guard| *guard).unwrap_or(0.0)
     }
 
     /// Start the server: bind ports, register mDNS services, begin accepting connections.

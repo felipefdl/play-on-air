@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-use crate::airplay::{AirPlaySessionEvent, airplay_db_to_cast_linear};
+use crate::airplay::{AirPlayManager, AirPlaySessionEvent, airplay_db_to_cast_linear, cast_linear_to_airplay_db};
 use crate::audio::{PcmRing, encode_pcm_i16_to_flac};
 use crate::cast::{CastPool, CastStreamKind, MediaLoadRequest};
 use crate::error::{Error, Result};
@@ -214,6 +214,8 @@ pub const fn session_end_steps() -> [SessionEndStep; 2] {
 pub struct Bridge {
   registry: Arc<DeviceRegistry>,
   cast_pool: Arc<CastPool>,
+  /// Optional AirPlay manager for seeding `GET_PARAMETER volume` from Cast after LOAD.
+  airplay: Option<Arc<AirPlayManager>>,
   sessions: Mutex<HashMap<String, ActiveSession>>,
   /// Optional barrier waited once at the start of each `handle_session_start`.
   ///
@@ -226,6 +228,7 @@ impl std::fmt::Debug for Bridge {
     f.debug_struct("Bridge")
       .field("registry", &self.registry)
       .field("cast_pool", &self.cast_pool)
+      .field("airplay", &self.airplay.is_some())
       .field("active_sessions", &self.sessions.lock().len())
       .finish_non_exhaustive()
   }
@@ -237,9 +240,17 @@ impl Bridge {
     Self {
       registry,
       cast_pool,
+      airplay: None,
       sessions: Mutex::new(HashMap::new()),
       start_barrier: Mutex::new(None),
     }
+  }
+
+  /// Attach the AirPlay manager so successful Cast LOAD can refresh reported volume.
+  #[must_use]
+  pub fn with_airplay(mut self, airplay: Arc<AirPlayManager>) -> Self {
+    self.airplay = Some(airplay);
+    self
   }
 
   /// Install a barrier that each session start waits on once (tests only).
@@ -392,8 +403,11 @@ impl Bridge {
           %stream_url,
           "bridge session Cast BUFFERED WAV load ok"
         );
+        // Nest remains source of truth on LOAD (PreserveDevice). Seed AirPlay reported
+        // volume + rollover last_volume from the device so the iOS slider matches.
+        let cast_linear = self.sync_reported_volume_after_load(device_id).await;
         let session_alive = Arc::new(AtomicBool::new(true));
-        let last_volume_linear = Arc::new(Mutex::new(None));
+        let last_volume_linear = Arc::new(Mutex::new(cast_linear));
         let inflight_load = Arc::new(Mutex::new(None));
         let (rollover_cancel, rollover_task) = spawn_rollover_reload_loop(
           device_id.to_owned(),
@@ -444,6 +458,34 @@ impl Bridge {
         Err(err)
       },
     }
+  }
+
+  /// Read Cast volume after LOAD and refresh AirPlay `GET_PARAMETER` if a manager is attached.
+  async fn sync_reported_volume_after_load(&self, device_id: &str) -> Option<f32> {
+    let pool = Arc::clone(&self.cast_pool);
+    let id = device_id.to_owned();
+    let level = match tokio::task::spawn_blocking(move || pool.get_volume(&id)).await {
+      Ok(Ok(level)) => level,
+      Ok(Err(err)) => {
+        tracing::debug!(%device_id, error = %err, "Cast get_volume after LOAD failed");
+        return None;
+      },
+      Err(err) => {
+        tracing::debug!(%device_id, error = %err, "Cast get_volume task join failed");
+        return None;
+      },
+    };
+    let db = cast_linear_to_airplay_db(level);
+    if let Some(airplay) = &self.airplay {
+      airplay.set_reported_volume_db(device_id, db);
+    }
+    tracing::info!(
+      %device_id,
+      cast_linear = level,
+      airplay_db = db,
+      "synced AirPlay reported volume from Cast"
+    );
+    Some(level)
   }
 
   /// End the bridge session for `device_id` if any (media down + Cast STOP best-effort).
@@ -860,7 +902,7 @@ pub trait RingLookup: Send + Sync {
   fn ring_for(&self, device_id: &str) -> Option<Arc<PcmRing>>;
 }
 
-impl RingLookup for crate::airplay::AirPlayManager {
+impl RingLookup for AirPlayManager {
   fn ring_for(&self, device_id: &str) -> Option<Arc<PcmRing>> {
     self.pcm_ring(device_id)
   }

@@ -348,7 +348,7 @@ pub(crate) fn handle_record(
 
 /// RTSP GET_PARAMETER: return volume or other parameters.
 pub(crate) fn handle_get_parameter(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
@@ -360,8 +360,9 @@ pub(crate) fn handle_get_parameter(
     let data = request.data()?;
     let text = std::str::from_utf8(data).ok()?;
     if text.contains("volume") {
+        let volume = conn.shared.reported_volume_db.lock().map(|guard| *guard).unwrap_or(0.0);
         response.add_header("Content-Type", "text/parameters");
-        return Some(b"volume: 0.000000\r\n".to_vec());
+        return Some(format!("volume: {volume:.6}\r\n").into_bytes());
     }
     None
 }
@@ -385,6 +386,9 @@ pub(crate) fn handle_set_parameter(
             let text = std::str::from_utf8(data).ok()?;
             if let Some(rest) = text.strip_prefix("volume: ") {
                 if let Ok(vol) = rest.trim().parse::<f32>() {
+                    if let Ok(mut guard) = conn.shared.reported_volume_db.lock() {
+                        *guard = vol.clamp(crate::raop::connection::AIRPLAY_VOLUME_DB_MIN, 0.0);
+                    }
                     conn.shared.handler.on_volume(vol);
                 }
             } else if let Some(rest) = text.strip_prefix("progress: ") {
@@ -446,6 +450,7 @@ mod tests {
             handler,
             output_sample_rate: None,
             output_max_channels: None,
+            reported_volume_db: std::sync::Mutex::new(0.0),
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {

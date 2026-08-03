@@ -13,6 +13,9 @@ use crate::proto::http::{HttpRequest, HttpResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Minimum AirPlay volume in dB (`GET_PARAMETER` / `SET_PARAMETER`). Mute floor.
+pub(crate) const AIRPLAY_VOLUME_DB_MIN: f32 = -144.0;
+
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
     pub(crate) rsakey: Arc<RsaKey>,
@@ -57,6 +60,11 @@ pub(crate) struct RaopShared {
     pub(crate) session_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     #[cfg(feature = "hls")]
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
+    /// Volume reported by `GET_PARAMETER volume` (AirPlay dB: `0.0` = max, `-144.0` = mute).
+    ///
+    /// Hosts may set this from the physical sink so the iOS slider matches device volume
+    /// instead of always advertising max (`0.0`).
+    pub(crate) reported_volume_db: std::sync::Mutex<f32>,
 }
 
 #[cfg(feature = "ap2")]

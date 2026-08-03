@@ -299,6 +299,8 @@ pub struct AirPlayReceiver {
   pub port: u16,
   state: Arc<DeviceAudioState>,
   server: RaopServer,
+  /// True after reported volume was seeded from Cast (host path).
+  volume_seeded_from_cast: AtomicBool,
 }
 
 impl std::fmt::Debug for AirPlayReceiver {
@@ -355,6 +357,7 @@ impl AirPlayReceiver {
       port,
       state,
       server,
+      volume_seeded_from_cast: AtomicBool::new(false),
     })
   }
 
@@ -372,6 +375,24 @@ impl AirPlayReceiver {
       .map_err(|err| Error::AirPlay(format!("start {}: {err}", self.name)))?;
     tracing::info!(device_id = %self.device_id, name = %self.name, "AirPlay 2 receiver started");
     Ok(())
+  }
+
+  /// Seed the dB value returned by AirPlay `GET_PARAMETER volume` (clamped by shairplay).
+  ///
+  /// Marks the receiver as seeded so maintain stops re-querying Cast.
+  pub fn set_reported_volume_db(&self, volume_db: f32) {
+    self.server.set_reported_volume_db(volume_db);
+    self.volume_seeded_from_cast.store(true, Ordering::Relaxed);
+  }
+
+  /// Current reported AirPlay volume in dB (`0.0` = max until seeded from Cast).
+  pub fn reported_volume_db(&self) -> f32 {
+    self.server.reported_volume_db()
+  }
+
+  /// Whether reported volume has been seeded from Cast (or host) at least once.
+  pub fn volume_seeded_from_cast(&self) -> bool {
+    self.volume_seeded_from_cast.load(Ordering::Relaxed)
   }
 
   /// Stop mDNS + accept loop, then force-close live RTSP sockets on this port.
@@ -518,6 +539,27 @@ impl AirPlayManager {
   pub fn pcm_ring(&self, device_id: &str) -> Option<Arc<PcmRing>> {
     self.receivers.lock().get(device_id).map(AirPlayReceiver::ring)
   }
+
+  /// Set the AirPlay `GET_PARAMETER volume` value for an advertised device (no-op if unknown).
+  pub fn set_reported_volume_db(&self, device_id: &str, volume_db: f32) {
+    if let Some(rx) = self.receivers.lock().get(device_id) {
+      rx.set_reported_volume_db(volume_db);
+    }
+  }
+
+  /// Reported AirPlay volume for `device_id`, if advertised.
+  pub fn reported_volume_db(&self, device_id: &str) -> Option<f32> {
+    self.receivers.lock().get(device_id).map(AirPlayReceiver::reported_volume_db)
+  }
+
+  /// Whether `device_id` still needs a Cast volume seed for `GET_PARAMETER`.
+  pub fn needs_volume_seed(&self, device_id: &str) -> bool {
+    self
+      .receivers
+      .lock()
+      .get(device_id)
+      .is_some_and(|rx| !rx.volume_seeded_from_cast())
+  }
 }
 
 /// Stable 6-byte MAC derived from `device_id` with locally administered unicast bits.
@@ -572,9 +614,14 @@ fn format_hwaddr(mac: [u8; 6]) -> String {
   format!("{b0:02x}:{b1:02x}:{b2:02x}:{b3:02x}:{b4:02x}:{b5:02x}")
 }
 
+/// AirPlay mute floor in dB (`GET_PARAMETER` / `SET_PARAMETER`).
+const AIRPLAY_VOLUME_DB_MIN: f32 = -144.0;
+/// Floor for `log10` when mapping near-silent Cast levels to AirPlay dB.
+const CAST_LINEAR_LOG_EPS: f32 = 1.0e-7;
+
 /// Map AirPlay volume (dB, 0 = max, -144 = mute) to Cast linear `0.0..=1.0`.
 pub fn airplay_db_to_cast_linear(volume_db: f32) -> f32 {
-  if volume_db <= -144.0 {
+  if volume_db <= AIRPLAY_VOLUME_DB_MIN {
     return 0.0;
   }
   if volume_db >= 0.0 {
@@ -583,6 +630,21 @@ pub fn airplay_db_to_cast_linear(volume_db: f32) -> f32 {
   // Approximate amplitude: 10^(dB/20).
   let linear = 10_f32.powf(volume_db / 20.0);
   linear.clamp(0.0, 1.0)
+}
+
+/// Map Cast linear volume (`0.0..=1.0`) to AirPlay dB (`0.0` = max, `-144.0` = mute).
+///
+/// Inverse of [`airplay_db_to_cast_linear`] for the amplitude path (`20 * log10(level)`).
+pub fn cast_linear_to_airplay_db(level: f32) -> f32 {
+  if !level.is_finite() || level <= 0.0 {
+    return AIRPLAY_VOLUME_DB_MIN;
+  }
+  if level >= 1.0 {
+    return 0.0;
+  }
+  let clamped = level.clamp(CAST_LINEAR_LOG_EPS, 1.0);
+  let db = 20.0 * clamped.log10();
+  db.clamp(AIRPLAY_VOLUME_DB_MIN, 0.0)
 }
 
 #[cfg(test)]
@@ -615,6 +677,25 @@ mod tests {
     assert!((airplay_db_to_cast_linear(-144.0) - 0.0).abs() < f32::EPSILON);
     let mid = airplay_db_to_cast_linear(-6.0);
     assert!(mid > 0.4 && mid < 0.6);
+  }
+
+  #[test]
+  fn cast_linear_to_airplay_db_bounds() {
+    assert!((cast_linear_to_airplay_db(0.0) - AIRPLAY_VOLUME_DB_MIN).abs() < f32::EPSILON);
+    assert!((cast_linear_to_airplay_db(1.0) - 0.0).abs() < f32::EPSILON);
+    let mid = cast_linear_to_airplay_db(0.5);
+    assert!((mid - (-6.020_6)).abs() < 0.01);
+  }
+
+  #[test]
+  fn cast_linear_airplay_db_roundtrip_mid() {
+    for level in [0.1_f32, 0.25, 0.5, 0.75, 0.9] {
+      let db = cast_linear_to_airplay_db(level);
+      let back = airplay_db_to_cast_linear(db);
+      assert!((back - level).abs() < 1.0e-5, "level={level} db={db} back={back}");
+    }
+    assert!((airplay_db_to_cast_linear(cast_linear_to_airplay_db(0.0)) - 0.0).abs() < f32::EPSILON);
+    assert!((airplay_db_to_cast_linear(cast_linear_to_airplay_db(1.0)) - 1.0).abs() < f32::EPSILON);
   }
 
   #[test]

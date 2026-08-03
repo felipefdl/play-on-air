@@ -18,10 +18,18 @@ use crate::registry::Device;
 
 use super::{ActiveCastSession, MediaLoadRequest, media_session_id_from_status, volume_level_clamped};
 
+/// Map Cast `Volume` from `get_status` to linear `0.0..=1.0` (muted → `0.0`).
+fn volume_from_cast_status(volume: rust_cast::channels::receiver::Volume) -> f32 {
+  if volume.muted.unwrap_or(false) {
+    return 0.0;
+  }
+  volume_level_clamped(volume.level.unwrap_or(0.0))
+}
+
 /// Heartbeat interval on the warm control-plane connection.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 
-/// Wall-clock wait for a worker reply to `Load` / `SetVolume` / `Stop`.
+/// Wall-clock wait for a worker reply to `Load` / `SetVolume` / `GetVolume` / `Stop`.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Best-effort wait when joining a worker after `Shutdown`.
@@ -100,6 +108,8 @@ enum CastWorkerCmd {
     level: f32,
     reply: SyncSender<Result<()>>,
   },
+  /// Read receiver volume from `get_status` on the warm connection (linear `0.0..=1.0`).
+  GetVolume { reply: SyncSender<Result<f32>> },
   /// Stop active media session (if any); keep TCP warm.
   Stop { reply: SyncSender<Result<()>> },
   /// Pause active media session (keep session id for later PLAY).
@@ -283,6 +293,21 @@ impl CastPool {
     }
   }
 
+  /// Read current receiver volume on the warm connection (`0.0..=1.0`; muted → `0.0`).
+  pub fn get_volume(&self, device_id: &str) -> Result<f32> {
+    let tx = self.cmd_tx(device_id)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::GetVolume { reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast get_volume timed out for {device_id}"))),
+      Err(RecvTimeoutError::Disconnected) => {
+        Err(Error::Cast(format!("warm Cast get_volume reply dropped for {device_id}")))
+      },
+    }
+  }
+
   /// Stop the active media session on the warm connection (no-op if no session).
   pub fn stop(&self, device_id: &str) -> Result<()> {
     let tx = self.cmd_tx(device_id)?;
@@ -447,6 +472,10 @@ fn worker_main(
       },
       Ok(CastWorkerCmd::SetVolume { level, reply }) => {
         let result = state.handle_set_volume(level);
+        drop(reply.send(result));
+      },
+      Ok(CastWorkerCmd::GetVolume { reply }) => {
+        let result = state.handle_get_volume();
         drop(reply.send(result));
       },
       Ok(CastWorkerCmd::Stop { reply }) => {
@@ -840,6 +869,39 @@ impl WorkerState {
     Ok(())
   }
 
+  /// Read linear volume from `receiver.get_status()` (muted → `0.0`). Retries once on failure.
+  fn handle_get_volume(&mut self) -> Result<f32> {
+    if self.device.is_none() {
+      self.ensure_connected(true)?;
+    }
+    let first_err = {
+      let device = self
+        .device
+        .as_ref()
+        .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
+      match device.receiver.get_status() {
+        Ok(status) => return Ok(volume_from_cast_status(status.volume)),
+        Err(err) => err,
+      }
+    };
+    tracing::warn!(
+      device_id = %self.device_id,
+      error = %first_err,
+      "warm Cast get_volume failed; reconnecting once"
+    );
+    self.drop_device();
+    self.ensure_connected(true)?;
+    let device = self
+      .device
+      .as_ref()
+      .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
+    let status = device
+      .receiver
+      .get_status()
+      .map_err(|e| Error::Cast(format!("warm get volume: {e}")))?;
+    Ok(volume_from_cast_status(status.volume))
+  }
+
   fn handle_stop(&mut self) -> Result<()> {
     let Some(session) = self.active.take() else {
       return Ok(());
@@ -1074,5 +1136,21 @@ mod tests {
   fn remove_unknown_is_ok() {
     let pool = CastPool::new(None);
     pool.remove("never-existed");
+  }
+
+  #[test]
+  fn volume_from_cast_status_muted_is_zero() {
+    let muted = rust_cast::channels::receiver::Volume { level: Some(0.8), muted: Some(true) };
+    assert!((volume_from_cast_status(muted) - 0.0).abs() < f32::EPSILON);
+  }
+
+  #[test]
+  fn volume_from_cast_status_level_clamped() {
+    let high = rust_cast::channels::receiver::Volume { level: Some(1.5), muted: Some(false) };
+    assert!((volume_from_cast_status(high) - 1.0).abs() < f32::EPSILON);
+    let mid = rust_cast::channels::receiver::Volume { level: Some(0.42), muted: None };
+    assert!((volume_from_cast_status(mid) - 0.42).abs() < f32::EPSILON);
+    let missing = rust_cast::channels::receiver::Volume { level: None, muted: None };
+    assert!((volume_from_cast_status(missing) - 0.0).abs() < f32::EPSILON);
   }
 }

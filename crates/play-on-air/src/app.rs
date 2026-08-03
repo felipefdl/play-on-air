@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 
-use crate::airplay::{AirPlayManager, AirPlaySessionEvent};
+use crate::airplay::{AirPlayManager, AirPlaySessionEvent, cast_linear_to_airplay_db};
 use crate::bridge::Bridge;
 use crate::cast::CastPool;
 use crate::config::Config;
@@ -51,7 +51,8 @@ impl App {
     let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
     let cast_pool = Arc::new(CastPool::new(Some(ownership_tx)));
-    let bridge = Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)));
+    let bridge =
+      Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)).with_airplay(Arc::clone(&airplay)));
 
     let discovery = Discovery::new(Arc::clone(&registry));
     let discovery_handle = discovery.spawn(shutdown.clone());
@@ -165,6 +166,10 @@ async fn maintain_airplay(
     }
     // Warm Cast TCP while idle so LOAD during AirPlay does not dial fresh.
     cast_pool.ensure(device);
+    // Seed GET_PARAMETER until Cast is warm (retries each maintain tick).
+    if airplay.needs_volume_seed(&device.id) {
+      sync_reported_volume_from_cast(airplay, cast_pool, &device.id);
+    }
   }
 
   for active in airplay.active_ids() {
@@ -182,4 +187,21 @@ async fn maintain_airplay(
   }
 
   Ok(())
+}
+
+/// Best-effort: set AirPlay reported dB from Cast linear volume so the iOS slider matches.
+///
+/// Blocks on the warm Cast worker briefly; only called when a receiver is newly advertised.
+fn sync_reported_volume_from_cast(airplay: &AirPlayManager, cast_pool: &CastPool, device_id: &str) {
+  let Ok(linear) = cast_pool.get_volume(device_id) else {
+    return;
+  };
+  let db = cast_linear_to_airplay_db(linear);
+  airplay.set_reported_volume_db(device_id, db);
+  tracing::info!(
+    %device_id,
+    cast_linear = linear,
+    airplay_db = db,
+    "synced AirPlay reported volume from Cast"
+  );
 }
