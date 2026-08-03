@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13
+
+- Idle Cast PAUSE only after **2.5s** without PCM **and** an empty ring (stops mid-track PAUSE/PLAY thrash on buffered AP2). Explicit pause/FLUSH still pauses promptly.
+
 ## 0.1.12
 
 - AirPlay volume UI: report Cast/Nest level on `GET_PARAMETER` (no hardcoded 100%); seed from warm Cast and after LOAD. Still preserve device volume on stream start.

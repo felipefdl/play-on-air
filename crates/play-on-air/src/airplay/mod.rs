@@ -20,10 +20,12 @@ const RAOP_PORT_SPAN: u64 = 1000;
 const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
-/// No PCM for this long ⇒ treat AirPlay playout as paused (Cast PAUSE).
+/// No PCM for this long **and** an empty ring ⇒ treat AirPlay as paused (Cast PAUSE).
 ///
-/// Keep this well above normal packet jitter so we do not thrash PAUSE/PLAY mid-track.
-const PAUSE_IDLE: Duration = Duration::from_millis(750);
+/// Buffered AP2 often gaps 1–2s between chunks while the track is still playing.
+/// A short idle alone was thrashing Nest PAUSE/PLAY mid-song. Explicit AP2 rate=0
+/// and FLUSH still pause immediately via [`AudioSession::audio_flush`].
+const PAUSE_IDLE: Duration = Duration::from_millis(2_500);
 /// Pause-watch poll cadence.
 const PAUSE_POLL: Duration = Duration::from_millis(50);
 
@@ -98,8 +100,9 @@ impl DeviceAudioState {
 /// when they close; those must not stop Cast (multi-speaker iOS opens/closes RC
 /// links while audio keeps running on another connection).
 ///
-/// Pause is inferred when PCM stops for [`PAUSE_IDLE`] (AP2 rate=0 stops delivery
-/// without dropping the session). Flush is explicit via [`AudioSession::audio_flush`].
+/// Idle pause is inferred only when PCM stops for [`PAUSE_IDLE`] **and** the ring is
+/// empty (AP2 rate=0 often stops delivery without dropping the session). Flush is
+/// explicit via [`AudioSession::audio_flush`] (immediate Cast PAUSE path).
 struct RingSession {
   state: Arc<DeviceAudioState>,
   ring: Arc<PcmRing>,
@@ -189,6 +192,15 @@ fn millis_since_start() -> u64 {
   u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whether the idle watcher should emit Cast PAUSE (pure; unit-tested).
+///
+/// Requires long enough silence **and** no residual PCM in the ring so buffered
+/// AP2 chunk gaps do not thrash Nest while audio is still queued for `LiveWav`.
+#[must_use]
+const fn should_emit_idle_pause(idle_ms: u64, idle_threshold_ms: u64, ring_frames: usize) -> bool {
+  idle_ms >= idle_threshold_ms && ring_frames == 0
+}
+
 fn spawn_pause_watch(
   state: Arc<DeviceAudioState>,
   last_process_ms: Arc<AtomicU64>,
@@ -196,6 +208,7 @@ fn spawn_pause_watch(
   cast_paused: Arc<AtomicBool>,
   cancel: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+  let idle_threshold_ms = u64::try_from(PAUSE_IDLE.as_millis()).unwrap_or(2_500);
   std::thread::Builder::new()
     .name(format!("ap-pause-{}", short_device_id(&state.device_id)))
     .spawn(move || {
@@ -210,8 +223,11 @@ fn spawn_pause_watch(
         let last = last_process_ms.load(Ordering::Acquire);
         let now = millis_since_start();
         let idle_ms = now.saturating_sub(last);
-        if idle_ms >= u64::try_from(PAUSE_IDLE.as_millis()).unwrap_or(250)
-          && !cast_paused.swap(true, Ordering::AcqRel)
+        let ring_frames = state.current_ring().available_frames();
+        if !should_emit_idle_pause(idle_ms, idle_threshold_ms, ring_frames) {
+          continue;
+        }
+        if !cast_paused.swap(true, Ordering::AcqRel)
           && let Some(tx) = &state.event_tx
         {
           drop(tx.send(AirPlaySessionEvent::Paused { device_id: state.device_id.clone() }));
@@ -718,5 +734,25 @@ mod tests {
     assert_eq!(state.current_ring().available_frames(), 3);
     session.audio_flush();
     assert_eq!(state.current_ring().available_frames(), 0);
+  }
+
+  #[test]
+  fn should_emit_idle_pause_requires_idle_and_empty_ring() {
+    let threshold = 2_500_u64;
+    // Buffered AP2 chunk gap with residual PCM: do not pause Cast.
+    assert!(!should_emit_idle_pause(3_000, threshold, 1));
+    assert!(!should_emit_idle_pause(threshold, threshold, 100));
+    // Short gap under threshold even with empty ring: still playing.
+    assert!(!should_emit_idle_pause(749, threshold, 0));
+    assert!(!should_emit_idle_pause(2_499, threshold, 0));
+    // Long silence and drained ring: real idle / rate=0 with no tail.
+    assert!(should_emit_idle_pause(threshold, threshold, 0));
+    assert!(should_emit_idle_pause(threshold + 1, threshold, 0));
+  }
+
+  #[test]
+  fn pause_idle_is_above_typical_buffered_gaps() {
+    // Documented product bar: longer than the old 750ms thrash threshold.
+    assert!(PAUSE_IDLE.as_millis() >= 2_000);
   }
 }
