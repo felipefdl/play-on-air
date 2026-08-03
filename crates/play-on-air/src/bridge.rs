@@ -53,7 +53,11 @@ const STALL_BODY_STALE: Duration = Duration::from_secs(5);
 /// Second stall within this window after a stall re-LOAD kicks the session.
 const STALL_REPEAT_WINDOW: Duration = Duration::from_secs(60);
 /// Early-session FLAC → WAV fallback window after a successful FLAC LOAD.
+///
+/// Decisive rejections inside this window (IDLE recovery, stall) fall back immediately.
 const FLAC_FALLBACK_WINDOW: Duration = Duration::from_secs(10);
+/// Two FLAC failure strikes within this window (any session age) → switch LIVE to WAV.
+const FLAC_STRIKE_PAIR_WINDOW: Duration = Duration::from_secs(90);
 
 /// How Cast volume is applied after a progressive media LOAD.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -220,6 +224,61 @@ const fn stall_action(
   StallAction::Reload
 }
 
+/// Why a FLAC LIVE session counted a failure strike (unit-tested with [`flac_strike_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlacStrikeReason {
+  /// Pool re-LOAD recovery (IDLE ERROR path → internal re-LOAD).
+  MediaRecovered,
+  /// Bridge stall watchdog issued a generation-scoped re-LOAD.
+  StallWatchdogReload,
+}
+
+/// Outcome of recording a FLAC failure strike against optional previous strike state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlacStrikeDecision {
+  /// First strike, or second strike outside the pair window (keep latest as previous).
+  RecordOnly,
+  /// Second strike within the pair window → switch session to WAV and remember fallback.
+  FallbackToWav,
+}
+
+/// Pure FLAC strike accounting: timestamps + reasons in, decision + updated previous out.
+///
+/// Two strikes within `pair_window` → [`FlacStrikeDecision::FallbackToWav`]; otherwise
+/// [`FlacStrikeDecision::RecordOnly`] and the new strike becomes the previous for the next call.
+fn flac_strike_decision(
+  previous: Option<(Instant, FlacStrikeReason)>,
+  now: Instant,
+  reason: FlacStrikeReason,
+  pair_window: Duration,
+) -> (FlacStrikeDecision, Option<(Instant, FlacStrikeReason)>) {
+  let decision = match previous {
+    Some((prev_at, _)) if now.saturating_duration_since(prev_at) < pair_window => FlacStrikeDecision::FallbackToWav,
+    Some(_) | None => FlacStrikeDecision::RecordOnly,
+  };
+  (decision, Some((now, reason)))
+}
+
+/// Apply a FLAC strike on a Playing session; returns whether pair-window fallback is due.
+fn apply_flac_strike(session: &mut PlayingSession, now: Instant, reason: FlacStrikeReason) -> FlacStrikeDecision {
+  let previous = session.flac_strike;
+  let (decision, updated) = flac_strike_decision(previous, now, reason, FLAC_STRIKE_PAIR_WINDOW);
+  session.flac_strike = updated;
+  decision
+}
+
+/// Plan from [`Bridge::on_media_recovered`] locked section when FLAC LIVE needs WAV fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaRecoveredPlan {
+  /// Inside the early decisive window (one recovery is enough).
+  EarlyImmediate { generation: u64 },
+  /// Second strike within [`FLAC_STRIKE_PAIR_WINDOW`].
+  StrikeFallback {
+    generation: u64,
+    first_strike: Option<FlacStrikeReason>,
+  },
+}
+
 /// Clears `Starting{generation}` if still armed when dropped (panic safety for session start).
 struct StartingGuard<'a> {
   bridge: &'a Bridge,
@@ -342,6 +401,8 @@ struct PlayingSession {
   last_stall_reload_at: Option<Instant>,
   /// When this Playing generation became active (FLAC early-fallback window).
   started_at: Instant,
+  /// Last FLAC failure strike for this Playing generation (pair-window late fallback).
+  flac_strike: Option<(Instant, FlacStrikeReason)>,
   /// Drop / send to stop the `LiveWav` Content-Length rollover re-LOAD loop.
   rollover_cancel: Option<oneshot::Sender<()>>,
   rollover_task: Option<tokio::task::JoinHandle<()>>,
@@ -872,6 +933,7 @@ impl Bridge {
       last_flush_reload_at: None,
       last_stall_reload_at: None,
       started_at: Instant::now(),
+      flac_strike: None,
       rollover_cancel,
       rollover_task,
       watchdog_cancel: Some(watchdog_cancel),
@@ -1258,28 +1320,8 @@ impl Bridge {
 
   /// Stall watchdog tick for a Playing generation (called from a detached task).
   async fn stall_watchdog_tick(self: &Arc<Self>, device_id: &str, generation: u64) {
-    let snapshot = {
-      let devices = self.devices.lock();
-      let Some(slot) = devices.get(device_id) else {
-        return;
-      };
-      let DeviceState::Playing { generation: live_gen, session } = &slot.state else {
-        return;
-      };
-      if *live_gen != generation {
-        return;
-      }
-      let (_bytes, last_write) = session.media.progress();
-      let snap = StallSnapshot {
-        paused: session.paused,
-        last_write,
-        ring_frames: session.ring.available_frames(),
-        started_at: session.started_at,
-        egress: session.egress,
-        last_stall: session.last_stall_reload_at,
-      };
-      drop(devices);
-      snap
+    let Some(snapshot) = self.stall_snapshot(device_id, generation) else {
+      return;
     };
 
     // Body age: last HTTP write, or time since session start if Cast never pulled.
@@ -1329,23 +1371,88 @@ impl Bridge {
           .await;
       },
       StallAction::Reload => {
-        {
-          let mut devices = self.devices.lock();
-          if let Some(DeviceState::Playing { generation: live_gen, session }) =
-            devices.get_mut(device_id).map(|s| &mut s.state)
-            && *live_gen == generation
-          {
-            session.last_stall_reload_at = Some(Instant::now());
-          }
-          drop(devices);
-        }
-
-        tracing::warn!(%device_id, generation, "media stall detected; re-LOADing Cast media");
-        let ok = self.reload_playing_media(device_id, generation, "stall").await;
-        if !ok {
-          self.terminal_stall_end(device_id, generation, "stall re-LOAD failed").await;
-        }
+        self.handle_stall_reload(device_id, generation).await;
       },
+    }
+  }
+
+  fn stall_snapshot(&self, device_id: &str, generation: u64) -> Option<StallSnapshot> {
+    let devices = self.devices.lock();
+    let slot = devices.get(device_id)?;
+    let DeviceState::Playing { generation: live_gen, session } = &slot.state else {
+      return None;
+    };
+    if *live_gen != generation {
+      return None;
+    }
+    let (_bytes, last_write) = session.media.progress();
+    let snap = StallSnapshot {
+      paused: session.paused,
+      last_write,
+      ring_frames: session.ring.available_frames(),
+      started_at: session.started_at,
+      egress: session.egress,
+      last_stall: session.last_stall_reload_at,
+    };
+    drop(devices);
+    Some(snap)
+  }
+
+  /// Stall Reload path: count FLAC strikes; two within the pair window → WAV, else re-LOAD.
+  async fn handle_stall_reload(self: &Arc<Self>, device_id: &str, generation: u64) {
+    let flac_strike_fallback = self.note_stall_reload_and_flac_strike(device_id, generation);
+
+    if let Some(first_strike) = flac_strike_fallback {
+      tracing::info!(
+        %device_id,
+        generation,
+        first_strike = ?first_strike,
+        second_strike = ?FlacStrikeReason::StallWatchdogReload,
+        "FLAC session hit two failure strikes within pair window; falling back to WAV BUFFERED"
+      );
+      self.remember_flac_fallback(device_id);
+      if self.switch_playing_to_wav(device_id, generation).await {
+        return;
+      }
+      tracing::debug!(
+        %device_id,
+        generation,
+        "FLAC strike fallback did not switch (session gone or already WAV); continuing stall re-LOAD"
+      );
+    }
+
+    tracing::warn!(%device_id, generation, "media stall detected; re-LOADing Cast media");
+    let ok = self.reload_playing_media(device_id, generation, "stall").await;
+    if !ok {
+      self.terminal_stall_end(device_id, generation, "stall re-LOAD failed").await;
+    }
+  }
+
+  /// Mark stall re-LOAD time; on FLAC LIVE record a strike.
+  ///
+  /// Returns the prior strike reason when pair-window fallback is due (always `Some` when
+  /// [`FlacStrikeDecision::FallbackToWav`] — the pure helper only falls back with a previous).
+  fn note_stall_reload_and_flac_strike(&self, device_id: &str, generation: u64) -> Option<FlacStrikeReason> {
+    let mut devices = self.devices.lock();
+    let Some(DeviceState::Playing { generation: live_gen, session }) = devices.get_mut(device_id).map(|s| &mut s.state)
+    else {
+      return None;
+    };
+    if *live_gen != generation {
+      return None;
+    }
+    let now = Instant::now();
+    session.last_stall_reload_at = Some(now);
+    if session.egress != EgressKind::FlacLive {
+      return None;
+    }
+    let previous = session.flac_strike;
+    let decision = apply_flac_strike(session, now, FlacStrikeReason::StallWatchdogReload);
+    drop(devices);
+    if decision == FlacStrikeDecision::FallbackToWav {
+      previous.map(|(_, r)| r)
+    } else {
+      None
     }
   }
 
@@ -1459,47 +1566,96 @@ impl Bridge {
     }
   }
 
-  /// Pool re-LOAD recovered media (IDLE/BUFFERING path). Early FLAC → WAV when in window.
+  /// Pool re-LOAD recovered media (IDLE ERROR recovery path).
+  ///
+  /// Early FLAC window → immediate WAV fallback. Outside the window, each recovery is a FLAC
+  /// strike; two strikes within [`FLAC_STRIKE_PAIR_WINDOW`] switch the LIVE session to WAV and
+  /// remember process-lifetime fallback for the device.
   pub async fn on_media_recovered(self: &Arc<Self>, device_id: &str) {
-    let early_flac_gen = {
-      let devices = self.devices.lock();
-      let Some(slot) = devices.get(device_id) else {
-        drop(devices);
-        tracing::info!(%device_id, "Cast pool re-LOAD recovered media (no bridge session)");
-        return;
-      };
-      let early = match &slot.state {
-        DeviceState::Playing { generation, session }
-          if session.egress == EgressKind::FlacLive && session.started_at.elapsed() < FLAC_FALLBACK_WINDOW =>
-        {
-          Some(*generation)
-        },
-        DeviceState::Idle | DeviceState::Starting { .. } | DeviceState::Playing { .. } => {
-          let generation = slot.live_gen();
-          tracing::info!(
-            %device_id,
-            session_generation = ?generation,
-            "Cast pool re-LOAD recovered media session"
-          );
-          None
-        },
-      };
-      drop(devices);
-      early
-    };
-    let Some(generation) = early_flac_gen else {
+    let Some(plan) = self.plan_media_recovered_flac(device_id) else {
       return;
     };
+    self.apply_media_recovered_plan(device_id, plan).await;
+  }
 
-    tracing::warn!(
-      %device_id,
-      generation,
-      "early FLAC media_recovered (IDLE recovery); falling back to WAV BUFFERED"
-    );
+  /// Decide whether a pool recovery should fall back FLAC→WAV (updates strike state under lock).
+  fn plan_media_recovered_flac(&self, device_id: &str) -> Option<MediaRecoveredPlan> {
+    let mut devices = self.devices.lock();
+    let Some(slot) = devices.get_mut(device_id) else {
+      drop(devices);
+      tracing::info!(%device_id, "Cast pool re-LOAD recovered media (no bridge session)");
+      return None;
+    };
+    let plan = match &mut slot.state {
+      DeviceState::Playing { generation: live_gen, session } if session.egress == EgressKind::FlacLive => {
+        let session_gen = *live_gen;
+        if session.started_at.elapsed() < FLAC_FALLBACK_WINDOW {
+          Some(MediaRecoveredPlan::EarlyImmediate { generation: session_gen })
+        } else {
+          let previous = session.flac_strike;
+          let decision = apply_flac_strike(session, Instant::now(), FlacStrikeReason::MediaRecovered);
+          match decision {
+            FlacStrikeDecision::RecordOnly => {
+              tracing::info!(
+                %device_id,
+                generation = session_gen,
+                strike = ?FlacStrikeReason::MediaRecovered,
+                "Cast pool re-LOAD recovered media; FLAC strike recorded"
+              );
+              None
+            },
+            FlacStrikeDecision::FallbackToWav => Some(MediaRecoveredPlan::StrikeFallback {
+              generation: session_gen,
+              first_strike: previous.map(|(_, r)| r),
+            }),
+          }
+        }
+      },
+      DeviceState::Idle | DeviceState::Starting { .. } | DeviceState::Playing { .. } => {
+        let live_generation = slot.live_gen();
+        tracing::info!(
+          %device_id,
+          session_generation = ?live_generation,
+          "Cast pool re-LOAD recovered media session"
+        );
+        None
+      },
+    };
+    drop(devices);
+    plan
+  }
+
+  async fn apply_media_recovered_plan(self: &Arc<Self>, device_id: &str, plan: MediaRecoveredPlan) {
+    let (generation, early) = match plan {
+      MediaRecoveredPlan::EarlyImmediate { generation } => {
+        tracing::warn!(
+          %device_id,
+          generation,
+          "early FLAC media_recovered (IDLE recovery); falling back to WAV BUFFERED"
+        );
+        (generation, true)
+      },
+      MediaRecoveredPlan::StrikeFallback { generation, first_strike } => {
+        tracing::info!(
+          %device_id,
+          generation,
+          first_strike = ?first_strike,
+          second_strike = ?FlacStrikeReason::MediaRecovered,
+          "FLAC session hit two failure strikes within pair window; falling back to WAV BUFFERED"
+        );
+        (generation, false)
+      },
+    };
     self.remember_flac_fallback(device_id);
     let switched = self.switch_playing_to_wav(device_id, generation).await;
     if !switched {
-      tracing::debug!(%device_id, generation, "early FLAC media_recovered fallback did not switch (session gone or already WAV)");
+      let kind = if early { "early" } else { "strike" };
+      tracing::debug!(
+        %device_id,
+        generation,
+        kind,
+        "FLAC media_recovered fallback did not switch (session gone or already WAV)"
+      );
     }
   }
 
@@ -1993,6 +2149,7 @@ mod tests {
       last_flush_reload_at: None,
       last_stall_reload_at: None,
       started_at: Instant::now(),
+      flac_strike: None,
       rollover_cancel: None,
       rollover_task: None,
       watchdog_cancel: None,
@@ -2786,7 +2943,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn on_media_recovered_outside_window_keeps_flac() {
+  async fn on_media_recovered_one_late_strike_keeps_flac() {
     let pool = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
@@ -2807,9 +2964,89 @@ mod tests {
         panic!("expected Playing");
       };
       assert_eq!(live.egress, EgressKind::FlacLive);
+      assert!(
+        live.flac_strike.is_some_and(|(_, r)| r == FlacStrikeReason::MediaRecovered),
+        "single late media_recovered must record a MediaRecovered strike"
+      );
       drop(devices);
     }
     bridge.handle_session_end("dev-late").await;
+  }
+
+  #[tokio::test]
+  async fn on_media_recovered_two_late_strikes_switch_to_wav() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, "dev-late2", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    playing.started_at = Instant::now()
+      .checked_sub(FLAC_FALLBACK_WINDOW + Duration::from_secs(5))
+      .unwrap_or_else(Instant::now);
+    insert_playing(&bridge, "dev-late2", 1, playing);
+
+    bridge.on_media_recovered("dev-late2").await;
+    bridge.on_media_recovered("dev-late2").await;
+
+    assert!(
+      bridge.flac_fallback.lock().contains("dev-late2"),
+      "two late media_recovered strikes must remember WAV fallback"
+    );
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session: live, .. } = &devices.get("dev-late2").expect("slot").state else {
+        panic!("expected Playing after two late recoveries");
+      };
+      assert_eq!(live.egress, EgressKind::WavBuffered);
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-late2").await;
+  }
+
+  #[tokio::test]
+  async fn late_media_recovered_then_stall_strike_switches_to_wav() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, "dev-mixed", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    playing.started_at = Instant::now()
+      .checked_sub(FLAC_FALLBACK_WINDOW + Duration::from_secs(5))
+      .unwrap_or_else(Instant::now);
+    // Seed a MediaRecovered strike as if the pool already recovered once.
+    playing.flac_strike = Some((Instant::now(), FlacStrikeReason::MediaRecovered));
+    insert_playing(&bridge, "dev-mixed", 1, playing);
+
+    // Second strike via stall-watchdog reason (same pure accounting as handle_stall_reload).
+    {
+      let mut devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &mut devices.get_mut("dev-mixed").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      let previous = session.flac_strike;
+      let decision = apply_flac_strike(session, Instant::now(), FlacStrikeReason::StallWatchdogReload);
+      assert_eq!(decision, FlacStrikeDecision::FallbackToWav);
+      assert_eq!(
+        previous.map(|(_, r)| r),
+        Some(FlacStrikeReason::MediaRecovered),
+        "pair fallback must retain first strike reason for logging"
+      );
+      drop(devices);
+    }
+    bridge.remember_flac_fallback("dev-mixed");
+    // switch_playing_to_wav returns re-LOAD success; without a Cast worker that is false, but
+    // egress still flips under the lock (same as early media_recovered tests).
+    let _reload_ok = bridge.switch_playing_to_wav("dev-mixed", 1).await;
+    assert!(bridge.flac_fallback.lock().contains("dev-mixed"));
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session: live, .. } = &devices.get("dev-mixed").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert_eq!(live.egress, EgressKind::WavBuffered);
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-mixed").await;
   }
 
   // --- B1: late STOP after replace ---
@@ -3095,6 +3332,53 @@ mod tests {
       bridge.devices.lock().get("dev-guard-disarm").map(|s| &s.state),
       Some(DeviceState::Starting { generation: 1 })
     ));
+  }
+
+  // --- FLAC strike accounting (pure) ---
+
+  #[test]
+  fn flac_strike_first_is_record_only() {
+    let t0 = Instant::now();
+    let (decision, previous) =
+      flac_strike_decision(None, t0, FlacStrikeReason::MediaRecovered, FLAC_STRIKE_PAIR_WINDOW);
+    assert_eq!(decision, FlacStrikeDecision::RecordOnly);
+    assert_eq!(previous, Some((t0, FlacStrikeReason::MediaRecovered)));
+  }
+
+  #[test]
+  fn flac_strike_second_within_pair_window_is_fallback() {
+    let t0 = Instant::now();
+    let t1 = t0 + Duration::from_secs(30);
+    let previous = Some((t0, FlacStrikeReason::MediaRecovered));
+    let (decision, updated) =
+      flac_strike_decision(previous, t1, FlacStrikeReason::StallWatchdogReload, FLAC_STRIKE_PAIR_WINDOW);
+    assert_eq!(decision, FlacStrikeDecision::FallbackToWav);
+    assert_eq!(updated, Some((t1, FlacStrikeReason::StallWatchdogReload)));
+  }
+
+  #[test]
+  fn flac_strike_second_after_pair_window_is_record_only() {
+    let t0 = Instant::now();
+    let t1 = t0 + FLAC_STRIKE_PAIR_WINDOW;
+    let previous = Some((t0, FlacStrikeReason::StallWatchdogReload));
+    let (decision, updated) =
+      flac_strike_decision(previous, t1, FlacStrikeReason::MediaRecovered, FLAC_STRIKE_PAIR_WINDOW);
+    assert_eq!(decision, FlacStrikeDecision::RecordOnly);
+    assert_eq!(updated, Some((t1, FlacStrikeReason::MediaRecovered)));
+  }
+
+  #[test]
+  fn flac_strike_exactly_at_pair_window_boundary_resets() {
+    // Pair window is exclusive upper bound: elapsed == window → RecordOnly.
+    let t0 = Instant::now();
+    let t1 = t0 + FLAC_STRIKE_PAIR_WINDOW;
+    let (decision, _) = flac_strike_decision(
+      Some((t0, FlacStrikeReason::MediaRecovered)),
+      t1,
+      FlacStrikeReason::MediaRecovered,
+      FLAC_STRIKE_PAIR_WINDOW,
+    );
+    assert_eq!(decision, FlacStrikeDecision::RecordOnly);
   }
 
   // --- I1: stall watchdog pure decisions ---
