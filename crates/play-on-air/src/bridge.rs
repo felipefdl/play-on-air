@@ -135,11 +135,20 @@ const fn replace_skips_cast_stop(policy: TeardownCastPolicy) -> bool {
 
 /// Whether a late-completing Cast LOAD should issue STOP because the session died.
 ///
-/// Replace teardown sets `late_stop_allowed` false so a superseded generation cannot STOP the
-/// device after the new generation's LOAD (serialized pool: Load(old) → Load(new) → Stop would
-/// kill the replacement session).
+/// Replace teardown stores `late_stop_allowed = false` **before** `session_alive = false` so a
+/// concurrent load never observes `(dead, late_stop_allowed)` (serialized pool:
+/// Load(old) → Load(new) → Stop would kill the replacement session). Intermediate
+/// `(alive, !late_stop_allowed)` is safe: this returns false.
 const fn late_load_should_stop(alive: bool, late_stop_allowed: bool) -> bool {
   !alive && late_stop_allowed
+}
+
+/// Whether a detached PAUSE/PLAY from `expected_gen` may still touch Cast for `device_id`.
+///
+/// Requires both session liveness and a matching live generation so a command from a replaced
+/// generation cannot land on the new session while the old `session_alive` is still true.
+fn detached_cast_control_allowed(alive: bool, live_gen: Option<u64>, expected_gen: u64) -> bool {
+  alive && live_gen == Some(expected_gen)
 }
 
 /// True when the Cast error is transport-shaped (timeout, disconnect, no session/worker).
@@ -339,10 +348,12 @@ struct PlayingSession {
   /// Cancel the stall watchdog task.
   watchdog_cancel: Option<oneshot::Sender<()>>,
   watchdog_task: Option<tokio::task::JoinHandle<()>>,
-  /// Cleared first on teardown so late LOAD paths STOP instead of reviving playback
-  /// (when [`Self::late_stop_allowed`] is still true).
+  /// Cleared on teardown so late LOAD paths STOP instead of reviving playback
+  /// (when [`Self::late_stop_allowed`] is still true). On replace, cleared **after**
+  /// `late_stop_allowed` so the pair is never observed as `(dead, late_stop_allowed)`.
   session_alive: Arc<AtomicBool>,
-  /// Replace path sets this false so a late-completing old LOAD does not STOP the new session.
+  /// Replace path sets this false **before** clearing [`Self::session_alive`] so a
+  /// late-completing old LOAD does not STOP the new session.
   ///
   /// Full end leaves this true: after `session_alive` is false, late LOAD still STOPs so
   /// playback cannot revive against a dead media server.
@@ -1081,6 +1092,8 @@ impl Bridge {
   ///
   /// Local paused bookkeeping is synchronous; Cast PAUSE is detached so the device worker
   /// never awaits Cast control I/O (same idea as [`Self::spawn_reload_playing_media`]).
+  /// Detached work re-checks generation + `session_alive` so a replaced generation cannot
+  /// PAUSE the new session.
   fn handle_pause(self: &Arc<Self>, device_id: &str) {
     let cast_pause = {
       let mut devices = self.devices.lock();
@@ -1108,10 +1121,12 @@ impl Bridge {
     };
     let (generation, alive, pool, id) = cast_pause;
     tracing::info!(%device_id, generation, "AirPlay paused; pausing Cast media");
+    let bridge = Arc::clone(self);
     drop(tokio::spawn(async move {
       let log_id = id.clone();
       let pause_result = tokio::task::spawn_blocking(move || {
-        if !alive.load(Ordering::Acquire) {
+        let live_gen = bridge.session_generation(&id);
+        if !detached_cast_control_allowed(alive.load(Ordering::Acquire), live_gen, generation) {
           return Ok(());
         }
         pool.pause(&id)
@@ -1132,7 +1147,8 @@ impl Bridge {
   /// Resume Cast media after AirPlay playout restarts.
   ///
   /// Local unpause is synchronous; Cast PLAY (and long-pause re-LOAD) are detached so the
-  /// device worker does not await Cast control I/O.
+  /// device worker does not await Cast control I/O. Detached PLAY re-checks generation +
+  /// `session_alive` so a replaced generation cannot PLAY the new session.
   fn handle_resume(self: &Arc<Self>, device_id: &str) {
     let action = {
       let mut devices = self.devices.lock();
@@ -1167,8 +1183,10 @@ impl Bridge {
         let id = device_id.to_owned();
         drop(tokio::spawn(async move {
           let play_id = id.clone();
+          let bridge_for_check = Arc::clone(&bridge);
           let play_result = tokio::task::spawn_blocking(move || {
-            if !session_alive.load(Ordering::Acquire) {
+            let live_gen = bridge_for_check.session_generation(&play_id);
+            if !detached_cast_control_allowed(session_alive.load(Ordering::Acquire), live_gen, generation) {
               return Ok(());
             }
             pool.play(&play_id)
@@ -1183,6 +1201,7 @@ impl Bridge {
               tracing::debug!(device_id = %id, generation, error = %err, "Cast play task join failed; re-LOADing");
             }
             // Off the device worker so Paused/Ended can proceed while re-LOAD runs.
+            // reload_playing_media re-checks generation + session_alive.
             bridge.spawn_reload_playing_media(&id, generation, "resume_play_failed");
           }
         }));
@@ -1812,11 +1831,13 @@ fn detach_teardown(session: PlayingSession, policy: TeardownCastPolicy) {
 
 async fn teardown_playing(session: PlayingSession, policy: TeardownCastPolicy) {
   let device_id = session.device_id.clone();
-  session.session_alive.store(false, Ordering::Release);
-  // Replace path: new generation owns the device; late-completing old LOAD must not STOP.
+  // Replace path: clear late_stop_allowed BEFORE session_alive so a concurrent late LOAD
+  // never observes (dead, late_stop_allowed=true). Intermediate (alive, !late_stop) is safe
+  // (late_load_should_stop is false). Full end leaves late_stop_allowed true.
   if replace_skips_cast_stop(policy) {
     session.late_stop_allowed.store(false, Ordering::Release);
   }
+  session.session_alive.store(false, Ordering::Release);
 
   if let Some(tx) = session.watchdog_cancel {
     let _cancelled = tx.send(());
@@ -2822,13 +2843,13 @@ mod tests {
       }
     });
 
-    // Replace teardown order: session_alive=false, then late_stop_allowed=false, then join LOAD.
-    session_alive.store(false, Ordering::Release);
+    // Replace teardown order: late_stop_allowed=false FIRST, then session_alive=false.
     assert!(
       replace_skips_cast_stop(TeardownCastPolicy::SkipStopForReplace),
       "replace path is the one that must suppress late STOP"
     );
     late_stop_allowed.store(false, Ordering::Release);
+    session_alive.store(false, Ordering::Release);
     let _party = gate.wait();
     load.join().expect("load thread");
 
@@ -2836,6 +2857,61 @@ mod tests {
       stop_count.load(Ordering::SeqCst),
       0,
       "late STOP must be suppressed when replace disallows it"
+    );
+  }
+
+  /// Load samples the intermediate replace store: `late_stop_allowed=false` while still alive.
+  /// That pair must never STOP; only the reverse order creates a dangerous torn window.
+  #[test]
+  fn replace_teardown_intermediate_state_suppresses_stop() {
+    let session_alive = Arc::new(AtomicBool::new(true));
+    let late_stop_allowed = Arc::new(AtomicBool::new(true));
+    let stop_count = Arc::new(AtomicUsize::new(0));
+    let mid = Arc::new(std::sync::Barrier::new(2));
+    let after = Arc::new(std::sync::Barrier::new(2));
+
+    let alive = Arc::clone(&session_alive);
+    let late_stop = Arc::clone(&late_stop_allowed);
+    let stops = Arc::clone(&stop_count);
+    let mid_load = Arc::clone(&mid);
+    let after_load = Arc::clone(&after);
+    let load = std::thread::spawn(move || {
+      // Sample after first store only (late_stop cleared, alive still true).
+      let _mid = mid_load.wait();
+      if late_load_should_stop(alive.load(Ordering::Acquire), late_stop.load(Ordering::Acquire)) {
+        let _: usize = stops.fetch_add(1, Ordering::SeqCst);
+      }
+      // Sample after second store (both false).
+      let _after = after_load.wait();
+      if late_load_should_stop(alive.load(Ordering::Acquire), late_stop.load(Ordering::Acquire)) {
+        let _: usize = stops.fetch_add(1, Ordering::SeqCst);
+      }
+    });
+
+    // Production replace order: late_stop first, then alive.
+    late_stop_allowed.store(false, Ordering::Release);
+    assert!(
+      session_alive.load(Ordering::Acquire) && !late_stop_allowed.load(Ordering::Acquire),
+      "intermediate replace state must be (alive, !late_stop)"
+    );
+    assert!(
+      !late_load_should_stop(true, false),
+      "intermediate (alive, !late_stop) must not STOP"
+    );
+    let _mid = mid.wait();
+    session_alive.store(false, Ordering::Release);
+    let _after = after.wait();
+    load.join().expect("load thread");
+
+    assert_eq!(
+      stop_count.load(Ordering::SeqCst),
+      0,
+      "neither intermediate nor final replace state may issue late STOP"
+    );
+    // Document the inverted order that this store sequence forbids:
+    assert!(
+      late_load_should_stop(false, true),
+      "torn (dead, late_stop_allowed) would STOP; replace order must never produce it"
     );
   }
 
@@ -2884,6 +2960,49 @@ mod tests {
       !late_stop_allowed.load(Ordering::Acquire),
       "SkipStopForReplace must clear late_stop_allowed before joining inflight LOAD"
     );
+  }
+
+  // --- B2 residual: detached PAUSE/PLAY generation ownership ---
+
+  #[test]
+  fn detached_cast_control_requires_alive_and_matching_generation() {
+    assert!(detached_cast_control_allowed(true, Some(3), 3));
+    assert!(!detached_cast_control_allowed(false, Some(3), 3));
+    assert!(
+      !detached_cast_control_allowed(true, Some(4), 3),
+      "replaced gen must not control Cast"
+    );
+    assert!(!detached_cast_control_allowed(true, None, 3));
+    assert!(!detached_cast_control_allowed(true, Some(2), 3));
+  }
+
+  #[tokio::test]
+  async fn replaced_generation_loses_detached_cast_control() {
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None))));
+    let pool = Arc::clone(&bridge.cast_pool);
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let session = test_playing_session(media, "dev-gen-ctl", pool, Arc::new(PcmRing::new(2, 64)));
+    let old_alive = Arc::clone(&session.session_alive);
+    insert_playing(&bridge, "dev-gen-ctl", 1, session);
+
+    // Accept a replacement start: live gen becomes 2 (Starting) while old session_alive
+    // is still true until detached teardown runs — the residual B2 race.
+    let (new_gen, prior) = bridge.accept_start("dev-gen-ctl");
+    assert_eq!(new_gen, 2);
+    assert!(prior.is_some());
+    assert!(
+      old_alive.load(Ordering::Acquire),
+      "old session_alive still true before teardown"
+    );
+    assert_eq!(bridge.session_generation("dev-gen-ctl"), Some(2));
+    assert!(
+      !detached_cast_control_allowed(old_alive.load(Ordering::Acquire), bridge.session_generation("dev-gen-ctl"), 1),
+      "old PAUSE/PLAY must not run against the new generation"
+    );
+
+    if let Some(old) = prior {
+      teardown_playing(*old, TeardownCastPolicy::SkipStopForReplace).await;
+    }
   }
 
   // --- Q1: transport-shaped FLAC errors ---
