@@ -126,18 +126,25 @@ enum TeardownCastPolicy {
 /// Ordered teardown steps for a full session end (media first, then Cast STOP).
 ///
 /// [`Bridge::handle_session_end`] always runs these in order: media HTTP first,
-/// then timed best-effort Cast STOP. Media must not wait on STOP success.
+/// clear pool ownership tracking, then timed best-effort Cast STOP. Media must
+/// not wait on STOP success. Ownership clear must not wait on STOP either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEndStep {
   /// Shut down the local media HTTP server (stop underrun immediately).
   MediaShutdown,
+  /// Clear Cast pool ownership tracking so probes stand down (no false steal).
+  ClearSessionOwnership,
   /// Best-effort Cast STOP with timeout (may fail or time out).
   CastStopBestEffort,
 }
 
-/// Shipped full session-end order (media first, then Cast STOP).
-pub const fn session_end_steps() -> [SessionEndStep; 2] {
-  [SessionEndStep::MediaShutdown, SessionEndStep::CastStopBestEffort]
+/// Shipped full session-end order (media → ownership clear → Cast STOP).
+pub const fn session_end_steps() -> [SessionEndStep; 3] {
+  [
+    SessionEndStep::MediaShutdown,
+    SessionEndStep::ClearSessionOwnership,
+    SessionEndStep::CastStopBestEffort,
+  ]
 }
 
 /// Whether replace teardown should skip Cast STOP (new LOAD replaces the app session).
@@ -2257,6 +2264,11 @@ async fn teardown_playing(session: PlayingSession, policy: TeardownCastPolicy) {
   // (late_load_should_stop is false). Full end leaves late_stop_allowed true.
   if replace_skips_cast_stop(policy) {
     session.late_stop_allowed.store(false, Ordering::Release);
+  } else {
+    // Full end: stand ownership probes down immediately (before long joins / STOP I/O)
+    // so a terminal-stall media absence cannot be declared as a false steal.
+    // Do not clear on replace — a new LOAD may already own (or will own) active.
+    session.pool.session_ended(&device_id);
   }
   session.session_alive.store(false, Ordering::Release);
 
@@ -2329,8 +2341,12 @@ fn end_media_and_maybe_cast_stop(
   media.shutdown();
   if replace_skips_cast_stop(policy) {
     // New LOAD is about to replace the Cast app session; avoid HOL-blocking it.
+    // Do not session_ended here — that would clear the superseding LOAD's active.
     return;
   }
+  // Ownership was already stood down via `session_ended` at the start of full
+  // teardown. Issue Cast STOP best-effort (no-ops if SessionEnded already cleared
+  // active; still useful when only stop_best_effort is used from other paths).
   pool.stop_best_effort(device_id, Duration::from_secs(2));
 }
 
@@ -2450,9 +2466,10 @@ mod tests {
   #[test]
   fn session_end_steps_media_before_cast_stop() {
     let steps = session_end_steps();
-    assert_eq!(steps.len(), 2);
+    assert_eq!(steps.len(), 3);
     assert_eq!(steps[0], SessionEndStep::MediaShutdown);
-    assert_eq!(steps[1], SessionEndStep::CastStopBestEffort);
+    assert_eq!(steps[1], SessionEndStep::ClearSessionOwnership);
+    assert_eq!(steps[2], SessionEndStep::CastStopBestEffort);
   }
 
   #[test]
