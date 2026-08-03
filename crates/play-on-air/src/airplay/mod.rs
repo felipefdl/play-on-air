@@ -87,6 +87,23 @@ impl DeviceAudioState {
   fn replace_ring(&self, ring: Arc<PcmRing>) {
     *self.ring_slot.lock() = ring;
   }
+
+  /// Atomically claim stream end if `ring` is still the live slot.
+  ///
+  /// On success, installs a drained placeholder under the same `ring_slot` lock
+  /// that [`Self::replace_ring`] uses, so a concurrent `audio_init` cannot leave
+  /// a later `Started` followed by this session's `Ended`. Caller must clear the
+  /// old ring and emit [`AirPlaySessionEvent::Ended`] only when this returns true.
+  fn claim_end_if_current(&self, ring: &Arc<PcmRing>) -> bool {
+    let mut slot = self.ring_slot.lock();
+    if !Arc::ptr_eq(&*slot, ring) {
+      return false;
+    }
+    // Release ownership while still holding the lock. Placeholder keeps
+    // `current_ring()` valid for idle readers until the next `audio_init`.
+    *slot = Arc::new(PcmRing::new(ring.channels(), DEFAULT_RING_FRAMES));
+    true
+  }
 }
 
 /// Forwards decoded f32 PCM into the current [`PcmRing`].
@@ -140,11 +157,6 @@ impl RingSession {
       drop(tx.send(AirPlaySessionEvent::Paused { device_id: self.state.device_id.clone() }));
     }
   }
-
-  /// Whether this session still owns the live ring (not superseded by a later `audio_init`).
-  fn owns_current_ring(&self) -> bool {
-    Arc::ptr_eq(&self.ring, &self.state.current_ring())
-  }
 }
 
 impl AudioSession for RingSession {
@@ -179,10 +191,11 @@ impl AudioSession for RingSession {
 
 impl Drop for RingSession {
   fn drop(&mut self) {
-    // Format rebuild replaces the ring then drops the old session. Only the
-    // current session owns the live ring — skip clear + Ended when stale so we
-    // do not kill the session that `audio_init` just started.
-    if !self.owns_current_ring() {
+    // Delivery does drop-then-replace on format change (Ended then Started).
+    // Cross-connection SETUP may replace-then-drop. Claim ownership under the
+    // same `ring_slot` lock as `replace_ring` so a superseded session can never
+    // emit Ended after a later Started (TOCTOU: check-then-send is not enough).
+    if !self.state.claim_end_if_current(&self.ring) {
       tracing::debug!(
         device_id = %self.state.device_id,
         "AirPlay audio session dropped (stale ring; suppress Ended)"
@@ -429,28 +442,34 @@ impl AirPlayManager {
 
   /// Stop and drop the receiver for `device_id` (best-effort hard stop when in a runtime).
   ///
-  /// When a tokio multi-thread runtime is current, hard-stop is **awaited** (with
-  /// [`REMOVE_SHUTDOWN_TIMEOUT`]) so a following [`Self::ensure`] does not race the
-  /// RAOP port. Detached spawn used to leave the old accept loop alive long enough
-  /// for re-bind / iOS session races.
+  /// Hard-stop is **awaited** (with [`REMOVE_SHUTDOWN_TIMEOUT`]) so a following
+  /// [`Self::ensure`] does not race the RAOP port. Safe on multi-thread runtimes
+  /// (`block_in_place`) and current-thread / no-runtime callers (dedicated helper
+  /// thread — `block_in_place` panics on current-thread).
   pub fn remove(&self, device_id: &str) {
     let removed = {
       let mut guard = self.receivers.lock();
       guard.remove(device_id)
     };
-    if let Some(mut rx) = removed {
-      let withdrawn_id = rx.device_id.clone();
-      let name = rx.name.clone();
-      let port = rx.port;
-      tracing::info!(device_id = %withdrawn_id, %name, "AirPlay receiver withdrawn");
-      if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        // Callers include async maintain/ensure; block_in_place is safe on the
-        // multi-thread runtime used by `#[tokio::main]`.
+    if let Some(rx) = removed {
+      tracing::info!(device_id = %rx.device_id, name = %rx.name, "AirPlay receiver withdrawn");
+      Self::await_shutdown_hard(rx);
+    }
+  }
+
+  /// Await hard-stop without panicking on current-thread runtimes.
+  fn await_shutdown_hard(mut rx: AirPlayReceiver) {
+    let device_id = rx.device_id.clone();
+    let port = rx.port;
+    match tokio::runtime::Handle::try_current() {
+      Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+        // Product path: `#[tokio::main]` multi-thread. `block_in_place` frees the
+        // worker so other tasks (including hard-stop work) can run.
         tokio::task::block_in_place(|| {
           handle.block_on(async {
             if tokio::time::timeout(REMOVE_SHUTDOWN_TIMEOUT, rx.shutdown_hard()).await.is_err() {
               tracing::warn!(
-                device_id = %withdrawn_id,
+                device_id = %device_id,
                 port,
                 "AirPlay hard-stop timed out during remove; force-closing port"
               );
@@ -458,10 +477,79 @@ impl AirPlayManager {
             }
           });
         });
-      } else {
-        crate::net::force_close_tcp_on_local_port(port);
-        drop(rx);
-      }
+      },
+      Ok(_) | Err(_) => {
+        // Current-thread: cannot `block_in_place` or `Handle::spawn` + recv (only
+        // worker would deadlock). No runtime: need one. Dedicated OS thread with
+        // its own current-thread runtime owns the wait.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let helper_id = device_id.clone();
+        let spawn_result = std::thread::Builder::new()
+          .name("airplay-remove-shutdown".to_owned())
+          .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+              Ok(rt) => {
+                rt.block_on(async {
+                  if tokio::time::timeout(REMOVE_SHUTDOWN_TIMEOUT, rx.shutdown_hard()).await.is_err() {
+                    tracing::warn!(
+                      device_id = %helper_id,
+                      port,
+                      "AirPlay hard-stop timed out during remove; force-closing port"
+                    );
+                    crate::net::force_close_tcp_on_local_port(port);
+                  }
+                });
+              },
+              Err(err) => {
+                tracing::warn!(
+                  device_id = %helper_id,
+                  port,
+                  error = %err,
+                  "failed to build runtime for AirPlay remove; force-closing port"
+                );
+                crate::net::force_close_tcp_on_local_port(port);
+                drop(rx);
+              },
+            }
+            // Result is `Copy` for `()` payload; consume via `is_err` (not `drop`/`let _`).
+            if done_tx.send(()).is_err() {
+              tracing::debug!(
+                device_id = %helper_id,
+                "AirPlay remove helper: done channel closed before signal"
+              );
+            }
+          });
+        match spawn_result {
+          Ok(join_handle) => {
+            let wait = REMOVE_SHUTDOWN_TIMEOUT.saturating_add(Duration::from_secs(1));
+            if done_rx.recv_timeout(wait).is_ok() {
+              if let Err(err) = join_handle.join() {
+                tracing::warn!(
+                  device_id = %device_id,
+                  ?err,
+                  "AirPlay remove helper thread panicked"
+                );
+              }
+            } else {
+              tracing::warn!(
+                device_id = %device_id,
+                port,
+                "AirPlay hard-stop helper timed out; force-closing port"
+              );
+              crate::net::force_close_tcp_on_local_port(port);
+            }
+          },
+          Err(err) => {
+            tracing::warn!(
+              device_id = %device_id,
+              port,
+              error = %err,
+              "failed to spawn AirPlay remove helper; force-closing port"
+            );
+            crate::net::force_close_tcp_on_local_port(port);
+          },
+        }
+      },
     }
   }
 
@@ -780,6 +868,125 @@ mod tests {
       Err(_) => {},
       Ok(ev) => panic!("stale drop must not emit Ended, got {ev:?}"),
     }
+  }
+
+  #[test]
+  fn claim_end_if_current_releases_ownership_under_lock() {
+    let ring_a = Arc::new(PcmRing::new(2, 64));
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::clone(&ring_a)),
+      event_tx: None,
+      device_id: "dev-claim".to_owned(),
+    });
+    assert!(state.claim_end_if_current(&ring_a));
+    assert!(!Arc::ptr_eq(&state.current_ring(), &ring_a));
+    // Second claim on the same ring must fail after ownership was released.
+    assert!(!state.claim_end_if_current(&ring_a));
+  }
+
+  #[test]
+  fn claim_end_after_replace_returns_false() {
+    let ring_a = Arc::new(PcmRing::new(2, 64));
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::clone(&ring_a)),
+      event_tx: None,
+      device_id: "dev-claim-stale".to_owned(),
+    });
+    state.replace_ring(Arc::new(PcmRing::new(1, 64)));
+    assert!(!state.claim_end_if_current(&ring_a));
+  }
+
+  /// Two-thread race: old session Drop concurrent with new `audio_init`.
+  ///
+  /// Invariant: after both complete (and before the new session is dropped),
+  /// events must never be `Started` then `Ended` from the superseded session
+  /// (that order kills the live Cast session on the bridge).
+  #[test]
+  fn concurrent_drop_and_audio_init_never_started_then_ended() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let fmt = AudioFormat {
+      codec: shairplay::AudioCodec::Pcm,
+      bits: 32,
+      channels: 2,
+      sample_rate: 44_100,
+    };
+
+    for iteration in 0..200 {
+      let (tx, mut rx) = mpsc::unbounded_channel();
+      let state = Arc::new(DeviceAudioState {
+        ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+        event_tx: Some(tx),
+        device_id: "dev-race".to_owned(),
+      });
+      let handler = RingHandler { state: Arc::clone(&state) };
+
+      let session1 = handler.audio_init(fmt);
+      match rx.try_recv() {
+        Ok(AirPlaySessionEvent::Started { .. }) => {},
+        other => panic!("iter {iteration}: expected first Started, got {other:?}"),
+      }
+
+      let barrier = Arc::new(Barrier::new(2));
+      let barrier_drop = Arc::clone(&barrier);
+      let drop_thread = thread::spawn(move || {
+        let _ = barrier_drop.wait();
+        drop(session1);
+      });
+
+      let _ = barrier.wait();
+      let session2 = handler.audio_init(fmt);
+      drop_thread
+        .join()
+        .unwrap_or_else(|_| panic!("iter {iteration}: drop thread panicked"));
+
+      // Drain events before dropping session2 so any stale Ended is visible here.
+      let mid: Vec<AirPlaySessionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+      let mut saw_second_started = false;
+      for event in &mid {
+        match event {
+          AirPlaySessionEvent::Started { .. } => {
+            saw_second_started = true;
+          },
+          AirPlaySessionEvent::Ended { .. } if saw_second_started => {
+            panic!("iter {iteration}: Ended after second Started (stale Drop race); events={mid:?}");
+          },
+          AirPlaySessionEvent::Ended { .. }
+          | AirPlaySessionEvent::Paused { .. }
+          | AirPlaySessionEvent::Resumed { .. }
+          | AirPlaySessionEvent::Flushed { .. }
+          | AirPlaySessionEvent::Volume { .. } => {},
+        }
+      }
+      assert!(
+        saw_second_started,
+        "iter {iteration}: expected second Started in mid events, got {mid:?}"
+      );
+
+      drop(session2);
+      match rx.try_recv() {
+        Ok(AirPlaySessionEvent::Ended { device_id }) => assert_eq!(device_id, "dev-race"),
+        other => panic!("iter {iteration}: expected final Ended, got {other:?}"),
+      }
+    }
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn remove_does_not_panic_on_current_thread_runtime() {
+    let mgr = AirPlayManager::new(None);
+    // Missing device is a no-op (never hits shutdown).
+    mgr.remove("no-such-device");
+    mgr
+      .ensure("dev-cur-thread", "Current-Thread Test")
+      .await
+      .expect("ensure should bind a RAOP port in tests");
+    // Must not panic: current-thread forbids `block_in_place`.
+    mgr.remove("dev-cur-thread");
+    assert!(
+      !mgr.active_ids().iter().any(|id| id == "dev-cur-thread"),
+      "receiver should be withdrawn after remove"
+    );
   }
 
   #[test]
