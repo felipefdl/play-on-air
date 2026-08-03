@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: tearing down a stale AirPlay control connection no longer kills the active audio session (music died seconds after starting on 0.2.0).
+- Fix: Nest devices no longer vanish from the AirPlay picker for ~44 s on spurious mDNS removals; on Linux a device leaves only when stale **and** its Cast control plane is unreachable.
+- Fix: warm Cast connections no longer churn on a 30 s watchdog while idle (drain reads are bounded to their short timeout).
+
 ## 0.2.0
 
 - **FLAC to Cast by default**: lossless FLAC over a live chunked stream (`streamType` LIVE). Devices that reject FLAC fall back to WAV automatically.
