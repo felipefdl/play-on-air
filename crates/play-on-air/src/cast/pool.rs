@@ -12,6 +12,7 @@
 //! - parse errors are not ownership theft; IDLE recover-then-kick policy
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::thread::JoinHandle;
@@ -204,11 +205,19 @@ pub(crate) fn ownership_action(inputs: OwnershipInputs) -> OwnershipAction {
   OwnershipAction::Inconclusive
 }
 
+/// Recoverable IDLE / stuck buffering → re-LOAD, wait for bridge, or lost after a real attempt.
+///
+/// - Recent LOAD (bridge rollover): [`OwnershipAction::Inconclusive`] — do not fight the bridge
+///   and do not count as steal.
+/// - Already attempted one re-LOAD this episode: [`OwnershipAction::LostSignal`].
+/// - Otherwise: [`OwnershipAction::AttemptReload`].
 const fn recoverable_or_lost(reload_attempted: bool, load_within_guard: bool) -> OwnershipAction {
-  if !reload_attempted && !load_within_guard {
-    OwnershipAction::AttemptReload
-  } else {
+  if load_within_guard {
+    OwnershipAction::Inconclusive
+  } else if reload_attempted {
     OwnershipAction::LostSignal
+  } else {
+    OwnershipAction::AttemptReload
   }
 }
 
@@ -275,6 +284,8 @@ struct CastWorkerHandle {
   port: u16,
   /// Active relay shutdown handle (updated by the worker on each connect).
   relay_slot: SharedRelaySlot,
+  /// `remove` in progress (or waiting for late join). Blocks `ensure` re-spawn.
+  exiting: bool,
 }
 
 /// Shared pool of warm Cast control-plane workers (`Send + Sync` via `Arc`).
@@ -282,7 +293,7 @@ struct CastWorkerHandle {
 /// Workers are started when devices appear (see app maintain loop) and torn down
 /// only when the device leaves — not when an AirPlay media session ends.
 pub struct CastPool {
-  workers: Mutex<HashMap<String, CastWorkerHandle>>,
+  workers: Arc<Mutex<HashMap<String, CastWorkerHandle>>>,
   /// Notifies the app when a warm LOAD session loses Cast media ownership
   /// (another app took the receiver). Payload is the registry device id.
   ownership_lost: Option<UnboundedSender<String>>,
@@ -314,7 +325,7 @@ impl CastPool {
   #[must_use]
   pub fn new(ownership_lost: Option<UnboundedSender<String>>) -> Self {
     Self {
-      workers: Mutex::new(HashMap::new()),
+      workers: Arc::new(Mutex::new(HashMap::new())),
       ownership_lost,
       media_recovered: None,
     }
@@ -331,10 +342,15 @@ impl CastPool {
   ///
   /// Updates host / hostname / port when the registry entry changes.
   /// Does **not** spawn a second worker while one is still registered (including
-  /// during join after shutdown signal).
+  /// an exiting tombstone after join timeout).
   pub fn ensure(&self, device: &Device) {
     let mut guard = self.workers.lock();
     if let Some(handle) = guard.get_mut(&device.id) {
+      // Tombstone from remove: worker may still be unwinding; never double-spawn.
+      if !ensure_may_spawn_for_slot(handle.exiting) {
+        drop(guard);
+        return;
+      }
       let host_changed = handle.host != device.host || handle.hostname != device.hostname || handle.port != device.port;
       if host_changed {
         handle.host.clone_from(&device.host);
@@ -391,6 +407,7 @@ impl CastPool {
         hostname: device.hostname.clone(),
         port: device.port,
         relay_slot,
+        exiting: false,
       },
     ));
     drop(guard);
@@ -399,30 +416,36 @@ impl CastPool {
 
   /// Shut down and remove the worker for `device_id` (device left the network).
   ///
-  /// Forces relay socket shutdown so a blocked `rust_cast` read unblocks; keeps the
-  /// map entry until join completes so [`Self::ensure`] cannot spawn a duplicate.
+  /// Forces relay socket shutdown so a blocked `rust_cast` read unblocks. The map
+  /// entry is kept until the worker **actually** exits so [`Self::ensure`] cannot
+  /// spawn a duplicate (on join timeout a reaper removes the tombstone later).
   pub fn remove(&self, device_id: &str) {
-    let join_handle = {
-      let mut workers = self.workers.lock();
-      let Some(worker) = workers.get_mut(device_id) else {
-        return;
-      };
-      // Unblock any stuck read before/while Shutdown is processed.
-      if let Ok(mut slot) = worker.relay_slot.lock()
-        && let Some(relay) = slot.take()
-      {
-        relay.shutdown();
-      }
-      drop(worker.cmd_tx.send(CastWorkerCmd::Shutdown));
-      let handle = worker.thread.take();
-      drop(workers);
-      handle
+    let mut workers = self.workers.lock();
+    let Some(worker) = workers.get_mut(device_id) else {
+      return;
     };
-    if let Some(handle) = join_handle {
-      join_with_timeout(handle, JOIN_TIMEOUT, device_id);
+    if worker.exiting {
+      // Remove already in flight (or reaper pending); do not clear the tombstone.
+      return;
     }
-    drop(self.workers.lock().remove(device_id));
-    tracing::info!(%device_id, "warm Cast worker removed");
+    worker.exiting = true;
+    // Unblock any stuck read before/while Shutdown is processed.
+    if let Ok(mut slot) = worker.relay_slot.lock()
+      && let Some(relay) = slot.take()
+    {
+      relay.shutdown();
+    }
+    drop(worker.cmd_tx.send(CastWorkerCmd::Shutdown));
+    let join_handle = worker.thread.take();
+    drop(workers);
+
+    if let Some(handle) = join_handle {
+      join_and_reap_worker(handle, JOIN_TIMEOUT, device_id.to_owned(), Arc::clone(&self.workers));
+    } else {
+      // No live thread (spawn never produced a handle); drop the tombstone.
+      drop(self.workers.lock().remove(device_id));
+      tracing::info!(%device_id, "warm Cast worker removed");
+    }
   }
 
   /// Shut down every worker (process exit).
@@ -676,7 +699,8 @@ fn worker_main(
       match cmd_rx.recv_timeout(wait) {
         Ok(cmd) => cmd,
         Err(RecvTimeoutError::Timeout) => {
-          state.on_idle_tick();
+          // Idle recovery / probes / reconnect are blocking Cast ops; same hard deadline.
+          state.with_hard_deadline(WorkerState::on_idle_tick);
           continue;
         },
         Err(RecvTimeoutError::Disconnected) => {
@@ -858,9 +882,12 @@ impl WorkerState {
   }
 
   /// Run `op` under a hard deadline: if still running after [`WORKER_OP_DEADLINE`],
-  /// shut down the relay so blocking `rust_cast` I/O unblocks.
+  /// shut down the relay so blocking `rust_cast` I/O unblocks, then clear `device`
+  /// so the next command/idle tick rebuilds the connection.
   fn with_hard_deadline<T>(&mut self, op: impl FnOnce(&mut Self) -> T) -> T {
     let relay_slot = Arc::clone(&self.relay_slot);
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_watch = Arc::clone(&fired);
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     let device_id = self.device_id.clone();
     let watchdog = std::thread::Builder::new()
@@ -873,6 +900,7 @@ impl WorkerState {
             deadline_s = WORKER_OP_DEADLINE.as_secs(),
             "warm Cast op exceeded hard deadline; shutting down relay"
           );
+          fired_watch.store(true, Ordering::SeqCst);
           if let Ok(mut slot) = relay_slot.lock()
             && let Some(relay) = slot.take()
           {
@@ -886,6 +914,10 @@ impl WorkerState {
     drop(cancel_tx);
     if let Some(handle) = watchdog {
       drop(handle.join());
+    }
+    if fired.load(Ordering::SeqCst) {
+      // Relay already shut by watchdog; drop dead client so reconnect rebuilds.
+      let _cleared = apply_hard_deadline_device_clear(&mut self.device);
     }
     result
   }
@@ -905,13 +937,20 @@ impl WorkerState {
 
     match connect_cast_device(&self.host, self.port, &self.relay_slot) {
       Ok(device) => {
-        if let Err(err) = device.connection.connect("receiver-0") {
-          self.note_unreachable(&Error::Cast(format!("warm connection channel: {err}")));
-          return Err(Error::Cast(format!("warm connection channel: {err}")));
+        if let Err(connect_err) = device.connection.connect("receiver-0") {
+          // Drop device (closes TLS) and shut the relay still held in the slot.
+          drop(device);
+          self.shutdown_relay_slot();
+          let err = Error::Cast(format!("warm connection channel: {connect_err}"));
+          self.note_unreachable(&err);
+          return Err(err);
         }
-        if let Err(err) = device.heartbeat.ping() {
-          self.note_unreachable(&Error::Cast(format!("warm heartbeat: {err}")));
-          return Err(Error::Cast(format!("warm heartbeat: {err}")));
+        if let Err(ping_err) = device.heartbeat.ping() {
+          drop(device);
+          self.shutdown_relay_slot();
+          let err = Error::Cast(format!("warm heartbeat: {ping_err}"));
+          self.note_unreachable(&err);
+          return Err(err);
         }
 
         self.device = Some(device);
@@ -941,6 +980,15 @@ impl WorkerState {
         self.note_unreachable(&err);
         Err(err)
       },
+    }
+  }
+
+  /// Take and shut any relay currently installed in the shared slot.
+  fn shutdown_relay_slot(&self) {
+    if let Ok(mut slot) = self.relay_slot.lock()
+      && let Some(relay) = slot.take()
+    {
+      relay.shutdown();
     }
   }
 
@@ -1190,12 +1238,12 @@ impl WorkerState {
         drop(self.ensure_connected(true));
       },
       OwnershipAction::AttemptReload => {
-        if self.try_internal_reload() {
-          self.reload_attempted = true;
+        let recovered = self.try_internal_reload();
+        self.reload_attempted = reload_attempted_after_internal_reload(recovered);
+        if recovered {
           self.ownership_loss_streak = 0;
           self.buffering_streak = 0;
         } else {
-          self.reload_attempted = true;
           self.note_lost_signal(&transport_id, media_session_id);
         }
       },
@@ -1706,24 +1754,72 @@ fn short_id(device_id: &str) -> &str {
   device_id.get(..end).unwrap_or(device_id)
 }
 
+/// Clear the warm device client after a hard-deadline fire (pure for unit tests).
+#[must_use]
+pub(crate) fn apply_hard_deadline_device_clear<T>(device: &mut Option<T>) -> bool {
+  if device.is_some() {
+    *device = None;
+    true
+  } else {
+    false
+  }
+}
+
+/// Whether `remove` may drop the worker map entry after a join attempt.
+///
+/// On timeout the entry stays as an exiting tombstone until a reaper joins.
+#[must_use]
+pub(crate) const fn remove_clears_map_entry(join_completed: bool) -> bool {
+  join_completed
+}
+
+/// Whether `ensure` may spawn a new worker for an existing map slot.
+#[must_use]
+pub(crate) const fn ensure_may_spawn_for_slot(exiting: bool) -> bool {
+  !exiting
+}
+
+/// Next `reload_attempted` flag after an internal re-LOAD attempt.
+///
+/// Spec: one re-LOAD **per trouble episode**. Success ends the episode (`false`);
+/// only failure marks the episode so a second Recoverable IDLE can escalate.
+#[must_use]
+pub(crate) const fn reload_attempted_after_internal_reload(success: bool) -> bool {
+  !success
+}
+
 /// Join a worker thread without blocking forever if it is stuck in I/O.
 ///
-/// Callers should already have forced relay shutdown so the worker can exit.
-fn join_with_timeout(thread: JoinHandle<()>, timeout: Duration, device_id: &str) {
+/// On success, removes `device_id` from `workers`. On timeout, leaves the exiting
+/// tombstone in the map and spawns a reaper that removes it after the late join.
+fn join_and_reap_worker(
+  thread: JoinHandle<()>,
+  timeout: Duration,
+  device_id: String,
+  workers: Arc<Mutex<HashMap<String, CastWorkerHandle>>>,
+) {
   let (done_tx, done_rx) = mpsc::sync_channel(1);
   let waiter = std::thread::spawn(move || {
     drop(thread.join());
     let _send = done_tx.send(());
   });
-  if done_rx.recv_timeout(timeout).is_ok() {
+  let join_completed = done_rx.recv_timeout(timeout).is_ok();
+  if remove_clears_map_entry(join_completed) {
     drop(waiter.join());
+    drop(workers.lock().remove(&device_id));
+    tracing::info!(%device_id, "warm Cast worker removed");
   } else {
     tracing::warn!(
       %device_id,
       timeout_ms = timeout.as_millis(),
-      "warm Cast worker join timed out; detaching"
+      "warm Cast worker join timed out; keeping map entry until exit"
     );
-    drop(waiter);
+    let reaper_name = format!("cast-reap-{}", short_id(&device_id));
+    drop(std::thread::Builder::new().name(reaper_name).spawn(move || {
+      drop(waiter.join());
+      drop(workers.lock().remove(&device_id));
+      tracing::info!(%device_id, "warm Cast worker removed after late join");
+    }));
   }
 }
 
@@ -1824,7 +1920,17 @@ mod tests {
     let mut i = base_inputs();
     i.idle_reason = Some(IdleReasonKind::Recoverable);
     i.load_within_guard = true;
-    assert_eq!(ownership_action(i), OwnershipAction::LostSignal);
+    // Guard means wait for the bridge rollover LOAD — not LostSignal / AirPlay kick.
+    assert_eq!(ownership_action(i), OwnershipAction::Inconclusive);
+  }
+
+  #[test]
+  fn ownership_buffering_stuck_skips_reload_when_load_recent() {
+    let mut i = base_inputs();
+    i.buffering = true;
+    i.buffering_streak = 3;
+    i.load_within_guard = true;
+    assert_eq!(ownership_action(i), OwnershipAction::Inconclusive);
   }
 
   #[test]
@@ -1835,6 +1941,59 @@ mod tests {
     assert_eq!(ownership_action(i), OwnershipAction::Owned);
     i.buffering_streak = 3;
     assert_eq!(ownership_action(i), OwnershipAction::AttemptReload);
+  }
+
+  #[test]
+  fn reload_attempted_cleared_on_success_set_on_failure() {
+    assert!(!reload_attempted_after_internal_reload(true));
+    assert!(reload_attempted_after_internal_reload(false));
+  }
+
+  #[test]
+  fn remove_clears_map_only_when_join_completes() {
+    assert!(remove_clears_map_entry(true));
+    assert!(!remove_clears_map_entry(false));
+  }
+
+  #[test]
+  fn ensure_may_not_spawn_while_exiting() {
+    assert!(ensure_may_spawn_for_slot(false));
+    assert!(!ensure_may_spawn_for_slot(true));
+  }
+
+  #[test]
+  fn hard_deadline_fire_clears_device_option() {
+    let mut device = Some(42_u8);
+    assert!(apply_hard_deadline_device_clear(&mut device));
+    assert!(device.is_none());
+    assert!(!apply_hard_deadline_device_clear(&mut device));
+  }
+
+  #[test]
+  fn ensure_does_not_spawn_over_exiting_tombstone() {
+    let pool = CastPool::new(None);
+    let device = sample_device("nest-tombstone");
+    {
+      let (cmd_tx, _cmd_rx) = mpsc::channel();
+      drop(pool.workers.lock().insert(
+        device.id.clone(),
+        CastWorkerHandle {
+          cmd_tx,
+          thread: None,
+          host: device.host.clone(),
+          hostname: device.hostname.clone(),
+          port: device.port,
+          relay_slot: Arc::new(StdMutex::new(None)),
+          exiting: true,
+        },
+      ));
+    }
+    pool.ensure(&device);
+    let workers = pool.workers.lock();
+    let handle = workers.get(&device.id).expect("tombstone kept");
+    assert!(handle.exiting, "ensure must not clear exiting flag");
+    assert!(handle.thread.is_none(), "ensure must not spawn a second worker");
+    drop(workers);
   }
 
   #[test]
@@ -1892,6 +2051,17 @@ mod tests {
     assert_eq!(classify_cast_probe_error(&err), ProbeFailureKind::Parse);
   }
 
+  fn wait_until_worker_gone(pool: &CastPool, device_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+      if !pool.device_ids().contains(&device_id.to_owned()) {
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("worker {device_id} still registered after remove/reaper window");
+  }
+
   #[test]
   fn worker_shutdown_joins_without_panic() {
     let pool = CastPool::new(None);
@@ -1899,7 +2069,8 @@ mod tests {
     pool.ensure(&device);
     assert!(pool.device_ids().contains(&device.id));
     pool.remove(&device.id);
-    assert!(!pool.device_ids().contains(&device.id));
+    // Map entry may remain as an exiting tombstone until the worker (or reaper) finishes.
+    wait_until_worker_gone(&pool, &device.id);
   }
 
   #[test]
@@ -1925,6 +2096,7 @@ mod tests {
     pool.ensure(&device);
     assert_eq!(pool.device_ids().len(), 1);
     pool.shutdown();
+    wait_until_worker_gone(&pool, &device.id);
     assert!(pool.device_ids().is_empty());
   }
 
