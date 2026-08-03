@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 /// How long after a remove event before the device actually leaves the registry.
 pub const DEFAULT_PENDING_LEAVE: Duration = Duration::from_secs(20);
@@ -140,6 +140,10 @@ pub fn match_device_for_leave<'a>(devices: &'a [Device], instance: &str) -> Opti
 #[derive(Debug, Default)]
 pub struct DeviceRegistry {
   inner: RwLock<HashMap<String, Device>>,
+  /// Ids that cancelled a pending leave via [`Self::appear`] since the last drain.
+  ///
+  /// Maintain drains this each tick to reset volume-seed attempts on re-sight.
+  pending_leave_cancellations: Mutex<Vec<String>>,
 }
 
 impl DeviceRegistry {
@@ -152,16 +156,30 @@ impl DeviceRegistry {
   ///
   /// Re-appearance cancels any pending leave and refreshes `last_seen`.
   /// Returns `true` if this id was not previously present (first appear).
+  ///
+  /// When a pending leave is cancelled, the id is queued for
+  /// [`Self::drain_pending_leave_cancellations`].
   pub fn appear(&self, mut device: Device) -> bool {
     let mut guard = self.inner.write();
     let key = device.id.clone();
     let is_new = !guard.contains_key(&key);
+    let was_pending = guard.get(&key).is_some_and(|d| d.pending_leave_deadline.is_some());
     // Appear always clears pending leave (re-sight cancels debounce).
     device.pending_leave_deadline = None;
     device.pending_leave_since = None;
     device.last_seen = Instant::now();
-    drop(guard.insert(key, device));
+    drop(guard.insert(key.clone(), device));
+    drop(guard);
+    if was_pending {
+      self.pending_leave_cancellations.lock().push(key);
+    }
     is_new
+  }
+
+  /// Drain device ids that cancelled a pending leave via re-appear since the last drain.
+  #[must_use]
+  pub fn drain_pending_leave_cancellations(&self) -> Vec<String> {
+    std::mem::take(&mut *self.pending_leave_cancellations.lock())
   }
 
   /// Remove a device that left the network immediately (no debounce).
@@ -352,6 +370,16 @@ mod tests {
     assert!(!reg.is_pending_leave("a"));
     assert_eq!(reg.len(), 1);
     assert_eq!(reg.get("a").map(|d| d.name), Some("New".to_owned()));
+    assert_eq!(reg.drain_pending_leave_cancellations(), vec!["a".to_owned()]);
+    assert!(reg.drain_pending_leave_cancellations().is_empty());
+  }
+
+  #[test]
+  fn appear_without_pending_does_not_queue_cancellation() {
+    let reg = DeviceRegistry::new();
+    assert!(reg.appear(sample("a", "A")));
+    assert!(!reg.appear(sample("a", "A2")));
+    assert!(reg.drain_pending_leave_cancellations().is_empty());
   }
 
   #[test]
