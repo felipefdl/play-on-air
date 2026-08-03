@@ -68,6 +68,37 @@ struct PlayoutState {
     pending_flush: bool,
 }
 
+/// Synchronous, abort-safe stop handle for buffered playout.
+///
+/// Call [`stop`](Self::stop) *before* aborting the command/receive tasks so the
+/// delivery thread unblocks even if the async [`PlayoutCommand::Stop`] is never polled.
+#[derive(Clone)]
+pub(crate) struct PlayoutStop {
+    state: Arc<(Mutex<PlayoutState>, Condvar)>,
+}
+
+impl PlayoutStop {
+    /// Mark playout stopped and wake the delivery thread.
+    pub(crate) fn stop(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        s.stopped = true;
+        s.buffer.clear();
+        cvar.notify_all();
+    }
+}
+
+/// Ensures delivery stops when the receive task exits or is aborted.
+struct ReceiveCleanup {
+    stop: PlayoutStop,
+}
+
+impl Drop for ReceiveCleanup {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
+
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
 pub(crate) struct BufferedAudioProcessor {
     /// TCP listener waiting for the iPhone to connect.
@@ -77,8 +108,9 @@ pub(crate) struct BufferedAudioProcessor {
 impl BufferedAudioProcessor {
     /// Start the processing pipeline.
     ///
-    /// Returns the command sender and abort handles for the async command/receive tasks
-    /// (so the server can force-kill sockets on hard stop).
+    /// Returns the command sender, a **synchronous** stop handle (use this from
+    /// `hard_stop_sessions` / TEARDOWN before aborting tasks), and abort handles for
+    /// the async command/receive tasks.
     pub(crate) fn start(
         self,
         shk: [u8; 32],
@@ -86,6 +118,7 @@ impl BufferedAudioProcessor {
         handler: Arc<dyn AudioHandler>,
     ) -> (
         tokio::sync::mpsc::UnboundedSender<PlayoutCommand>,
+        PlayoutStop,
         Vec<tokio::task::AbortHandle>,
     ) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -106,6 +139,9 @@ impl BufferedAudioProcessor {
             }),
             Condvar::new(),
         ));
+        let playout_stop = PlayoutStop {
+            state: Arc::clone(&state),
+        };
 
         // Delivery thread
         let state2 = state.clone();
@@ -185,10 +221,14 @@ impl BufferedAudioProcessor {
             }
         });
 
-        // Receiver task
+        // Receiver task — cleanup runs via Drop even if this task is aborted.
         let state4 = state.clone();
-
         let recv_handle = tokio::spawn(async move {
+            let _cleanup = ReceiveCleanup {
+                stop: PlayoutStop {
+                    state: Arc::clone(&state4),
+                },
+            };
             let (stream, addr) = match self.listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -201,7 +241,11 @@ impl BufferedAudioProcessor {
             receive_loop(stream, &shk, output_config, state4, &handler).await;
         });
 
-        (cmd_tx, vec![cmd_handle.abort_handle(), recv_handle.abort_handle()])
+        (
+            cmd_tx,
+            playout_stop,
+            vec![cmd_handle.abort_handle(), recv_handle.abort_handle()],
+        )
     }
 }
 
@@ -272,7 +316,7 @@ async fn receive_loop(
 
             // Signal format change to delivery thread
             let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
             s.sample_rate = target_sr;
             s.channels = target_ch;
             s.format_changed = true;
@@ -308,18 +352,14 @@ async fn receive_loop(
             );
 
             let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
             s.buffer.insert(timestamp, samples);
             cvar.notify_all();
         }
     }
+    // Delivery stop is owned by `ReceiveCleanup` Drop on the receive task so
+    // abort still unblocks the delivery thread.
     debug!("Buffered audio receive loop ended");
-    let (lock, cvar) = &*state;
-    if let Ok(mut s) = lock.lock() {
-        s.stopped = true;
-        s.buffer.clear();
-        cvar.notify_all();
-    }
 }
 
 /// Timed playout delivery thread. Wakes on condvar, delivers due frames to AudioSession.
@@ -533,10 +573,24 @@ mod tests {
     }
 
     fn stop_delivery(state: &Arc<(Mutex<PlayoutState>, Condvar)>) {
-        let (lock, cvar) = &**state;
-        let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        s.stopped = true;
-        cvar.notify_all();
+        PlayoutStop {
+            state: Arc::clone(state),
+        }
+        .stop();
+    }
+
+    fn join_with_timeout(join: std::thread::JoinHandle<()>, label: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if join.is_finished() {
+                join.join().unwrap_or_else(|_| panic!("{label} panicked"));
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("{label} did not exit within timeout");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -582,7 +636,7 @@ mod tests {
         assert_eq!(handler.inits.load(Ordering::SeqCst), 2);
 
         stop_delivery(&state);
-        join.join().expect("delivery thread");
+        join_with_timeout(join, "delivery thread");
 
         let order = handler.order.lock().unwrap_or_else(PoisonError::into_inner).clone();
         // Expect: audio_init, (maybe process), drop, audio_init, drop (on stop).
@@ -597,6 +651,59 @@ mod tests {
         assert!(
             between.contains(&"drop"),
             "old session must drop before second audio_init; order={order:?}"
+        );
+    }
+
+    /// Hard-stop path: sync stop must unblock delivery without an async PlayoutCommand.
+    #[test]
+    fn sync_stop_unblocks_delivery_and_drops_session() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let stop = PlayoutStop {
+            state: Arc::clone(&state),
+        };
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.buffer.insert(0, vec![0.0, 0.0]);
+            s.anchor_local_ns = now_ns();
+            cvar.notify_all();
+        }
+        wait_until(|| handler.inits.load(Ordering::SeqCst) >= 1, "audio_init");
+
+        // Mimic hard_stop_sessions: sync stop only (no async channel, no command task).
+        stop.stop();
+        join_with_timeout(join, "delivery after sync stop");
+
+        let counters = current_counters(&handler).expect("session counters");
+        assert!(
+            counters.drops.load(Ordering::SeqCst) >= 1,
+            "AudioSession must Drop when delivery exits after sync stop"
+        );
+        assert!(
+            state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped,
+            "playout state must be stopped"
+        );
+    }
+
+    #[test]
+    fn receive_cleanup_drop_stops_playout() {
+        let state = fresh_state(44_100, 2);
+        {
+            let _cleanup = ReceiveCleanup {
+                stop: PlayoutStop {
+                    state: Arc::clone(&state),
+                },
+            };
+            assert!(!state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped);
+        }
+        assert!(
+            state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped,
+            "ReceiveCleanup Drop must stop playout (abort-safe)"
         );
     }
 
@@ -684,6 +791,6 @@ mod tests {
         assert!(counters.flushes.load(Ordering::SeqCst) >= 1);
 
         stop_delivery(&state);
-        join.join().expect("delivery thread");
+        join_with_timeout(join, "delivery thread");
     }
 }

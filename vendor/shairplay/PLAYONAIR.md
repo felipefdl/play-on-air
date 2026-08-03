@@ -21,5 +21,9 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
    outside the playout mutex (avoids Drop clearing the new ring).
 7. `AudioSession::on_rate` / `on_flush` for AP2 buffered SetRate/FLUSHBUFFERED; delivery drains
    pending flags so pause/flush reach the host while rate is 0.
+8. Buffered playout: `PlayoutStop` sync stop + receive-task Drop cleanup so hard-stop before task
+   abort unblocks the delivery thread (async `PlayoutCommand::Stop` alone was abort-unsafe).
+9. TEARDOWN calls `hard_stop_sessions()` (clears active_audio, aborts session tasks including
+   realtime) and takes `playout_cmd` instead of a best-effort async Stop.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

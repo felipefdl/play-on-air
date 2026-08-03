@@ -702,13 +702,15 @@ fn setup_stream_buffered(
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
-    let (cmd_tx, aborts) = proc.start(shk_arr, output_config, handler);
+    let (cmd_tx, playout_stop, aborts) = proc.start(shk_arr, output_config, handler);
     for h in aborts {
         conn.shared.register_session_task(h);
     }
-    conn.playout_cmd = Some(cmd_tx.clone());
+    conn.playout_cmd = Some(cmd_tx);
+    // Sync stop so hard_stop / TEARDOWN unblocks the delivery thread before
+    // aborting the command task (async PlayoutCommand::Stop is not abort-safe).
     conn.shared.set_active_audio(Box::new(move || {
-        let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+        playout_stop.stop();
     }));
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
