@@ -13,7 +13,7 @@ Product intent: [`VISION.md`](VISION.md).
 | **Zero setup** | Binary runs with no config file and no flags for the happy path. Discover Chromecasts, expose each as AirPlay 2, bridge audio. Missing optional TOML = product defaults, not error. |
 | **AP2 only** | AirPlay 2 receiver only. No AirPlay 1 stack, no dual protocol. |
 | **Chromecast only** | Google Cast devices only. No UPnP, Sonos, or generic DLNA. |
-| **Quality first** | Decode AirPlay input once; egress **FLAC** (or lossless WAV/LPCM if a sink rejects FLAC). Never default to MP3/AAC for the Cast hop. Prefer realtime ALAC when the client offers it; fully support buffered AAC without a second lossy encode. |
+| **Quality first** | Decode AirPlay input once; egress **FLAC** over chunked HTTP with Cast `streamType` LIVE (WAV/LPCM BUFFERED fallback when a sink rejects FLAC). Never default to MP3/AAC for the Cast hop. Prefer realtime ALAC when the client offers it; fully support buffered AAC without a second lossy encode. ~2 s Cast-side cushion via silence preroll and maintained lead. |
 | **Performance first** | Steady-state audio path: no alloc thrash, no blocking Cast control on the sample thread, pre-sized ring buffers, structured `tracing` only. |
 | **Optional cosmetics only** | Optional TOML may rename or hide devices. It must not be required for discovery, pairing, or playback. |
 | **Honest limits** | No video A/V sync promises. No hi-res end-to-end claims beyond what AirPlay speaker casting delivers. Unsupported is **not supported**. |
@@ -64,7 +64,7 @@ New crates must set `[lints] workspace = true`.
 
 ## Audio and protocol rules
 
-1. **No second lossy encode** on the default path. FLAC (or WAV/LPCM) to Chromecast.
+1. **No second lossy encode** on the default path. Decode once; egress FLAC over chunked HTTP (`streamType` LIVE). WAV/LPCM BUFFERED is the fallback when a device rejects FLAC.
 2. Support AP2 **realtime** and **buffered** audio as clients send them. Do not require the user to pick a mode.
 3. Discovery is continuous. Device gone → withdraw AirPlay advertisement; device back → re-advertise.
 4. Default AirPlay name = Chromecast advertised name (identity map). Optional TOML overrides name or sets hide.
