@@ -335,14 +335,13 @@ pub(crate) fn handle_setup(
 
 /// AP1 RTSP RECORD: acknowledge the start of RTP streaming.
 pub(crate) fn handle_record(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    // Mirror the AP2 RECORD response: classic RAOP clients expect an
-    // Audio-Latency header. The value is a placeholder — actual playback
-    // timing is handled by the RTP layer, not advertised here.
-    response.add_header("Audio-Latency", "0");
+    // Classic RAOP clients expect Audio-Latency in samples at stream rate.
+    // Configured on the server builder (default ~2 s @ 48 kHz).
+    response.add_header("Audio-Latency", &conn.shared.audio_latency_samples.to_string());
     None
 }
 
@@ -450,6 +449,7 @@ mod tests {
             handler,
             output_sample_rate: None,
             output_max_channels: None,
+            audio_latency_samples: crate::raop::server::DEFAULT_AUDIO_LATENCY_SAMPLES,
             reported_volume_db: std::sync::Mutex::new(0.0),
         });
         let pairing = shared.pairing.create_session();

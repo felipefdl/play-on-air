@@ -177,8 +177,8 @@ async fn ap1_record_returns_200() {
 
     assert!(resp.contains("RTSP/1.0 200 OK"), "got: {resp}");
     assert!(resp.contains("CSeq: 8"));
-    // Parity with the AP2 RECORD response (clients expect this header).
-    assert!(resp.contains("Audio-Latency: 0"), "got: {resp}");
+    // Default builder latency: 2 s at 48 kHz (samples at stream rate).
+    assert!(resp.contains("Audio-Latency: 96000"), "got: {resp}");
 
     server.stop().await;
 }

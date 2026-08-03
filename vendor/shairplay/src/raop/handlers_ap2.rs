@@ -702,13 +702,15 @@ fn setup_stream_buffered(
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
-    let (cmd_tx, aborts) = proc.start(shk_arr, output_config, handler);
+    let (cmd_tx, playout_stop, aborts) = proc.start(shk_arr, output_config, handler);
     for h in aborts {
         conn.shared.register_session_task(h);
     }
-    conn.playout_cmd = Some(cmd_tx.clone());
+    conn.playout_cmd = Some(cmd_tx);
+    // Sync stop so hard_stop / TEARDOWN unblocks the delivery thread before
+    // aborting the command task (async PlayoutCommand::Stop is not abort-safe).
     conn.shared.set_active_audio(Box::new(move || {
-        let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+        playout_stop.stop();
     }));
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
@@ -822,12 +824,13 @@ fn setup_stream_video(
 #[cfg(feature = "ap2")]
 /// AP2 RECORD: start buffered audio playout.
 pub(crate) fn handle_record(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     tracing::debug!("RECORD");
-    response.add_header("Audio-Latency", "0");
+    // Samples at stream rate — builder-configurable (default ~2 s @ 48 kHz).
+    response.add_header("Audio-Latency", &conn.shared.audio_latency_samples.to_string());
     None
 }
 

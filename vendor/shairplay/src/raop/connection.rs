@@ -12,6 +12,8 @@ use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "ap2")]
+use std::sync::PoisonError;
 
 /// Minimum AirPlay volume in dB (`GET_PARAMETER` / `SET_PARAMETER`). Mute floor.
 pub(crate) const AIRPLAY_VOLUME_DB_MIN: f32 = -144.0;
@@ -32,6 +34,8 @@ pub(crate) struct RaopShared {
     /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
     #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
+    /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
+    pub(crate) audio_latency_samples: u32,
     #[cfg(feature = "ap2")]
     pub(crate) pin: Option<String>,
     #[cfg(feature = "video")]
@@ -72,7 +76,11 @@ impl RaopShared {
     /// Register a newly-started audio session, stopping the previous one so only
     /// the latest connection's playout feeds the audio output.
     pub(crate) fn set_active_audio(&self, stop: Box<dyn FnOnce() + Send>) {
-        let prev = self.active_audio.lock().ok().and_then(|mut g| g.replace(stop));
+        let prev = self
+            .active_audio
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(stop);
         if let Some(prev) = prev {
             prev();
         }
@@ -80,22 +88,26 @@ impl RaopShared {
 
     /// Track a detached task so [`Self::hard_stop_sessions`] can abort it.
     pub(crate) fn register_session_task(&self, handle: tokio::task::AbortHandle) {
-        if let Ok(mut guard) = self.session_tasks.lock() {
-            guard.push(handle);
-        }
+        self.session_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
     }
 
     /// Stop active audio and abort all registered AP2 session tasks.
+    ///
+    /// Order is load-bearing: the active-audio stop handle must run **before**
+    /// aborting tasks. Buffered playout registers a synchronous stop that sets
+    /// `stopped` and notifies the delivery condvar; if the async command task is
+    /// aborted first, `PlayoutCommand::Stop` is never polled and delivery wedges.
     pub(crate) fn hard_stop_sessions(&self) {
-        if let Ok(mut guard) = self.active_audio.lock()
-            && let Some(stop) = guard.take()
-        {
+        let stop = self.active_audio.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(stop) = stop {
             stop();
         }
-        if let Ok(mut guard) = self.session_tasks.lock() {
-            for handle in guard.drain(..) {
-                handle.abort();
-            }
+        let mut tasks = self.session_tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        for handle in tasks.drain(..) {
+            handle.abort();
         }
     }
 }

@@ -17,5 +17,27 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 5. Reported volume: `RaopShared` stores the dB returned by `GET_PARAMETER volume` (default `0.0`);
    `SET_PARAMETER` updates it; `RaopServer::set_reported_volume_db` / `reported_volume_db` let the host
    seed the value from Chromecast so the iOS slider matches device level.
+6. Buffered delivery: drop old `AudioSession` before `audio_init` on format change; run `audio_init`
+   outside the playout mutex (avoids Drop clearing the new ring).
+7. `AudioSession::on_rate` / `on_flush` for AP2 buffered SetRate/FLUSHBUFFERED; delivery drains
+   pending flags so pause/flush reach the host while rate is 0.
+8. Buffered playout: `PlayoutStop` sync stop + receive-task Drop cleanup so hard-stop before task
+   abort unblocks the delivery thread (async `PlayoutCommand::Stop` alone was abort-unsafe).
+9. TEARDOWN calls `hard_stop_sessions()` (clears active_audio, aborts session tasks including
+   realtime) and takes `playout_cmd` instead of a best-effort async Stop.
+10. Playout anchors/scheduling use `mono_now_ns()` (`Instant`); wall `now_ns()` remains for PTP only.
+11. Delivery caps due AAC packets per tick (`MAX_FRAMES_PER_TICK`) so catch-up cannot flood the host ring.
+12. Playout RTP math uses `source_sample_rate`; FLUSHBUFFERED range compare is wrap-safe; map capped ~30s.
+13. Playout mutex/condvar locks use `unwrap_or_else(PoisonError::into_inner)` (poison-proof).
+14. Realtime type 96: RTP seq reorder window (drop dups, silence for aged gaps; ALAC in order only).
+    Decode failure fills the same silence length as a Lost packet (keeps PCM clock length).
+15. RTSP `process_connection` read timeout (45s) so half-open iOS sockets release the connection semaphore; accept loop prunes finished `conn_aborts`.
+16. Configurable `Audio-Latency` RECORD header (`RaopServerBuilder::audio_latency_samples`, default 96000 = 2s@48k).
+17. Event channel: 1 MB ciphertext cap, disconnect on decrypt error, exit when command sender closes.
+18. PTP sink abort handles stored and aborted in `RaopServer::stop` (avoids EADDRINUSE on restart).
+
+### Accepted deviations
+
+- **Buffered `BTreeMap<u32, …>` RTP key order:** keys are raw `u32` RTP timestamps. Across a wrap, `BTreeMap` order is not wrap-aware (high keys sort after low keys). The ~30 s map cap keeps the live span ≪ 2^32 samples, so wrap-within-map does not occur for normal sessions. Revisit only if multi-hour sessions keep a map that can span a wrap.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

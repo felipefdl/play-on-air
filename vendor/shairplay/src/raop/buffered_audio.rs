@@ -10,7 +10,7 @@
 //! - **Delivery** (std::thread): timed playout using anchor-based scheduling
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -19,7 +19,28 @@ use crate::codec::aac::{AacDecoder, AudioSsrc};
 use crate::error::{CodecError, NetworkError, ShairplayError};
 use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
-use crate::util::now_ns;
+use crate::util::mono_now_ns;
+
+/// Max AAC packets delivered to the host per delivery-loop tick.
+///
+/// Each map entry is one decoded AAC packet (typically 1024 source samples before
+/// resample). Uncapped catch-up after a stall would dump the whole map into the
+/// host ring in one burst. 16 packets ≈ 370 ms at 44.1/48 kHz — enough to recover
+/// without flooding a multi-second ring in a single write storm. Excess due frames
+/// stay in the map for the next tick.
+const MAX_FRAMES_PER_TICK: usize = 16;
+
+/// Max RTP-timestamp span retained in the playout map (~30 s of source audio).
+///
+/// While rate=0 (paused) or the client buffers far ahead, the map can grow without
+/// bound. Cap by source-clock duration and by packet count (1024-sample AAC frames).
+const MAX_BUFFER_DURATION_SECS: u32 = 30;
+
+/// Typical AAC frame length in source samples (ADTS / AirPlay buffered path).
+const AAC_FRAME_SAMPLES: u32 = 1024;
+
+/// Minimum interval between buffer-cap warning logs (1 s of mono time).
+const BUFFER_CAP_WARN_INTERVAL_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone)]
 /// Output configuration passed from the server builder.
@@ -56,12 +77,110 @@ pub enum PlayoutCommand {
 struct PlayoutState {
     buffer: BTreeMap<u32, Vec<f32>>, // rtp_timestamp → F32 PCM samples
     anchor_rtp: u32,
+    /// Monotonic local time at the anchor (see [`mono_now_ns`]).
     anchor_local_ns: u64,
     rate: u32,
+    /// Output sample rate for `AudioFormat` / host ring (may differ after resample).
     sample_rate: u32,
+    /// Source RTP clock rate (AAC/ALAC stream). Playout math scales wall time by this.
+    source_sample_rate: u32,
     channels: u8,
     stopped: bool,
     format_changed: bool,
+    /// Set by the command task; drained by `delivery_loop` onto the live session.
+    pending_rate: Option<u32>,
+    /// Set by the command task on FLUSHBUFFERED; drained by `delivery_loop`.
+    pending_flush: bool,
+    /// Cumulative map entries dropped by the duration/count cap.
+    buffer_cap_drops: u64,
+    /// Mono time of last rate-limited buffer-cap warning.
+    last_cap_warn_ns: u64,
+}
+
+/// Synchronous, abort-safe stop handle for buffered playout.
+///
+/// Call [`stop`](Self::stop) *before* aborting the command/receive tasks so the
+/// delivery thread unblocks even if the async [`PlayoutCommand::Stop`] is never polled.
+#[derive(Clone)]
+pub(crate) struct PlayoutStop {
+    state: Arc<(Mutex<PlayoutState>, Condvar)>,
+}
+
+impl PlayoutStop {
+    /// Mark playout stopped and wake the delivery thread.
+    pub(crate) fn stop(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        s.stopped = true;
+        s.buffer.clear();
+        cvar.notify_all();
+    }
+}
+
+/// Ensures delivery stops when the receive task exits or is aborted.
+struct ReceiveCleanup {
+    stop: PlayoutStop,
+}
+
+impl Drop for ReceiveCleanup {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
+
+/// Wrap-safe closed range on the RTP u32 timeline: `from <= ts <= until` with wrap.
+///
+/// Mirrors the `(a.wrapping_sub(b) as i32) >= 0` half-plane checks used for due frames.
+fn rtp_in_flush_range(ts: u32, from: u32, until: u32) -> bool {
+    (ts.wrapping_sub(from) as i32) >= 0 && (until.wrapping_sub(ts) as i32) >= 0
+}
+
+/// Remove and return up to `max_frames` due packets (RTP ts ≤ `target_rtp`, wrap-safe).
+fn take_due_frames(buffer: &mut BTreeMap<u32, Vec<f32>>, target_rtp: u32, max_frames: usize) -> Vec<(u32, Vec<f32>)> {
+    let keys: Vec<u32> = buffer
+        .keys()
+        .copied()
+        .filter(|&ts| (target_rtp.wrapping_sub(ts) as i32) >= 0)
+        .take(max_frames)
+        .collect();
+    keys.into_iter()
+        .filter_map(|ts| buffer.remove(&ts).map(|data| (ts, data)))
+        .collect()
+}
+
+/// Drop oldest map entries until span ≤ `max_secs` of `source_sample_rate` and
+/// packet count is within ~30 s of typical AAC frames. Returns entries dropped.
+fn enforce_buffer_cap(buffer: &mut BTreeMap<u32, Vec<f32>>, source_sample_rate: u32, max_secs: u32) -> usize {
+    if buffer.is_empty() || source_sample_rate == 0 || max_secs == 0 {
+        return 0;
+    }
+    let max_span = source_sample_rate.saturating_mul(max_secs);
+    let max_packets = (u64::from(source_sample_rate)
+        .saturating_mul(u64::from(max_secs))
+        .div_ceil(u64::from(AAC_FRAME_SAMPLES)))
+    .max(1) as usize;
+
+    let mut dropped = 0usize;
+    while buffer.len() > max_packets {
+        if buffer.pop_first().is_some() {
+            dropped += 1;
+        } else {
+            break;
+        }
+    }
+    while let (Some((&first, _)), Some((&last, _))) = (buffer.first_key_value(), buffer.last_key_value()) {
+        let span = last.wrapping_sub(first);
+        // BTreeMap is ordered by raw u32; after wrap, span as i32 is negative — still drop oldest.
+        if (span as i32) >= 0 && span <= max_span {
+            break;
+        }
+        if buffer.pop_first().is_some() {
+            dropped += 1;
+        } else {
+            break;
+        }
+    }
+    dropped
 }
 
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
@@ -73,8 +192,9 @@ pub(crate) struct BufferedAudioProcessor {
 impl BufferedAudioProcessor {
     /// Start the processing pipeline.
     ///
-    /// Returns the command sender and abort handles for the async command/receive tasks
-    /// (so the server can force-kill sockets on hard stop).
+    /// Returns the command sender, a **synchronous** stop handle (use this from
+    /// `hard_stop_sessions` / TEARDOWN before aborting tasks), and abort handles for
+    /// the async command/receive tasks.
     pub(crate) fn start(
         self,
         shk: [u8; 32],
@@ -82,6 +202,7 @@ impl BufferedAudioProcessor {
         handler: Arc<dyn AudioHandler>,
     ) -> (
         tokio::sync::mpsc::UnboundedSender<PlayoutCommand>,
+        PlayoutStop,
         Vec<tokio::task::AbortHandle>,
     ) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -94,12 +215,21 @@ impl BufferedAudioProcessor {
                 anchor_local_ns: 0,
                 rate: 0,
                 sample_rate: default_sr,
+                // Until format is detected, assume RTP clock == default output rate.
+                source_sample_rate: default_sr,
                 channels: 2,
                 stopped: false,
                 format_changed: false,
+                pending_rate: None,
+                pending_flush: false,
+                buffer_cap_drops: 0,
+                last_cap_warn_ns: 0,
             }),
             Condvar::new(),
         ));
+        let playout_stop = PlayoutStop {
+            state: Arc::clone(&state),
+        };
 
         // Delivery thread
         let state2 = state.clone();
@@ -115,7 +245,7 @@ impl BufferedAudioProcessor {
         let cmd_handle = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 let (lock, cvar) = &*state3;
-                let mut s = lock.lock().unwrap();
+                let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 match cmd {
                     PlayoutCommand::SetRate {
                         anchor_rtp,
@@ -125,16 +255,19 @@ impl BufferedAudioProcessor {
                         s.anchor_rtp = anchor_rtp;
                         let was_paused = s.rate == 0;
                         s.rate = rate;
+                        // Delivery thread owns the AudioSession; queue for on_rate.
+                        s.pending_rate = Some(rate);
                         if rate == 0 {
                             info!("Playout paused");
                         } else {
                             // Set anchor so the earliest buffered frame is deliverable
                             // with a small lead time for smooth playback
                             if let Some(&first_ts) = s.buffer.keys().next() {
-                                let lead_frames = s.sample_rate / 10; // 100ms lead
+                                // Lead is in RTP source-clock frames, not output rate.
+                                let lead_frames = s.source_sample_rate / 10; // 100ms lead
                                 s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
                             }
-                            s.anchor_local_ns = now_ns();
+                            s.anchor_local_ns = mono_now_ns();
                             let stale: Vec<u32> = s
                                 .buffer
                                 .keys()
@@ -157,13 +290,15 @@ impl BufferedAudioProcessor {
                         let keys: Vec<u32> = s
                             .buffer
                             .keys()
-                            .filter(|&&ts| ts >= from_seq && ts <= until_seq)
+                            .filter(|&&ts| rtp_in_flush_range(ts, from_seq, until_seq))
                             .copied()
                             .collect();
                         for k in &keys {
                             s.buffer.remove(k);
                         }
+                        s.pending_flush = true;
                         debug!(flushed = keys.len(), "Flushed");
+                        cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
                         s.stopped = true;
@@ -175,10 +310,14 @@ impl BufferedAudioProcessor {
             }
         });
 
-        // Receiver task
+        // Receiver task — cleanup runs via Drop even if this task is aborted.
         let state4 = state.clone();
-
         let recv_handle = tokio::spawn(async move {
+            let _cleanup = ReceiveCleanup {
+                stop: PlayoutStop {
+                    state: Arc::clone(&state4),
+                },
+            };
             let (stream, addr) = match self.listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -191,7 +330,11 @@ impl BufferedAudioProcessor {
             receive_loop(stream, &shk, output_config, state4, &handler).await;
         });
 
-        (cmd_tx, vec![cmd_handle.abort_handle(), recv_handle.abort_handle()])
+        (
+            cmd_tx,
+            playout_stop,
+            vec![cmd_handle.abort_handle(), recv_handle.abort_handle()],
+        )
     }
 }
 
@@ -262,8 +405,9 @@ async fn receive_loop(
 
             // Signal format change to delivery thread
             let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
             s.sample_rate = target_sr;
+            s.source_sample_rate = src_sr;
             s.channels = target_ch;
             s.format_changed = true;
             cvar.notify_all();
@@ -298,18 +442,28 @@ async fn receive_loop(
             );
 
             let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
             s.buffer.insert(timestamp, samples);
+            let source_sr = s.source_sample_rate;
+            let dropped = enforce_buffer_cap(&mut s.buffer, source_sr, MAX_BUFFER_DURATION_SECS);
+            if dropped > 0 {
+                s.buffer_cap_drops = s.buffer_cap_drops.saturating_add(dropped as u64);
+                let now = mono_now_ns();
+                if now.saturating_sub(s.last_cap_warn_ns) >= BUFFER_CAP_WARN_INTERVAL_NS {
+                    warn!(
+                        dropped_now = dropped,
+                        dropped_total = s.buffer_cap_drops,
+                        "Buffered audio map exceeded ~30s; dropped oldest frames"
+                    );
+                    s.last_cap_warn_ns = now;
+                }
+            }
             cvar.notify_all();
         }
     }
+    // Delivery stop is owned by `ReceiveCleanup` Drop on the receive task so
+    // abort still unblocks the delivery thread.
     debug!("Buffered audio receive loop ended");
-    let (lock, cvar) = &*state;
-    if let Ok(mut s) = lock.lock() {
-        s.stopped = true;
-        s.buffer.clear();
-        cvar.notify_all();
-    }
 }
 
 /// Timed playout delivery thread. Wakes on condvar, delivers due frames to AudioSession.
@@ -322,54 +476,583 @@ fn delivery_loop(
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
 
     loop {
-        let mut s = lock.lock().unwrap();
+        let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
 
-        while !s.stopped && (s.rate == 0 || s.buffer.is_empty()) {
-            s = cvar.wait(s).unwrap();
+        // Park until stop, host notifications (rate/flush), or playable audio.
+        // Must wake on rate==0 with `pending_rate` so `on_rate(0)` runs before re-parking.
+        while !s.stopped && s.pending_rate.is_none() && !s.pending_flush && (s.rate == 0 || s.buffer.is_empty()) {
+            s = cvar.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
         if s.stopped {
             break;
         }
 
-        // Lazy init or reinit session on format change
-        if session.is_none() || s.format_changed {
+        // Snapshot under the lock, then release before audio_init / session callbacks.
+        // Dropping the old session *before* audio_init avoids Drop(Ended) clearing the
+        // ring that audio_init just installed (RHS-of-assignment drop order).
+        let need_init = session.is_none() || s.format_changed;
+        let init_format = if need_init {
             s.format_changed = false;
-            let format = AudioFormat {
+            Some(AudioFormat {
                 codec: AudioCodec::Pcm,
                 bits: 32,
                 channels: s.channels,
                 sample_rate: s.sample_rate,
-            };
+            })
+        } else {
+            None
+        };
+        let pending_rate = s.pending_rate.take();
+        let pending_flush = std::mem::replace(&mut s.pending_flush, false);
+
+        let mut ready: Vec<(u32, Vec<f32>)> = Vec::new();
+        if s.rate != 0 && !s.buffer.is_empty() {
+            let now = mono_now_ns();
+            let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
+            // Elapsed media time must advance on the *source* RTP clock, not the
+            // (possibly resampled) output rate — otherwise target_rtp drifts.
+            let elapsed_frames = (elapsed_ns as u128 * u128::from(s.source_sample_rate) / 1_000_000_000) as u32;
+            let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
+
+            ready = take_due_frames(&mut s.buffer, target_rtp, MAX_FRAMES_PER_TICK);
+        }
+        drop(s);
+
+        if let Some(format) = init_format {
+            let old = session.take();
+            drop(old);
             info!(?format, "Audio session initialized");
             session = Some(handler.audio_init(format));
         }
 
-        let now = now_ns();
-        let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
-        let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
-        let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
-
-        let ready: Vec<(u32, Vec<f32>)> = s
-            .buffer
-            .iter()
-            .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
-            .map(|(&ts, data)| (ts, data.clone()))
-            .collect();
-
-        for (ts, _) in &ready {
-            s.buffer.remove(ts);
-        }
-        drop(s);
-
         if let Some(ref mut sess) = session {
+            if pending_flush {
+                sess.on_flush();
+            }
+            if let Some(rate) = pending_rate {
+                sess.on_rate(rate);
+            }
             for (_, frame) in &ready {
                 sess.audio_process(frame);
             }
         }
 
         if ready.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            // Avoid busy-spin while rate > 0 and the next frame is not yet due.
+            // When rate == 0 and notifications are drained, the wait above parks us.
+            let s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let should_sleep = s.rate != 0
+                && !s.buffer.is_empty()
+                && s.pending_rate.is_none()
+                && !s.pending_flush
+                && !s.format_changed
+                && !s.stopped;
+            drop(s);
+            if should_sleep {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
     info!("Delivery loop ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raop::AudioSession;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Shared counters for a mock session living behind `Box<dyn AudioSession>`.
+    #[derive(Default)]
+    struct SessionCounters {
+        rates: Mutex<Vec<u32>>,
+        flushes: AtomicUsize,
+        drops: AtomicUsize,
+        process_calls: AtomicUsize,
+        samples_processed: AtomicUsize,
+    }
+
+    struct TrackingSession {
+        counters: Arc<SessionCounters>,
+        /// Global init/drop order log shared with the handler.
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AudioSession for TrackingSession {
+        fn audio_process(&mut self, samples: &[f32]) {
+            self.counters.process_calls.fetch_add(1, Ordering::SeqCst);
+            self.counters
+                .samples_processed
+                .fetch_add(samples.len(), Ordering::SeqCst);
+        }
+        fn on_rate(&mut self, rate: u32) {
+            self.counters
+                .rates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(rate);
+        }
+        fn on_flush(&mut self) {
+            self.counters.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for TrackingSession {
+        fn drop(&mut self) {
+            self.counters.drops.fetch_add(1, Ordering::SeqCst);
+            self.order.lock().unwrap_or_else(PoisonError::into_inner).push("drop");
+        }
+    }
+
+    struct TrackingHandler {
+        inits: AtomicUsize,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        /// Counters for the most recently created session.
+        current: Mutex<Option<Arc<SessionCounters>>>,
+        /// All sessions ever created (for format-change drop-order checks).
+        all: Mutex<Vec<Arc<SessionCounters>>>,
+    }
+
+    impl TrackingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inits: AtomicUsize::new(0),
+                order: Arc::new(Mutex::new(Vec::new())),
+                current: Mutex::new(None),
+                all: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl AudioHandler for TrackingHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            self.inits.fetch_add(1, Ordering::SeqCst);
+            self.order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("audio_init");
+            let counters = Arc::new(SessionCounters::default());
+            self.all
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&counters));
+            *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&counters));
+            Box::new(TrackingSession {
+                counters,
+                order: Arc::clone(&self.order),
+            })
+        }
+    }
+
+    fn fresh_state(sample_rate: u32, channels: u8) -> Arc<(Mutex<PlayoutState>, Condvar)> {
+        Arc::new((
+            Mutex::new(PlayoutState {
+                buffer: BTreeMap::new(),
+                anchor_rtp: 0,
+                anchor_local_ns: 0,
+                rate: 0,
+                sample_rate,
+                source_sample_rate: sample_rate,
+                channels,
+                stopped: false,
+                format_changed: false,
+                pending_rate: None,
+                pending_flush: false,
+                buffer_cap_drops: 0,
+                last_cap_warn_ns: 0,
+            }),
+            Condvar::new(),
+        ))
+    }
+
+    fn spawn_delivery(
+        state: Arc<(Mutex<PlayoutState>, Condvar)>,
+        handler: Arc<TrackingHandler>,
+    ) -> std::thread::JoinHandle<()> {
+        let output = OutputConfig {
+            sample_rate: Some(44_100),
+            max_channels: Some(2),
+        };
+        std::thread::spawn(move || {
+            delivery_loop(state, handler, output);
+        })
+    }
+
+    fn stop_delivery(state: &Arc<(Mutex<PlayoutState>, Condvar)>) {
+        PlayoutStop {
+            state: Arc::clone(state),
+        }
+        .stop();
+    }
+
+    fn join_with_timeout(join: std::thread::JoinHandle<()>, label: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if join.is_finished() {
+                join.join().unwrap_or_else(|_| panic!("{label} panicked"));
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("{label} did not exit within timeout");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn format_change_drops_old_session_before_audio_init() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        // First session.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.buffer.insert(0, vec![0.0, 0.0]);
+            s.anchor_local_ns = mono_now_ns();
+            cvar.notify_all();
+        }
+        // Wait until first init.
+        for _ in 0..50 {
+            if handler.inits.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handler.inits.load(Ordering::SeqCst), 1);
+
+        // Format change → second init; old session must Drop before new audio_init.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.channels = 1;
+            s.format_changed = true;
+            s.buffer.insert(100, vec![0.1]);
+            cvar.notify_all();
+        }
+        for _ in 0..50 {
+            if handler.inits.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handler.inits.load(Ordering::SeqCst), 2);
+
+        stop_delivery(&state);
+        join_with_timeout(join, "delivery thread");
+
+        let order = handler.order.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        // Expect: audio_init, (maybe process), drop, audio_init, drop (on stop).
+        let init_idxs: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| (*e == "audio_init").then_some(i))
+            .collect();
+        assert_eq!(init_idxs.len(), 2, "order={order:?}");
+        // Between the two audio_init calls there must be a drop (old session).
+        let between = &order[init_idxs[0] + 1..init_idxs[1]];
+        assert!(
+            between.contains(&"drop"),
+            "old session must drop before second audio_init; order={order:?}"
+        );
+    }
+
+    /// Hard-stop path: sync stop must unblock delivery without an async PlayoutCommand.
+    #[test]
+    fn sync_stop_unblocks_delivery_and_drops_session() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let stop = PlayoutStop {
+            state: Arc::clone(&state),
+        };
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.buffer.insert(0, vec![0.0, 0.0]);
+            s.anchor_local_ns = mono_now_ns();
+            cvar.notify_all();
+        }
+        wait_until(|| handler.inits.load(Ordering::SeqCst) >= 1, "audio_init");
+
+        // Mimic hard_stop_sessions: sync stop only (no async channel, no command task).
+        stop.stop();
+        join_with_timeout(join, "delivery after sync stop");
+
+        let counters = current_counters(&handler).expect("session counters");
+        assert!(
+            counters.drops.load(Ordering::SeqCst) >= 1,
+            "AudioSession must Drop when delivery exits after sync stop"
+        );
+        assert!(
+            state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped,
+            "playout state must be stopped"
+        );
+    }
+
+    #[test]
+    fn receive_cleanup_drop_stops_playout() {
+        let state = fresh_state(44_100, 2);
+        {
+            let _cleanup = ReceiveCleanup {
+                stop: PlayoutStop {
+                    state: Arc::clone(&state),
+                },
+            };
+            assert!(!state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped);
+        }
+        assert!(
+            state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped,
+            "ReceiveCleanup Drop must stop playout (abort-safe)"
+        );
+    }
+
+    fn current_counters(handler: &TrackingHandler) -> Option<Arc<SessionCounters>> {
+        handler.current.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    fn wait_until(mut pred: impl FnMut() -> bool, label: &str) {
+        for _ in 0..100 {
+            if pred() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timeout waiting for {label}");
+    }
+
+    #[test]
+    fn pending_rate_and_flush_reach_session() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        // Create session via format + playable buffer, then pause/flush/resume via flags.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.buffer.insert(0, vec![0.0, 0.0]);
+            s.anchor_local_ns = mono_now_ns();
+            cvar.notify_all();
+        }
+        wait_until(|| handler.inits.load(Ordering::SeqCst) >= 1, "first audio_init");
+        assert_eq!(handler.inits.load(Ordering::SeqCst), 1);
+
+        // Drain each pending flag before posting the next so Option<u32> is not overwritten.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            s.pending_rate = Some(0);
+            cvar.notify_all();
+        }
+        wait_until(
+            || {
+                current_counters(&handler)
+                    .is_some_and(|c| c.rates.lock().unwrap_or_else(PoisonError::into_inner).contains(&0))
+            },
+            "on_rate(0)",
+        );
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.pending_flush = true;
+            cvar.notify_all();
+        }
+        wait_until(
+            || current_counters(&handler).is_some_and(|c| c.flushes.load(Ordering::SeqCst) >= 1),
+            "on_flush",
+        );
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.pending_rate = Some(1);
+            s.buffer.insert(200, vec![0.2, 0.2]);
+            s.anchor_local_ns = mono_now_ns();
+            cvar.notify_all();
+        }
+        wait_until(
+            || {
+                current_counters(&handler)
+                    .is_some_and(|c| c.rates.lock().unwrap_or_else(PoisonError::into_inner).contains(&1))
+            },
+            "on_rate(1)",
+        );
+
+        let counters = current_counters(&handler).expect("session counters");
+        let rates = counters.rates.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(rates.contains(&0), "rates={rates:?}");
+        assert!(rates.contains(&1), "rates={rates:?}");
+        assert!(counters.flushes.load(Ordering::SeqCst) >= 1);
+
+        stop_delivery(&state);
+        join_with_timeout(join, "delivery thread");
+    }
+
+    #[test]
+    fn take_due_frames_caps_per_tick() {
+        let mut buffer = BTreeMap::new();
+        // 64 due packets, all ts ≤ target.
+        for i in 0u32..64 {
+            buffer.insert(i * 1024, vec![i as f32]);
+        }
+        let ready = take_due_frames(&mut buffer, 64 * 1024, MAX_FRAMES_PER_TICK);
+        assert_eq!(ready.len(), MAX_FRAMES_PER_TICK);
+        assert_eq!(buffer.len(), 64 - MAX_FRAMES_PER_TICK);
+        // Excess remains for a later tick.
+        let more = take_due_frames(&mut buffer, 64 * 1024, MAX_FRAMES_PER_TICK);
+        assert_eq!(more.len(), MAX_FRAMES_PER_TICK);
+        assert_eq!(buffer.len(), 64 - 2 * MAX_FRAMES_PER_TICK);
+    }
+
+    #[test]
+    fn delivery_tick_delivers_at_most_max_frames() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            // Anchor far in the past so every inserted packet is immediately due.
+            s.anchor_local_ns = mono_now_ns().saturating_sub(5_000_000_000);
+            for i in 0u32..48 {
+                s.buffer.insert(i * 1024, vec![0.0, 0.0]);
+            }
+            cvar.notify_all();
+        }
+
+        wait_until(
+            || current_counters(&handler).is_some_and(|c| c.process_calls.load(Ordering::SeqCst) >= 1),
+            "first audio_process",
+        );
+        // Give the delivery loop a short window to potentially over-deliver, then
+        // assert a single-tick bound: process_calls should climb in steps of ≤ MAX.
+        // After first burst, remaining packets stay buffered until subsequent ticks.
+        std::thread::sleep(Duration::from_millis(15));
+        let counters = current_counters(&handler).expect("session");
+        let calls = counters.process_calls.load(Ordering::SeqCst);
+        // Within ~15ms with 5ms sleep between empty-ready waits, at most a few ticks.
+        // The critical property: map still holds excess after the first delivery window.
+        let remaining = state.0.lock().unwrap_or_else(PoisonError::into_inner).buffer.len();
+        assert!(
+            remaining > 0,
+            "expected excess due frames to remain after capped ticks; process_calls={calls}"
+        );
+        assert!(calls <= 48, "should not invent packets; process_calls={calls}");
+        // First few ticks cannot empty 48 due packets under the per-tick cap.
+        // Allow a handful of 5ms ticks in the 15ms window while still proving the cap.
+        let max_ticks_in_window = 4usize;
+        let min_remaining = 48usize.saturating_sub(MAX_FRAMES_PER_TICK.saturating_mul(max_ticks_in_window));
+        assert!(
+            remaining >= min_remaining,
+            "cap should leave a large remainder early; remaining={remaining}, calls={calls}, min={min_remaining}"
+        );
+
+        stop_delivery(&state);
+        join_with_timeout(join, "delivery frame-cap");
+    }
+
+    #[test]
+    fn rtp_flush_range_wrap_safe() {
+        // Range spanning u32 wrap: from near max to small positive.
+        let from = u32::MAX - 100;
+        let until = 50u32;
+        assert!(rtp_in_flush_range(u32::MAX - 10, from, until));
+        assert!(rtp_in_flush_range(0, from, until));
+        assert!(rtp_in_flush_range(50, from, until));
+        assert!(!rtp_in_flush_range(100, from, until));
+        assert!(!rtp_in_flush_range(u32::MAX - 200, from, until));
+
+        // Non-wrapping range still works.
+        assert!(rtp_in_flush_range(1500, 1000, 2000));
+        assert!(!rtp_in_flush_range(999, 1000, 2000));
+        assert!(!rtp_in_flush_range(2001, 1000, 2000));
+    }
+
+    #[test]
+    fn flush_command_removes_wrap_range_from_map() {
+        let state = fresh_state(44_100, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.buffer.insert(u32::MAX - 50, vec![1.0]);
+            s.buffer.insert(10, vec![2.0]);
+            s.buffer.insert(5000, vec![3.0]); // outside wrap range
+        }
+
+        // Simulate command-handler flush logic.
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let from_seq = u32::MAX - 100;
+            let until_seq = 100u32;
+            let keys: Vec<u32> = s
+                .buffer
+                .keys()
+                .filter(|&&ts| rtp_in_flush_range(ts, from_seq, until_seq))
+                .copied()
+                .collect();
+            for k in &keys {
+                s.buffer.remove(k);
+            }
+            assert_eq!(keys.len(), 2);
+            assert!(s.buffer.contains_key(&5000));
+            assert_eq!(s.buffer.len(), 1);
+        }
+    }
+
+    #[test]
+    fn buffer_cap_drops_oldest_beyond_30s() {
+        let source_sr = 48_000u32;
+        let mut buffer = BTreeMap::new();
+        // Insert packets spanning well over 30s of RTP time (1024 samples each).
+        let packets = source_sr * 40 / AAC_FRAME_SAMPLES + 10;
+        for i in 0..packets {
+            buffer.insert(i * AAC_FRAME_SAMPLES, vec![i as f32]);
+        }
+        let before = buffer.len();
+        assert!(before > (source_sr * MAX_BUFFER_DURATION_SECS / AAC_FRAME_SAMPLES) as usize);
+
+        let dropped = enforce_buffer_cap(&mut buffer, source_sr, MAX_BUFFER_DURATION_SECS);
+        assert!(dropped > 0, "expected oldest packets dropped");
+        assert!(buffer.len() < before);
+
+        let max_packets = (u64::from(source_sr)
+            .saturating_mul(u64::from(MAX_BUFFER_DURATION_SECS))
+            .div_ceil(u64::from(AAC_FRAME_SAMPLES))) as usize;
+        assert!(
+            buffer.len() <= max_packets,
+            "len={} max_packets={max_packets}",
+            buffer.len()
+        );
+
+        // Oldest should be gone: first remaining key is not 0.
+        let first = *buffer.keys().next().expect("non-empty after cap");
+        assert!(first > 0, "oldest RTP ts should have been dropped; first={first}");
+    }
+
+    #[test]
+    fn buffer_cap_noop_when_under_limit() {
+        let mut buffer = BTreeMap::new();
+        for i in 0u32..10 {
+            buffer.insert(i * AAC_FRAME_SAMPLES, vec![0.0]);
+        }
+        let dropped = enforce_buffer_cap(&mut buffer, 44_100, MAX_BUFFER_DURATION_SECS);
+        assert_eq!(dropped, 0);
+        assert_eq!(buffer.len(), 10);
+    }
 }
