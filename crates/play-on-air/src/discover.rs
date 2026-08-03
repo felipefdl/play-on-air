@@ -14,7 +14,9 @@ use std::io::{BufRead, BufReader};
 #[cfg(target_os = "macos")]
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use tokio::sync::watch;
 
