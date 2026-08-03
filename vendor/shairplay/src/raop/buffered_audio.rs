@@ -1020,7 +1020,7 @@ mod tests {
         let source_sr = 48_000u32;
         let mut buffer = BTreeMap::new();
         // Insert packets spanning well over 30s of RTP time (1024 samples each).
-        let packets = (source_sr * 40 / AAC_FRAME_SAMPLES) as u32 + 10;
+        let packets = source_sr * 40 / AAC_FRAME_SAMPLES + 10;
         for i in 0..packets {
             buffer.insert(i * AAC_FRAME_SAMPLES, vec![i as f32]);
         }
