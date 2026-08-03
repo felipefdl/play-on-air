@@ -9,7 +9,7 @@ Chromecast devices as AirPlay 2 speakers on the local network.
 
 PlayOnAir discovers Google Cast devices, exposes each as an **AirPlay 2** receiver, and bridges audio from iPhone, iPad, or Mac to the matching Chromecast. One process on your LAN. No accounts, no cloud, no telemetry.
 
-See [VISION.md](VISION.md) for product intent and non-goals. License: [LICENSE.md](LICENSE.md) (MIT, Felipe Lima).
+See [VISION.md](VISION.md) for product intent and non-goals. License: [LICENSE.md](LICENSE.md) (project MIT; vendored AirPlay stack LGPL-3.0-or-later).
 
 ---
 
@@ -148,4 +148,4 @@ If PlayOnAir is useful, you can [sponsor the maintainer on GitHub](https://githu
 
 ## License
 
-MIT. Copyright (c) 2026 Felipe Lima. See [LICENSE.md](LICENSE.md).
+PlayOnAir first-party code is **MIT** (Copyright (c) 2026 Felipe Lima). The vendored AirPlay stack under `vendor/shairplay/` is **LGPL-3.0-or-later** and is included in the binary and Docker images. Full terms and third-party notes: [LICENSE.md](LICENSE.md).
