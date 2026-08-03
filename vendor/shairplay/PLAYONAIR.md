@@ -17,5 +17,9 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 5. Reported volume: `RaopShared` stores the dB returned by `GET_PARAMETER volume` (default `0.0`);
    `SET_PARAMETER` updates it; `RaopServer::set_reported_volume_db` / `reported_volume_db` let the host
    seed the value from Chromecast so the iOS slider matches device level.
+6. Buffered delivery: drop old `AudioSession` before `audio_init` on format change; run `audio_init`
+   outside the playout mutex (avoids Drop clearing the new ring).
+7. `AudioSession::on_rate` / `on_flush` for AP2 buffered SetRate/FLUSHBUFFERED; delivery drains
+   pending flags so pause/flush reach the host while rate is 0.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

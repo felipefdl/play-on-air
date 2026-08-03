@@ -10,7 +10,7 @@
 //! - **Delivery** (std::thread): timed playout using anchor-based scheduling
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -62,6 +62,10 @@ struct PlayoutState {
     channels: u8,
     stopped: bool,
     format_changed: bool,
+    /// Set by the command task; drained by `delivery_loop` onto the live session.
+    pending_rate: Option<u32>,
+    /// Set by the command task on FLUSHBUFFERED; drained by `delivery_loop`.
+    pending_flush: bool,
 }
 
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
@@ -97,6 +101,8 @@ impl BufferedAudioProcessor {
                 channels: 2,
                 stopped: false,
                 format_changed: false,
+                pending_rate: None,
+                pending_flush: false,
             }),
             Condvar::new(),
         ));
@@ -115,7 +121,7 @@ impl BufferedAudioProcessor {
         let cmd_handle = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 let (lock, cvar) = &*state3;
-                let mut s = lock.lock().unwrap();
+                let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 match cmd {
                     PlayoutCommand::SetRate {
                         anchor_rtp,
@@ -125,6 +131,8 @@ impl BufferedAudioProcessor {
                         s.anchor_rtp = anchor_rtp;
                         let was_paused = s.rate == 0;
                         s.rate = rate;
+                        // Delivery thread owns the AudioSession; queue for on_rate.
+                        s.pending_rate = Some(rate);
                         if rate == 0 {
                             info!("Playout paused");
                         } else {
@@ -163,7 +171,9 @@ impl BufferedAudioProcessor {
                         for k in &keys {
                             s.buffer.remove(k);
                         }
+                        s.pending_flush = true;
                         debug!(flushed = keys.len(), "Flushed");
+                        cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
                         s.stopped = true;
@@ -322,54 +332,358 @@ fn delivery_loop(
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
 
     loop {
-        let mut s = lock.lock().unwrap();
+        let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
 
-        while !s.stopped && (s.rate == 0 || s.buffer.is_empty()) {
-            s = cvar.wait(s).unwrap();
+        // Park until stop, host notifications (rate/flush), or playable audio.
+        // Must wake on rate==0 with `pending_rate` so `on_rate(0)` runs before re-parking.
+        while !s.stopped && s.pending_rate.is_none() && !s.pending_flush && (s.rate == 0 || s.buffer.is_empty()) {
+            s = cvar.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
         if s.stopped {
             break;
         }
 
-        // Lazy init or reinit session on format change
-        if session.is_none() || s.format_changed {
+        // Snapshot under the lock, then release before audio_init / session callbacks.
+        // Dropping the old session *before* audio_init avoids Drop(Ended) clearing the
+        // ring that audio_init just installed (RHS-of-assignment drop order).
+        let need_init = session.is_none() || s.format_changed;
+        let init_format = if need_init {
             s.format_changed = false;
-            let format = AudioFormat {
+            Some(AudioFormat {
                 codec: AudioCodec::Pcm,
                 bits: 32,
                 channels: s.channels,
                 sample_rate: s.sample_rate,
-            };
+            })
+        } else {
+            None
+        };
+        let pending_rate = s.pending_rate.take();
+        let pending_flush = std::mem::replace(&mut s.pending_flush, false);
+
+        let mut ready: Vec<(u32, Vec<f32>)> = Vec::new();
+        if s.rate != 0 && !s.buffer.is_empty() {
+            let now = now_ns();
+            let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
+            let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
+            let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
+
+            ready = s
+                .buffer
+                .iter()
+                .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
+                .map(|(&ts, data)| (ts, data.clone()))
+                .collect();
+
+            for (ts, _) in &ready {
+                s.buffer.remove(ts);
+            }
+        }
+        drop(s);
+
+        if let Some(format) = init_format {
+            let old = session.take();
+            drop(old);
             info!(?format, "Audio session initialized");
             session = Some(handler.audio_init(format));
         }
 
-        let now = now_ns();
-        let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
-        let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
-        let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
-
-        let ready: Vec<(u32, Vec<f32>)> = s
-            .buffer
-            .iter()
-            .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
-            .map(|(&ts, data)| (ts, data.clone()))
-            .collect();
-
-        for (ts, _) in &ready {
-            s.buffer.remove(ts);
-        }
-        drop(s);
-
         if let Some(ref mut sess) = session {
+            if pending_flush {
+                sess.on_flush();
+            }
+            if let Some(rate) = pending_rate {
+                sess.on_rate(rate);
+            }
             for (_, frame) in &ready {
                 sess.audio_process(frame);
             }
         }
 
         if ready.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            // Avoid busy-spin while rate > 0 and the next frame is not yet due.
+            // When rate == 0 and notifications are drained, the wait above parks us.
+            let s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let should_sleep = s.rate != 0
+                && !s.buffer.is_empty()
+                && s.pending_rate.is_none()
+                && !s.pending_flush
+                && !s.format_changed
+                && !s.stopped;
+            drop(s);
+            if should_sleep {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
     info!("Delivery loop ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raop::AudioSession;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Shared counters for a mock session living behind `Box<dyn AudioSession>`.
+    #[derive(Default)]
+    struct SessionCounters {
+        rates: Mutex<Vec<u32>>,
+        flushes: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    struct TrackingSession {
+        counters: Arc<SessionCounters>,
+        /// Global init/drop order log shared with the handler.
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AudioSession for TrackingSession {
+        fn audio_process(&mut self, _samples: &[f32]) {}
+        fn on_rate(&mut self, rate: u32) {
+            self.counters
+                .rates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(rate);
+        }
+        fn on_flush(&mut self) {
+            self.counters.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for TrackingSession {
+        fn drop(&mut self) {
+            self.counters.drops.fetch_add(1, Ordering::SeqCst);
+            self.order.lock().unwrap_or_else(PoisonError::into_inner).push("drop");
+        }
+    }
+
+    struct TrackingHandler {
+        inits: AtomicUsize,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        /// Counters for the most recently created session.
+        current: Mutex<Option<Arc<SessionCounters>>>,
+        /// All sessions ever created (for format-change drop-order checks).
+        all: Mutex<Vec<Arc<SessionCounters>>>,
+    }
+
+    impl TrackingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inits: AtomicUsize::new(0),
+                order: Arc::new(Mutex::new(Vec::new())),
+                current: Mutex::new(None),
+                all: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl AudioHandler for TrackingHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            self.inits.fetch_add(1, Ordering::SeqCst);
+            self.order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("audio_init");
+            let counters = Arc::new(SessionCounters::default());
+            self.all
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&counters));
+            *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&counters));
+            Box::new(TrackingSession {
+                counters,
+                order: Arc::clone(&self.order),
+            })
+        }
+    }
+
+    fn fresh_state(sample_rate: u32, channels: u8) -> Arc<(Mutex<PlayoutState>, Condvar)> {
+        Arc::new((
+            Mutex::new(PlayoutState {
+                buffer: BTreeMap::new(),
+                anchor_rtp: 0,
+                anchor_local_ns: 0,
+                rate: 0,
+                sample_rate,
+                channels,
+                stopped: false,
+                format_changed: false,
+                pending_rate: None,
+                pending_flush: false,
+            }),
+            Condvar::new(),
+        ))
+    }
+
+    fn spawn_delivery(
+        state: Arc<(Mutex<PlayoutState>, Condvar)>,
+        handler: Arc<TrackingHandler>,
+    ) -> std::thread::JoinHandle<()> {
+        let output = OutputConfig {
+            sample_rate: Some(44_100),
+            max_channels: Some(2),
+        };
+        std::thread::spawn(move || {
+            delivery_loop(state, handler, output);
+        })
+    }
+
+    fn stop_delivery(state: &Arc<(Mutex<PlayoutState>, Condvar)>) {
+        let (lock, cvar) = &**state;
+        let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        s.stopped = true;
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn format_change_drops_old_session_before_audio_init() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        // First session.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.buffer.insert(0, vec![0.0, 0.0]);
+            s.anchor_local_ns = now_ns();
+            cvar.notify_all();
+        }
+        // Wait until first init.
+        for _ in 0..50 {
+            if handler.inits.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handler.inits.load(Ordering::SeqCst), 1);
+
+        // Format change → second init; old session must Drop before new audio_init.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.channels = 1;
+            s.format_changed = true;
+            s.buffer.insert(100, vec![0.1]);
+            cvar.notify_all();
+        }
+        for _ in 0..50 {
+            if handler.inits.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(handler.inits.load(Ordering::SeqCst), 2);
+
+        stop_delivery(&state);
+        join.join().expect("delivery thread");
+
+        let order = handler.order.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        // Expect: audio_init, (maybe process), drop, audio_init, drop (on stop).
+        let init_idxs: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| (*e == "audio_init").then_some(i))
+            .collect();
+        assert_eq!(init_idxs.len(), 2, "order={order:?}");
+        // Between the two audio_init calls there must be a drop (old session).
+        let between = &order[init_idxs[0] + 1..init_idxs[1]];
+        assert!(
+            between.contains(&"drop"),
+            "old session must drop before second audio_init; order={order:?}"
+        );
+    }
+
+    fn current_counters(handler: &TrackingHandler) -> Option<Arc<SessionCounters>> {
+        handler.current.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    fn wait_until(mut pred: impl FnMut() -> bool, label: &str) {
+        for _ in 0..100 {
+            if pred() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timeout waiting for {label}");
+    }
+
+    #[test]
+    fn pending_rate_and_flush_reach_session() {
+        let handler = TrackingHandler::new();
+        let state = fresh_state(44_100, 2);
+        let join = spawn_delivery(Arc::clone(&state), Arc::clone(&handler));
+
+        // Create session via format + playable buffer, then pause/flush/resume via flags.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.format_changed = true;
+            s.rate = 1;
+            s.buffer.insert(0, vec![0.0, 0.0]);
+            s.anchor_local_ns = now_ns();
+            cvar.notify_all();
+        }
+        wait_until(|| handler.inits.load(Ordering::SeqCst) >= 1, "first audio_init");
+        assert_eq!(handler.inits.load(Ordering::SeqCst), 1);
+
+        // Drain each pending flag before posting the next so Option<u32> is not overwritten.
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            s.pending_rate = Some(0);
+            cvar.notify_all();
+        }
+        wait_until(
+            || {
+                current_counters(&handler)
+                    .is_some_and(|c| c.rates.lock().unwrap_or_else(PoisonError::into_inner).contains(&0))
+            },
+            "on_rate(0)",
+        );
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.pending_flush = true;
+            cvar.notify_all();
+        }
+        wait_until(
+            || current_counters(&handler).is_some_and(|c| c.flushes.load(Ordering::SeqCst) >= 1),
+            "on_flush",
+        );
+
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.pending_rate = Some(1);
+            s.buffer.insert(200, vec![0.2, 0.2]);
+            s.anchor_local_ns = now_ns();
+            cvar.notify_all();
+        }
+        wait_until(
+            || {
+                current_counters(&handler)
+                    .is_some_and(|c| c.rates.lock().unwrap_or_else(PoisonError::into_inner).contains(&1))
+            },
+            "on_rate(1)",
+        );
+
+        let counters = current_counters(&handler).expect("session counters");
+        let rates = counters.rates.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(rates.contains(&0), "rates={rates:?}");
+        assert!(rates.contains(&1), "rates={rates:?}");
+        assert!(counters.flushes.load(Ordering::SeqCst) >= 1);
+
+        stop_delivery(&state);
+        join.join().expect("delivery thread");
+    }
 }

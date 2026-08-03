@@ -160,8 +160,17 @@ impl PairingStore for MemoryPairingStore {
 pub trait AudioSession: Send + Sync {
     /// Receive decoded f32 interleaved PCM audio samples.
     fn audio_process(&mut self, samples: &[f32]);
-    /// Flush the audio buffer (e.g. on seek).
+    /// Flush the audio buffer (e.g. on seek). Used by the AP1 RTP path.
     fn audio_flush(&mut self) {}
+    /// AP2 buffered playout rate change (`rate == 0` = pause, nonzero = play).
+    ///
+    /// Default is a no-op. Hosts that bridge to a sink should map this to pause/resume.
+    fn on_rate(&mut self, _rate: u32) {}
+    /// AP2 buffered `FLUSHBUFFERED` / playout flush. Default is a no-op.
+    ///
+    /// Distinct from [`audio_flush`](Self::audio_flush) so the buffered delivery
+    /// thread can notify without sharing the AP1 RTP session object.
+    fn on_flush(&mut self) {}
 }
 
 /// Playback command to send to the source device.

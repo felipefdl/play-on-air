@@ -91,9 +91,15 @@ impl DeviceAudioState {
 /// when they close; those must not stop Cast (multi-speaker iOS opens/closes RC
 /// links while audio keeps running on another connection).
 ///
-/// Forwards PCM; Cast PAUSE only on explicit [`AudioSession::audio_flush`] (FLUSH /
-/// buffer clear). We do **not** Cast-PAUSE on PCM idle: buffered AP2 gaps and underruns
-/// left Nest paused while iPhone still showed Streaming and advanced the scrubber.
+/// Cast PAUSE sources (AP2 buffered):
+/// - [`AudioSession::on_rate`] with `rate == 0` (iPhone pause)
+/// - [`AudioSession::on_flush`] / [`AudioSession::audio_flush`] (seek / buffer clear)
+///
+/// We do **not** Cast-PAUSE on PCM idle: buffered AP2 gaps and underruns left Nest
+/// paused while iPhone still showed Streaming and advanced the scrubber.
+///
+/// Resume: [`AudioSession::on_rate`] nonzero if previously paused, and/or the first
+/// PCM after flush via [`Self::note_pcm`] (single source of truth via `cast_paused`).
 struct RingSession {
   state: Arc<DeviceAudioState>,
   ring: Arc<PcmRing>,
@@ -116,15 +122,9 @@ impl RingSession {
       drop(tx.send(AirPlaySessionEvent::Resumed { device_id: self.state.device_id.clone() }));
     }
   }
-}
 
-impl AudioSession for RingSession {
-  fn audio_process(&mut self, samples: &[f32]) {
-    self.note_pcm();
-    self.ring.push_f32(samples);
-  }
-
-  fn audio_flush(&mut self) {
+  /// Clear ring + `Flushed`; set paused and emit `Paused` if not already paused.
+  fn emit_flush_and_pause(&self) {
     self.ring.clear();
     if let Some(tx) = &self.state.event_tx {
       drop(tx.send(AirPlaySessionEvent::Flushed { device_id: self.state.device_id.clone() }));
@@ -135,10 +135,55 @@ impl AudioSession for RingSession {
       drop(tx.send(AirPlaySessionEvent::Paused { device_id: self.state.device_id.clone() }));
     }
   }
+
+  /// Whether this session still owns the live ring (not superseded by a later `audio_init`).
+  fn owns_current_ring(&self) -> bool {
+    Arc::ptr_eq(&self.ring, &self.state.current_ring())
+  }
+}
+
+impl AudioSession for RingSession {
+  fn audio_process(&mut self, samples: &[f32]) {
+    self.note_pcm();
+    self.ring.push_f32(samples);
+  }
+
+  fn audio_flush(&mut self) {
+    self.emit_flush_and_pause();
+  }
+
+  fn on_rate(&mut self, rate: u32) {
+    if rate == 0 {
+      if !self.cast_paused.swap(true, Ordering::AcqRel)
+        && let Some(tx) = &self.state.event_tx
+      {
+        drop(tx.send(AirPlaySessionEvent::Paused { device_id: self.state.device_id.clone() }));
+      }
+    } else if self.cast_paused.swap(false, Ordering::AcqRel)
+      && let Some(tx) = &self.state.event_tx
+    {
+      // Dedupe with `note_pcm`: only emit Resumed when we were actually paused.
+      drop(tx.send(AirPlaySessionEvent::Resumed { device_id: self.state.device_id.clone() }));
+    }
+  }
+
+  fn on_flush(&mut self) {
+    self.emit_flush_and_pause();
+  }
 }
 
 impl Drop for RingSession {
   fn drop(&mut self) {
+    // Format rebuild replaces the ring then drops the old session. Only the
+    // current session owns the live ring — skip clear + Ended when stale so we
+    // do not kill the session that `audio_init` just started.
+    if !self.owns_current_ring() {
+      tracing::debug!(
+        device_id = %self.state.device_id,
+        "AirPlay audio session dropped (stale ring; suppress Ended)"
+      );
+      return;
+    }
     self.ring.clear();
     if let Some(tx) = &self.state.event_tx {
       drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
@@ -643,6 +688,75 @@ mod tests {
   }
 
   #[test]
+  fn format_change_second_init_suppresses_stale_ended() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+      event_tx: Some(tx),
+      device_id: "dev-fmt".to_owned(),
+    });
+    let handler = RingHandler { state: Arc::clone(&state) };
+    let fmt = |channels: u8| AudioFormat {
+      codec: shairplay::AudioCodec::Pcm,
+      bits: 32,
+      channels,
+      sample_rate: 44_100,
+    };
+
+    let session1 = handler.audio_init(fmt(1));
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Started { device_id, sample_rate, ring }) => {
+        assert_eq!(device_id, "dev-fmt");
+        assert_eq!(sample_rate, 44_100);
+        assert_eq!(ring.channels(), 1);
+      },
+      other => panic!("expected Started, got {other:?}"),
+    }
+
+    let session2 = handler.audio_init(fmt(2));
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Started { ring, .. }) => {
+        assert_eq!(ring.channels(), 2);
+        assert!(Arc::ptr_eq(&ring, &state.current_ring()));
+      },
+      other => panic!("expected second Started, got {other:?}"),
+    }
+
+    // Old session drop must not emit Ended (would kill the new stream).
+    drop(session1);
+    match rx.try_recv() {
+      Err(_) => {},
+      Ok(ev) => panic!("stale RingSession Drop must not emit Ended, got {ev:?}"),
+    }
+
+    // Genuine end of the current session still ends the stream.
+    drop(session2);
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Ended { device_id }) => assert_eq!(device_id, "dev-fmt"),
+      other => panic!("expected Ended from current session, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn drop_after_replace_ring_skips_ended() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let ring_a = Arc::new(PcmRing::new(2, 64));
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::clone(&ring_a)),
+      event_tx: Some(tx),
+      device_id: "dev-stale".to_owned(),
+    });
+    let session = RingSession::new(Arc::clone(&state), Arc::clone(&ring_a));
+    let ring_b = Arc::new(PcmRing::new(1, 64));
+    state.replace_ring(ring_b);
+    drop(session);
+    match rx.try_recv() {
+      Err(_) => {},
+      Ok(ev) => panic!("stale drop must not emit Ended, got {ev:?}"),
+    }
+  }
+
+  #[test]
   fn flush_emits_pause_and_pcm_resumes() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let state = Arc::new(DeviceAudioState {
@@ -669,5 +783,54 @@ mod tests {
       Ok(AirPlaySessionEvent::Resumed { device_id }) => assert_eq!(device_id, "dev-flush"),
       other => panic!("expected Resumed after PCM, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn on_rate_pause_resume_and_on_flush() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+      event_tx: Some(tx),
+      device_id: "dev-rate".to_owned(),
+    });
+    let ring = state.current_ring();
+    let mut session = RingSession::new(Arc::clone(&state), Arc::clone(&ring));
+    session.audio_process(&[0.1_f32, 0.2]);
+    while rx.try_recv().is_ok() {}
+
+    session.on_rate(0);
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Paused { device_id }) => assert_eq!(device_id, "dev-rate"),
+      other => panic!("expected Paused on rate 0, got {other:?}"),
+    }
+    // Dedupe: second pause is silent.
+    session.on_rate(0);
+    match rx.try_recv() {
+      Err(_) => {},
+      Ok(ev) => panic!("duplicate on_rate(0) must not emit, got {ev:?}"),
+    }
+
+    session.on_rate(1);
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Resumed { device_id }) => assert_eq!(device_id, "dev-rate"),
+      other => panic!("expected Resumed on nonzero rate, got {other:?}"),
+    }
+    // Dedupe with note_pcm: already resumed, PCM must not double-send Resumed.
+    session.audio_process(&[0.3_f32, 0.4]);
+    match rx.try_recv() {
+      Err(_) => {},
+      Ok(ev) => panic!("note_pcm must not double Resumed after on_rate, got {ev:?}"),
+    }
+
+    session.on_flush();
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Flushed { device_id }) => assert_eq!(device_id, "dev-rate"),
+      other => panic!("expected Flushed, got {other:?}"),
+    }
+    match rx.try_recv() {
+      Ok(AirPlaySessionEvent::Paused { device_id }) => assert_eq!(device_id, "dev-rate"),
+      other => panic!("expected Paused after on_flush, got {other:?}"),
+    }
+    assert_eq!(state.current_ring().available_frames(), 0);
   }
 }
