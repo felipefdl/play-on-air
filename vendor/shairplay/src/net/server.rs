@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -9,6 +10,16 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::error::NetworkError;
 use crate::proto::http::{HttpRequest, HttpResponse};
+
+/// Idle read deadline for an accepted RTSP connection.
+///
+/// Healthy AirPlay clients send `/feedback` about every 2 s, so this only trips
+/// half-open / abandoned sockets that would otherwise hold a connection slot forever.
+#[cfg(not(test))]
+const RTSP_READ_TIMEOUT: Duration = Duration::from_secs(45);
+/// Short deadline under test so silence trips without a multi-second wait.
+#[cfg(test)]
+const RTSP_READ_TIMEOUT: Duration = Duration::from_millis(80);
 
 async fn write_bad_request_and_close<S: AsyncWrite + Unpin>(
     stream: &mut S,
@@ -312,10 +323,14 @@ where
             }
         }
 
-        // Read from network
-        let n = match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        // Read from network (deadline so half-open peers cannot pin a semaphore slot).
+        let n = match tokio::time::timeout(RTSP_READ_TIMEOUT, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => n,
+            Err(_) => {
+                tracing::warn!(%remote, timeout_secs = RTSP_READ_TIMEOUT.as_secs(), "RTSP read timeout");
+                break;
+            }
         };
 
         // Decrypt if encrypted, otherwise feed directly
@@ -401,6 +416,8 @@ fn spawn_accept_loop(
                         process_connection(stream, handler, remote).await;
                     });
                     if let Ok(mut guard) = aborts.lock() {
+                        // Drop finished handles so the vec cannot grow without bound.
+                        guard.retain(|h| !h.is_finished());
                         guard.push(handle.abort_handle());
                     }
                 }
@@ -476,5 +493,29 @@ mod tests {
         // Handler requested disconnect → server shuts the stream → client sees EOF.
         assert_eq!(client.read(&mut tmp).await.unwrap(), 0, "server should have closed");
         task.await.unwrap();
+    }
+
+    /// Half-open peer: no further bytes after the response → read timeout ends the task.
+    #[tokio::test]
+    async fn ends_on_idle_read_timeout() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let task = tokio::spawn(process_connection(
+            server,
+            Box::new(OkHandler { disconnect: false }),
+            remote,
+        ));
+
+        client
+            .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut tmp = [0u8; 1024];
+        assert!(client.read(&mut tmp).await.unwrap() > 0);
+        // Keep the client side open but silent so the server waits for another read.
+        tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("process_connection should exit after RTSP_READ_TIMEOUT")
+            .unwrap();
     }
 }
