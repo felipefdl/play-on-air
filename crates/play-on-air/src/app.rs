@@ -1,9 +1,10 @@
 //! Application main loop: discovery, AirPlay ads, bridge, and shutdown.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 
@@ -14,7 +15,20 @@ use crate::config::Config;
 use crate::discover::Discovery;
 use crate::error::Result;
 use crate::names::{airplay_name_with_id, is_hidden};
-use crate::registry::{DEFAULT_STALE_TTL, DeviceRegistry};
+use crate::registry::{
+  DEFAULT_STALE_TTL, Device, DeviceRegistry, SESSION_GUARD_GONE, WithdrawDecision, decide_airplay_withdraw,
+};
+
+/// Wall-clock bound for a single Cast `get_volume` seed attempt.
+const VOLUME_SEED_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stop retrying volume seed after this many failures until the device re-appears.
+const VOLUME_SEED_MAX_ATTEMPTS: u32 = 5;
+/// Bound for joining a blocking `cast_pool.remove` / shutdown.
+const POOL_BLOCKING_JOIN: Duration = Duration::from_secs(5);
+/// Max maintain-task restarts per rolling window before giving up.
+const MAINTAIN_RESTART_MAX: u32 = 5;
+/// Rolling window for maintain-task restart budget.
+const MAINTAIN_RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 /// Top-level runtime owning shared state.
 #[derive(Debug)]
@@ -82,33 +96,14 @@ impl App {
       }
     });
 
-    let mut maintain_shutdown = shutdown.clone();
-    let maintain_pool = Arc::clone(&cast_pool);
-    let maintain = tokio::spawn(async move {
-      loop {
-        if *maintain_shutdown.borrow() {
-          break;
-        }
-        if let Err(err) = maintain_airplay(&registry, &config, &airplay, &maintain_pool).await {
-          tracing::error!(error = %err, "AirPlay maintain loop error");
-        }
-        tokio::select! {
-          () = sleep(Duration::from_secs(2)) => {}
-          changed = maintain_shutdown.changed() => {
-            // A closed channel (sender dropped) must exit too; otherwise
-            // `changed()` resolves immediately forever and this loop spins.
-            if changed.is_err() || *maintain_shutdown.borrow() {
-              break;
-            }
-          }
-        }
-      }
-      // Withdraw all AirPlay ads and warm Cast workers on shutdown.
-      for id in airplay.active_ids() {
-        airplay.remove(&id);
-      }
-      maintain_pool.shutdown();
-    });
+    let maintain = spawn_supervised_maintain(
+      Arc::clone(&registry),
+      config,
+      Arc::clone(&airplay),
+      Arc::clone(&cast_pool),
+      Arc::clone(&bridge),
+      shutdown.clone(),
+    );
 
     // Wait for shutdown signal (already driven by caller updating the watch).
     let mut wait = shutdown.clone();
@@ -119,11 +114,49 @@ impl App {
     }
 
     tracing::info!("shutting down PlayOnAir");
-    drop(maintain.await);
+    match maintain.await {
+      Ok(()) => {},
+      Err(err) if err.is_cancelled() => {
+        tracing::debug!("maintain task cancelled during shutdown");
+      },
+      Err(err) => {
+        tracing::error!(error = %err, "maintain task join error during shutdown");
+      },
+    }
     discovery_handle.abort();
-    bridge_task.abort();
+    match bridge_task.await {
+      Ok(()) => {},
+      Err(err) if err.is_cancelled() => {
+        tracing::info!("bridge task aborted on shutdown");
+      },
+      Err(err) => {
+        tracing::error!(error = %err, "bridge task join error on shutdown");
+      },
+    }
     ownership_watch.abort();
-    cast_pool.shutdown();
+    match ownership_watch.await {
+      Ok(()) => {},
+      Err(err) if err.is_cancelled() => {
+        tracing::info!("ownership watch aborted on shutdown");
+      },
+      Err(err) => {
+        tracing::error!(error = %err, "ownership watch join error on shutdown");
+      },
+    }
+    // Final pool teardown on a blocking worker (join can take seconds).
+    let pool_for_shutdown = Arc::clone(&cast_pool);
+    match tokio::time::timeout(
+      POOL_BLOCKING_JOIN,
+      tokio::task::spawn_blocking(move || {
+        pool_for_shutdown.shutdown();
+      }),
+    )
+    .await
+    {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => tracing::warn!(error = %err, "cast pool shutdown join error"),
+      Err(_) => tracing::warn!("cast pool shutdown timed out"),
+    }
     Ok(())
   }
 }
@@ -132,30 +165,175 @@ fn coerce_rings(manager: Arc<AirPlayManager>) -> Arc<dyn crate::bridge::RingLook
   manager
 }
 
+/// Spawn the maintain loop with bounded restart on panic / join error.
+fn spawn_supervised_maintain(
+  registry: Arc<DeviceRegistry>,
+  config: Config,
+  airplay: Arc<AirPlayManager>,
+  cast_pool: Arc<CastPool>,
+  bridge: Arc<Bridge>,
+  shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(async move {
+    let mut restart_times: Vec<Instant> = Vec::new();
+    loop {
+      if *shutdown.borrow() {
+        break;
+      }
+      let child = spawn_maintain_loop(
+        Arc::clone(&registry),
+        config.clone(),
+        Arc::clone(&airplay),
+        Arc::clone(&cast_pool),
+        Arc::clone(&bridge),
+        shutdown.clone(),
+      );
+      match child.await {
+        Ok(()) => break,
+        Err(err) => {
+          tracing::error!(error = %err, "maintain task ended with join error");
+          if *shutdown.borrow() {
+            break;
+          }
+          let now = Instant::now();
+          restart_times.retain(|t| now.duration_since(*t) < MAINTAIN_RESTART_WINDOW);
+          if restart_times.len() >= MAINTAIN_RESTART_MAX as usize {
+            tracing::error!(
+              max = MAINTAIN_RESTART_MAX,
+              window_secs = MAINTAIN_RESTART_WINDOW.as_secs(),
+              "maintain task exceeded restart budget; giving up (AirPlay ads may be stale)"
+            );
+            break;
+          }
+          restart_times.push(now);
+          tracing::warn!(restarts_in_window = restart_times.len(), "respawning maintain task");
+          sleep(Duration::from_millis(200)).await;
+        },
+      }
+    }
+  })
+}
+
+fn spawn_maintain_loop(
+  registry: Arc<DeviceRegistry>,
+  config: Config,
+  airplay: Arc<AirPlayManager>,
+  cast_pool: Arc<CastPool>,
+  bridge: Arc<Bridge>,
+  mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(async move {
+    let volume_attempts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+    let mut not_desired_since: HashMap<String, Instant> = HashMap::new();
+    // Device ids observed last tick; absence → re-appear resets volume attempts.
+    let mut known_ids: HashSet<String> = HashSet::new();
+
+    loop {
+      if *shutdown.borrow() {
+        break;
+      }
+      if let Err(err) = maintain_airplay(
+        &registry,
+        &config,
+        &airplay,
+        &cast_pool,
+        &bridge,
+        &volume_attempts,
+        &mut not_desired_since,
+        &mut known_ids,
+      )
+      .await
+      {
+        tracing::error!(error = %err, "AirPlay maintain loop error");
+      }
+      tokio::select! {
+        () = sleep(Duration::from_secs(2)) => {}
+        changed = shutdown.changed() => {
+          if changed.is_err() || *shutdown.borrow() {
+            break;
+          }
+        }
+      }
+    }
+    // Withdraw all AirPlay ads and warm Cast workers on shutdown.
+    for id in airplay.active_ids() {
+      airplay.remove(&id);
+    }
+    let pool = Arc::clone(&cast_pool);
+    match tokio::time::timeout(
+      POOL_BLOCKING_JOIN,
+      tokio::task::spawn_blocking(move || {
+        pool.shutdown();
+      }),
+    )
+    .await
+    {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => tracing::warn!(error = %err, "cast pool shutdown join error in maintain"),
+      Err(_) => tracing::warn!("cast pool shutdown timed out in maintain"),
+    }
+  })
+}
+
 /// Reconcile AirPlay advertisements and warm Cast workers with the registry/config.
+#[expect(
+  clippy::too_many_arguments,
+  reason = "maintain state is explicit maps; keep flat rather than a god-struct for one loop"
+)]
 async fn maintain_airplay(
   registry: &DeviceRegistry,
   config: &Config,
   airplay: &AirPlayManager,
-  cast_pool: &CastPool,
+  cast_pool: &Arc<CastPool>,
+  bridge: &Bridge,
+  volume_attempts: &Mutex<HashMap<String, u32>>,
+  not_desired_since: &mut HashMap<String, Instant>,
+  known_ids: &mut HashSet<String>,
 ) -> Result<()> {
-  // Drop devices that never received ServiceRemoved but stopped advertising.
+  // Complete debounced leaves whose deadline elapsed.
+  let due = registry.take_due_leaves(Instant::now());
+  for dev in &due {
+    tracing::info!(
+      id = %dev.id,
+      name = %dev.name,
+      instance = %dev.instance,
+      "Chromecast left"
+    );
+    let since = dev.pending_leave_since.unwrap_or_else(Instant::now);
+    let _ = not_desired_since.insert(dev.id.clone(), since);
+    let _ = known_ids.remove(&dev.id);
+  }
+
+  // Drop devices that never received a remove event but stopped advertising.
   let expired = registry.expire_stale(DEFAULT_STALE_TTL);
   for dev in &expired {
     tracing::info!(id = %dev.id, name = %dev.name, "expired stale Chromecast");
-    airplay.remove(&dev.id);
-    cast_pool.remove(&dev.id);
+    let ancient = Instant::now().checked_sub(SESSION_GUARD_GONE).unwrap_or_else(Instant::now);
+    let _ = not_desired_since.insert(dev.id.clone(), ancient);
+    let _ = known_ids.remove(&dev.id);
+    // Stale expiry is not mid-session recovery; withdraw immediately when no live session.
+    if !bridge.has_session(&dev.id) {
+      airplay.remove(&dev.id);
+      remove_cast_worker(cast_pool, &dev.id).await;
+    }
   }
 
   let devices = registry.list();
   let mut desired: HashSet<String> = HashSet::new();
+  let mut present_ids: HashSet<String> = HashSet::new();
 
   for device in &devices {
+    let _ = present_ids.insert(device.id.clone());
     if is_hidden(&device.name, &device.id, config) {
       continue;
     }
-    let name = airplay_name_with_id(&device.name, &device.id, config);
+    // Device re-appeared after leave/expire → reset volume seed attempts.
+    if !known_ids.contains(&device.id) {
+      let _ = volume_attempts.lock().remove(&device.id);
+    }
+
     let _inserted = desired.insert(device.id.clone());
+    let name = airplay_name_with_id(&device.name, &device.id, config);
     if let Err(err) = airplay.ensure(&device.id, &name).await {
       tracing::error!(
         id = %device.id,
@@ -166,42 +344,160 @@ async fn maintain_airplay(
     }
     // Warm Cast TCP while idle so LOAD during AirPlay does not dial fresh.
     cast_pool.ensure(device);
-    // Seed GET_PARAMETER until Cast is warm (retries each maintain tick).
-    if airplay.needs_volume_seed(&device.id) {
-      sync_reported_volume_from_cast(airplay, cast_pool, &device.id);
+  }
+  *known_ids = present_ids;
+
+  sync_volume_seeds(airplay, cast_pool, volume_attempts, &devices).await;
+
+  // Withdraw receivers that are no longer desired, with live-session guard.
+  let active_ids = airplay.active_ids();
+  for active in &active_ids {
+    if desired.contains(active) {
+      let _ = not_desired_since.remove(active);
+      continue;
+    }
+    let since = *not_desired_since.entry(active.clone()).or_insert_with(Instant::now);
+    let gone_for = Instant::now().saturating_duration_since(since);
+    let has_session = bridge.has_session(active);
+    match decide_airplay_withdraw(false, has_session, gone_for, SESSION_GUARD_GONE) {
+      WithdrawDecision::Keep => {},
+      WithdrawDecision::Defer => {
+        tracing::debug!(
+          id = %active,
+          has_session,
+          gone_secs = gone_for.as_secs(),
+          "deferring AirPlay withdraw"
+        );
+      },
+      WithdrawDecision::Withdraw => {
+        tracing::info!(id = %active, "AirPlay receiver withdrawn (device no longer desired)");
+        airplay.remove(active);
+        remove_cast_worker(cast_pool, active).await;
+        let _ = not_desired_since.remove(active);
+      },
     }
   }
 
-  for active in airplay.active_ids() {
-    if !desired.contains(&active) {
-      airplay.remove(&active);
-      cast_pool.remove(&active);
-    }
-  }
-
-  // Drop warm workers for devices no longer desired (e.g. newly hidden).
+  // Drop warm workers for devices no longer desired when no session and no AirPlay ad.
+  let still_active: HashSet<String> = airplay.active_ids().into_iter().collect();
   for id in cast_pool.device_ids() {
-    if !desired.contains(&id) {
-      cast_pool.remove(&id);
+    if desired.contains(&id) || bridge.has_session(&id) || still_active.contains(&id) {
+      continue;
     }
+    remove_cast_worker(cast_pool, &id).await;
   }
 
   Ok(())
 }
 
-/// Best-effort: set AirPlay reported dB from Cast linear volume so the iOS slider matches.
-///
-/// Blocks on the warm Cast worker briefly; only called when a receiver is newly advertised.
-fn sync_reported_volume_from_cast(airplay: &AirPlayManager, cast_pool: &CastPool, device_id: &str) {
-  let Ok(linear) = cast_pool.get_volume(device_id) else {
+/// Concurrent volume seeds with attempt cap and per-call timeout.
+async fn sync_volume_seeds(
+  airplay: &AirPlayManager,
+  cast_pool: &Arc<CastPool>,
+  volume_attempts: &Mutex<HashMap<String, u32>>,
+  devices: &[Device],
+) {
+  let mut ids = Vec::new();
+  for device in devices {
+    if !airplay.needs_volume_seed(&device.id) {
+      continue;
+    }
+    let attempts = volume_attempts.lock().get(&device.id).copied().unwrap_or(0);
+    if attempts >= VOLUME_SEED_MAX_ATTEMPTS {
+      tracing::debug!(
+        id = %device.id,
+        attempts,
+        "volume seed attempts exhausted until re-appear"
+      );
+      continue;
+    }
+    ids.push(device.id.clone());
+  }
+  if ids.is_empty() {
     return;
-  };
-  let db = cast_linear_to_airplay_db(linear);
-  airplay.set_reported_volume_db(device_id, db);
-  tracing::info!(
-    %device_id,
-    cast_linear = linear,
-    airplay_db = db,
-    "synced AirPlay reported volume from Cast"
-  );
+  }
+
+  let mut join_set = tokio::task::JoinSet::new();
+  for id in ids {
+    let pool = Arc::clone(cast_pool);
+    let device_id = id.clone();
+    drop(join_set.spawn(async move {
+      let result = tokio::time::timeout(
+        VOLUME_SEED_TIMEOUT,
+        tokio::task::spawn_blocking(move || pool.get_volume(&device_id)),
+      )
+      .await;
+      (id, result)
+    }));
+  }
+
+  while let Some(joined) = join_set.join_next().await {
+    let Ok((device_id, result)) = joined else {
+      continue;
+    };
+    if let Ok(Ok(Ok(linear))) = result {
+      let _ = volume_attempts.lock().remove(&device_id);
+      let db = cast_linear_to_airplay_db(linear);
+      airplay.set_reported_volume_db(&device_id, db);
+      tracing::info!(
+        %device_id,
+        cast_linear = linear,
+        airplay_db = db,
+        "synced AirPlay reported volume from Cast"
+      );
+      continue;
+    }
+    let attempts = {
+      let mut guard = volume_attempts.lock();
+      let entry = guard.entry(device_id.clone()).or_insert(0);
+      *entry = entry.saturating_add(1);
+      let n = *entry;
+      drop(guard);
+      n
+    };
+    tracing::debug!(
+      %device_id,
+      attempts,
+      "volume seed attempt failed"
+    );
+  }
+}
+
+/// Run `cast_pool.remove` off the async runtime with a join bound.
+async fn remove_cast_worker(cast_pool: &Arc<CastPool>, device_id: &str) {
+  let pool = Arc::clone(cast_pool);
+  let id = device_id.to_owned();
+  match tokio::time::timeout(
+    POOL_BLOCKING_JOIN,
+    tokio::task::spawn_blocking(move || {
+      pool.remove(&id);
+    }),
+  )
+  .await
+  {
+    Ok(Ok(())) => {},
+    Ok(Err(err)) => tracing::warn!(device_id, error = %err, "cast_pool.remove join error"),
+    Err(_) => tracing::warn!(device_id, "cast_pool.remove timed out"),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn withdraw_decision_defers_live_session() {
+    assert_eq!(
+      decide_airplay_withdraw(false, true, Duration::from_secs(600), SESSION_GUARD_GONE),
+      WithdrawDecision::Defer
+    );
+  }
+
+  #[test]
+  fn withdraw_decision_after_guard_without_session() {
+    assert_eq!(
+      decide_airplay_withdraw(false, false, SESSION_GUARD_GONE, SESSION_GUARD_GONE),
+      WithdrawDecision::Withdraw
+    );
+  }
 }

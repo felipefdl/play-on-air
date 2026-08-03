@@ -63,41 +63,58 @@ fn init_tracing() {
 
 fn spawn_signal_handler(shutdown_tx: watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
+    wait_for_first_shutdown_signal().await;
+    tracing::info!("graceful shutdown requested (second signal forces exit)");
+    let _sent = shutdown_tx.send(true);
+
+    // Re-arm: a second SIGINT/SIGTERM exits immediately.
+    wait_for_first_shutdown_signal().await;
+    tracing::error!("second shutdown signal; exiting immediately");
+    // Forced exit on second signal; graceful shutdown already in progress.
+    #[expect(
+      clippy::exit,
+      reason = "second SIGINT/SIGTERM must force-exit per lifecycle contract"
+    )]
+    {
+      std::process::exit(1);
+    }
+  })
+}
+
+/// Wait for one SIGINT or SIGTERM (or Ctrl-C on non-unix).
+async fn wait_for_first_shutdown_signal() {
+  let ctrl_c = tokio::signal::ctrl_c();
+
+  #[cfg(unix)]
+  {
     let mut sigterm = {
       use tokio::signal::unix::{SignalKind, signal};
       signal(SignalKind::terminate()).ok()
     };
 
-    #[cfg(unix)]
-    {
-      tokio::select! {
-        result = ctrl_c => {
-          if let Err(err) = result {
-            tracing::warn!(error = %err, "SIGINT handler error");
-          }
-          tracing::info!("received SIGINT");
+    tokio::select! {
+      result = ctrl_c => {
+        if let Err(err) = result {
+          tracing::warn!(error = %err, "SIGINT handler error");
         }
-        () = async {
-          if let Some(ref mut sig) = sigterm {
-            let _term = sig.recv().await;
-            tracing::info!("received SIGTERM");
-          } else {
-            std::future::pending::<()>().await;
-          }
-        } => {}
+        tracing::info!("received SIGINT");
       }
+      () = async {
+        if let Some(ref mut sig) = sigterm {
+          let _term = sig.recv().await;
+          tracing::info!("received SIGTERM");
+        } else {
+          std::future::pending::<()>().await;
+        }
+      } => {}
     }
+  }
 
-    #[cfg(not(unix))]
-    {
-      if let Err(err) = ctrl_c.await {
-        tracing::warn!(error = %err, "SIGINT handler error");
-      }
-      tracing::info!("received interrupt signal");
+  #[cfg(not(unix))]
+  {
+    if let Err(err) = ctrl_c.await {
+      tracing::warn!(error = %err, "SIGINT handler error");
     }
-
-    let _sent = shutdown_tx.send(true);
-  })
+    tracing::info!("received interrupt signal");
+  }
 }
