@@ -234,6 +234,10 @@ struct PlayingSession {
   last_volume_linear: Arc<Mutex<Option<f32>>>,
   /// In-flight blocking Cast LOAD (rollover / reload); awaited on teardown before media STOP.
   inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+  /// Serializes join → publish → await → take of `inflight_load` across concurrent re-LOAD
+  /// entry points (flush spawn, resume spawn, stall, rollover) so a second caller cannot
+  /// overwrite a `JoinHandle` without aborting it (detached LOAD).
+  reload_flight: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Per-device generation-stamped session state.
@@ -687,6 +691,7 @@ impl Bridge {
     let session_alive = Arc::new(AtomicBool::new(true));
     let last_volume_linear = Arc::new(Mutex::new(cast_linear));
     let inflight_load = Arc::new(Mutex::new(None));
+    let reload_flight = Arc::new(tokio::sync::Mutex::new(()));
 
     let (rollover_cancel, rollover_task) = if egress == EgressKind::WavBuffered {
       let (cancel, task) = spawn_rollover_reload_loop(
@@ -698,6 +703,7 @@ impl Bridge {
         Arc::clone(&session_alive),
         Arc::clone(&last_volume_linear),
         Arc::clone(&inflight_load),
+        Arc::clone(&reload_flight),
       );
       (Some(cancel), Some(task))
     } else {
@@ -728,6 +734,7 @@ impl Bridge {
       session_alive,
       last_volume_linear,
       inflight_load,
+      reload_flight,
     };
 
     let orphan = {
@@ -1199,13 +1206,19 @@ impl Bridge {
         LoadVolumePolicy::Rollover { last_volume },
         Arc::clone(&session.session_alive),
         Arc::clone(&session.inflight_load),
+        Arc::clone(&session.reload_flight),
       );
       drop(devices);
       Some(plan)
     };
-    let Some((pool, request, volume, alive, inflight_load)) = load_plan else {
+    let Some((pool, request, volume, alive, inflight_load, reload_flight)) = load_plan else {
       return false;
     };
+
+    // Serialize the whole join → spawn → store → await → take region so concurrent
+    // callers (flush spawn + resume spawn + stall + rollover) cannot both pass
+    // join_prior and both publish — second overwrite would detach a LOAD.
+    let _flight = reload_flight.lock().await;
 
     // Single-flight: finish any prior LOAD before publishing a new one (no detached race).
     join_prior_inflight_load(&inflight_load, device_id).await;
@@ -1339,6 +1352,7 @@ impl Bridge {
           Arc::clone(&session.session_alive),
           Arc::clone(&session.last_volume_linear),
           Arc::clone(&session.inflight_load),
+          Arc::clone(&session.reload_flight),
         );
         session.rollover_cancel = Some(cancel);
         session.rollover_task = Some(task);
@@ -1482,7 +1496,7 @@ async fn join_prior_inflight_load(inflight_load: &Mutex<Option<tokio::task::Join
 /// Spawn a task that re-LOADs the same stream URL each time `LiveWav` hits its body cap.
 #[expect(
   clippy::too_many_arguments,
-  reason = "rollover loop needs session liveness, volume, and inflight load slots"
+  reason = "rollover loop needs session liveness, volume, inflight load, and reload flight"
 )]
 fn spawn_rollover_reload_loop(
   device_id: String,
@@ -1493,6 +1507,7 @@ fn spawn_rollover_reload_loop(
   session_alive: Arc<AtomicBool>,
   last_volume_linear: Arc<Mutex<Option<f32>>>,
   inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+  reload_flight: Arc<tokio::sync::Mutex<()>>,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
   let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
   let task = tokio::spawn(async move {
@@ -1516,6 +1531,9 @@ fn spawn_rollover_reload_loop(
           let title = cast_name.clone();
           let last_volume = *last_volume_linear.lock();
           let alive = Arc::clone(&session_alive);
+          // Share reload_flight with reload_playing_media so concurrent re-LOAD entry
+          // points cannot overwrite inflight_load without joining (detached LOAD).
+          let flight = reload_flight.lock().await;
           // Single-flight: finish any prior LOAD before publishing (no detached race).
           join_prior_inflight_load(&inflight_load, &device_id).await;
           if !session_alive.load(Ordering::Acquire) {
@@ -1560,6 +1578,8 @@ fn spawn_rollover_reload_loop(
               },
             }
           }
+          // Drop flight before the next select wait so concurrent reload_playing_media can run.
+          drop(flight);
           match load_result {
             Ok(Ok(session)) => {
               if session_alive.load(Ordering::Acquire) {
@@ -1703,7 +1723,55 @@ impl RingLookup for AirPlayManager {
 mod tests {
   use super::*;
   use crate::registry::Device;
+  use std::sync::atomic::AtomicUsize;
   use std::time::{Duration, Instant};
+
+  #[derive(Default)]
+  struct ReloadFlightCounters {
+    spawned: AtomicUsize,
+    joined: AtomicUsize,
+    in_region: AtomicUsize,
+    max_in_region: AtomicUsize,
+  }
+
+  /// Mirrors production join → publish → await → take under `reload_flight`.
+  async fn simulated_reload_flight_region(
+    reload_flight: Arc<tokio::sync::Mutex<()>>,
+    inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    counters: Arc<ReloadFlightCounters>,
+    delay: Duration,
+  ) {
+    let flight = reload_flight.lock().await;
+    let cur = counters.in_region.fetch_add(1, Ordering::SeqCst) + 1;
+    let _: usize = counters.max_in_region.fetch_max(cur, Ordering::SeqCst);
+
+    join_prior_inflight_load(&inflight_load, "flight-test").await;
+
+    let (result_tx, result_rx) = oneshot::channel::<()>();
+    {
+      let mut slot = inflight_load.lock();
+      let load_task = tokio::spawn(async move {
+        sleep(delay).await;
+        let _sent = result_tx.send(());
+      });
+      let _: usize = counters.spawned.fetch_add(1, Ordering::SeqCst);
+      *slot = Some(load_task);
+    }
+
+    match result_rx.await {
+      Ok(()) | Err(_) => {},
+    }
+    let pending_join = inflight_load.lock().take();
+    if let Some(join_handle) = pending_join {
+      match join_handle.await {
+        Ok(()) | Err(_) => {
+          let _: usize = counters.joined.fetch_add(1, Ordering::SeqCst);
+        },
+      }
+    }
+    let _: usize = counters.in_region.fetch_sub(1, Ordering::SeqCst);
+    drop(flight);
+  }
 
   /// Minimal playing session for teardown / pause tests (no live Cast worker).
   fn test_playing_session(
@@ -1734,6 +1802,7 @@ mod tests {
       session_alive: Arc::new(AtomicBool::new(true)),
       last_volume_linear: Arc::new(Mutex::new(None)),
       inflight_load: Arc::new(Mutex::new(None)),
+      reload_flight: Arc::new(tokio::sync::Mutex::new(())),
     }
   }
 
@@ -2087,6 +2156,46 @@ mod tests {
     assert!(
       INFLIGHT_LOAD_JOIN_TIMEOUT <= Duration::from_secs(12),
       "INFLIGHT_LOAD_JOIN_TIMEOUT={INFLIGHT_LOAD_JOIN_TIMEOUT:?} must stay near pool budget (not 30s era)"
+    );
+  }
+
+  /// Concurrent join → publish → await → take regions under `reload_flight` never orphan a handle.
+  ///
+  /// Production `reload_playing_media` and the `LiveWav` rollover loop share
+  /// `PlayingSession::reload_flight` for this same critical section (flush spawn + resume
+  /// spawn + stall can otherwise both pass `join_prior` and overwrite without abort).
+  #[tokio::test]
+  async fn reload_flight_serializes_concurrent_publish_without_orphan() {
+    let reload_flight = Arc::new(tokio::sync::Mutex::new(()));
+    let inflight_load = Arc::new(Mutex::new(None));
+    let counters = Arc::new(ReloadFlightCounters::default());
+    let delay = Duration::from_millis(40);
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+      handles.push(tokio::spawn(simulated_reload_flight_region(
+        Arc::clone(&reload_flight),
+        Arc::clone(&inflight_load),
+        Arc::clone(&counters),
+        delay,
+      )));
+    }
+    for handle in handles {
+      handle.await.expect("region task");
+    }
+
+    assert_eq!(
+      counters.max_in_region.load(Ordering::SeqCst),
+      1,
+      "reload_flight must admit only one join/publish/await/take region at a time"
+    );
+    assert_eq!(
+      counters.spawned.load(Ordering::SeqCst),
+      counters.joined.load(Ordering::SeqCst),
+      "every published inflight handle must be joined (no detached overwrite)"
+    );
+    assert!(
+      inflight_load.lock().is_none(),
+      "no leftover inflight handle after concurrent reloads"
     );
   }
 
