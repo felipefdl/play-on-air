@@ -286,6 +286,8 @@ struct CastWorkerHandle {
   relay_slot: SharedRelaySlot,
   /// `remove` in progress (or waiting for late join). Blocks `ensure` re-spawn.
   exiting: bool,
+  /// Shared with the worker thread: last known Cast control-plane reachability.
+  reachable: Arc<AtomicBool>,
 }
 
 /// Shared pool of warm Cast control-plane workers (`Send + Sync` via `Arc`).
@@ -375,6 +377,8 @@ impl CastPool {
     let media_recovered = self.media_recovered.clone();
     let relay_slot: SharedRelaySlot = Arc::new(StdMutex::new(None));
     let relay_slot_worker = Arc::clone(&relay_slot);
+    let reachable = Arc::new(AtomicBool::new(false));
+    let reachable_worker = Arc::clone(&reachable);
     let thread_name = format!("cast-warm-{}", short_id(&device_id));
     let join = std::thread::Builder::new()
       .name(thread_name)
@@ -388,6 +392,7 @@ impl CastPool {
           ownership_lost,
           media_recovered,
           relay_slot_worker,
+          reachable_worker,
         );
       })
       .ok();
@@ -408,10 +413,23 @@ impl CastPool {
         port: device.port,
         relay_slot,
         exiting: false,
+        reachable,
       },
     ));
     drop(guard);
     tracing::debug!(id = %device.id, host = %device.host, port = device.port, "warm Cast worker started");
+  }
+
+  /// Whether the warm Cast worker for `device_id` currently reports a reachable control plane.
+  ///
+  /// Returns `false` when no worker exists, the worker is exiting, or the last known
+  /// state is unreachable. Used by Linux discovery liveness (TTL alone is insufficient).
+  #[must_use]
+  pub fn is_reachable(&self, device_id: &str) -> bool {
+    let guard = self.workers.lock();
+    guard
+      .get(device_id)
+      .is_some_and(|h| !h.exiting && h.reachable.load(Ordering::Relaxed))
   }
 
   /// Shut down and remove the worker for `device_id` (device left the network).
@@ -621,8 +639,10 @@ struct WorkerState {
   reconnect_attempt: u32,
   /// When the device first became unreachable (for downtime logs).
   unreachable_since: Option<Instant>,
-  /// Whether the last known control-plane state was reachable.
+  /// Whether the last known control-plane state was reachable (local + shared flag).
   reachable: bool,
+  /// Shared with the pool handle for cheap cross-thread reachability probes.
+  reachable_flag: Arc<AtomicBool>,
   /// Earliest time to try another reconnect.
   next_reconnect_at: Instant,
   /// Last parse-error string warned (once per distinct message).
@@ -652,6 +672,7 @@ fn worker_main(
   ownership_lost: Option<UnboundedSender<String>>,
   media_recovered: Option<UnboundedSender<String>>,
   relay_slot: SharedRelaySlot,
+  reachable_flag: Arc<AtomicBool>,
 ) {
   let now = Instant::now();
   let mut state = WorkerState {
@@ -674,6 +695,7 @@ fn worker_main(
     reconnect_attempt: 0,
     unreachable_since: None,
     reachable: false,
+    reachable_flag,
     next_reconnect_at: now,
     last_parse_warn: None,
     logged_source_ip: false,
@@ -997,6 +1019,7 @@ impl WorkerState {
     let attempts = self.reconnect_attempt;
     let downtime = self.unreachable_since.map(|t| t.elapsed());
     self.reachable = true;
+    self.reachable_flag.store(true, Ordering::Relaxed);
     self.reconnect_attempt = 0;
     self.unreachable_since = None;
     self.next_reconnect_at = Instant::now();
@@ -1022,6 +1045,7 @@ impl WorkerState {
       self.unreachable_since = Some(Instant::now());
     }
     self.reachable = false;
+    self.reachable_flag.store(false, Ordering::Relaxed);
     self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
     let seed = self
       .device_id
@@ -1858,6 +1882,39 @@ mod tests {
   }
 
   #[test]
+  fn is_reachable_false_without_worker() {
+    let pool = CastPool::new(None);
+    assert!(
+      !pool.is_reachable("missing-device"),
+      "no worker must report unreachable (Linux leave backstop)"
+    );
+  }
+
+  #[test]
+  fn is_reachable_false_while_exiting_tombstone() {
+    let pool = CastPool::new(None);
+    let device = Device::new("tomb", "Tomb", "127.0.0.1", "tomb.local", 8009, "tomb");
+    {
+      let (cmd_tx, _cmd_rx) = mpsc::channel();
+      let mut workers = pool.workers.lock();
+      drop(workers.insert(
+        device.id.clone(),
+        CastWorkerHandle {
+          cmd_tx,
+          thread: None,
+          host: device.host.clone(),
+          hostname: device.hostname.clone(),
+          port: device.port,
+          relay_slot: Arc::new(StdMutex::new(None)),
+          exiting: true,
+          reachable: Arc::new(AtomicBool::new(true)),
+        },
+      ));
+    }
+    assert!(!pool.is_reachable(&device.id), "exiting tombstone must not count as reachable");
+  }
+
+  #[test]
   fn cast_transport_still_owned_true_when_present() {
     let apps = ["receiver-0", "our-transport", "other"];
     assert!(cast_transport_still_owned(&apps, "our-transport"));
@@ -1988,6 +2045,7 @@ mod tests {
           port: device.port,
           relay_slot: Arc::new(StdMutex::new(None)),
           exiting: true,
+          reachable: Arc::new(AtomicBool::new(false)),
         },
       ));
     }

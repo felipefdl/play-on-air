@@ -855,10 +855,15 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
         }
       },
       Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
-        // mdns-sd can emit ServiceRemoved during re-query / interface churn.
-        // Debounce via pending-leave (~20s); a re-resolve cancels the leave.
-        let instance = instance_from_mdns_fullname(&fullname);
-        leave_by_instance(registry, instance);
+        // mdns-sd spuriously emits ServiceRemoved during re-query / interface churn.
+        // Honoring it with pending-leave withdrew AirPlay ads for ~44 s on healthy
+        // devices. Ignore removals; Linux leave is TTL + warm Cast unreachability
+        // (see `should_leave_linux_stale` / app stale expiry).
+        debug_assert!(
+          !crate::registry::linux_service_removed_triggers_leave(),
+          "Linux ServiceRemoved must not mark pending leave"
+        );
+        tracing::debug!(fullname = %fullname, "mdns-sd ServiceRemoved ignored on Linux");
       },
       Ok(ServiceEvent::SearchStopped(ty)) => {
         tracing::warn!(%ty, "mdns-sd search stopped");

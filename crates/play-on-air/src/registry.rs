@@ -14,9 +14,23 @@ pub const SESSION_GUARD_GONE: Duration = Duration::from_secs(60);
 
 /// Default TTL for registry entries without a re-sighting (stale backstop).
 ///
-/// Primary removal is debounced mDNS leave (`pending_leave`). This TTL withdraws
-/// AirPlay ads for devices that silently disappear without a remove event.
+/// On macOS, primary removal is debounced mDNS leave (`pending_leave`). On Linux,
+/// spurious `ServiceRemoved` is ignored; leave requires this TTL **and** a warm
+/// Cast worker reporting unreachable (see [`should_leave_linux_stale`]).
 pub const DEFAULT_STALE_TTL: Duration = Duration::from_secs(600);
+
+/// Linux liveness leave: mDNS `last_seen` alone is never enough while the warm Cast
+/// control plane is healthy. Leave only when TTL has expired **and** Cast is unreachable.
+#[must_use]
+pub const fn should_leave_linux_stale(ttl_expired: bool, cast_reachable: bool) -> bool {
+  ttl_expired && !cast_reachable
+}
+
+/// Linux `ServiceRemoved` must not trigger pending-leave (mdns-sd re-query noise).
+#[must_use]
+pub const fn linux_service_removed_triggers_leave() -> bool {
+  false
+}
 
 /// A discovered Google Cast device on the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +341,35 @@ impl DeviceRegistry {
   pub fn expire_stale(&self, ttl: Duration) -> Vec<Device> {
     self.prune_older_than(ttl)
   }
+
+  /// Like [`Self::expire_stale`], but only removes entries for which `should_expire` is true.
+  ///
+  /// Used on Linux so a healthy warm Cast connection keeps the device despite a
+  /// stale mDNS `last_seen` (see [`should_leave_linux_stale`]).
+  pub fn expire_stale_where(&self, ttl: Duration, mut should_expire: impl FnMut(&Device) -> bool) -> Vec<Device> {
+    let now = Instant::now();
+    let mut guard = self.inner.write();
+    let stale: Vec<String> = guard
+      .iter()
+      .filter_map(|(id, dev)| {
+        if dev.pending_leave_deadline.is_some() {
+          return None;
+        }
+        if now.duration_since(dev.last_seen) > ttl && should_expire(dev) {
+          Some(id.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+    let mut removed = Vec::with_capacity(stale.len());
+    for id in stale {
+      if let Some(dev) = guard.remove(&id) {
+        removed.push(dev);
+      }
+    }
+    removed
+  }
 }
 
 #[cfg(test)]
@@ -576,6 +619,44 @@ mod tests {
     assert!(!pending_leave_is_due(t1, t0));
     assert!(pending_leave_is_due(t0, t1));
     assert!(pending_leave_is_due(t0, t0));
+  }
+
+  #[test]
+  fn linux_service_removed_never_triggers_leave() {
+    assert!(
+      !linux_service_removed_triggers_leave(),
+      "Linux mdns-sd ServiceRemoved must be ignored (pre-0.2.0 / post-hotfix policy)"
+    );
+  }
+
+  #[test]
+  fn linux_stale_leave_requires_ttl_and_unreachable() {
+    assert!(!should_leave_linux_stale(false, false));
+    assert!(!should_leave_linux_stale(false, true));
+    // TTL alone is insufficient while Cast is healthy.
+    assert!(!should_leave_linux_stale(true, true));
+    // TTL expired + Cast unreachable → leave.
+    assert!(should_leave_linux_stale(true, false));
+  }
+
+  #[test]
+  fn expire_stale_where_keeps_when_predicate_false() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample("keep", "Keep"));
+    let _ = reg.appear(sample("drop", "Drop"));
+    {
+      let mut guard = reg.inner.write();
+      for dev in guard.values_mut() {
+        dev.last_seen = Instant::now()
+          .checked_sub(DEFAULT_STALE_TTL + Duration::from_secs(60))
+          .expect("clock");
+      }
+    }
+    let removed = reg.expire_stale_where(DEFAULT_STALE_TTL, |dev| dev.id == "drop");
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].id, "drop");
+    assert!(reg.get("keep").is_some(), "predicate false must keep device");
+    assert!(reg.get("drop").is_none());
   }
 
   #[test]

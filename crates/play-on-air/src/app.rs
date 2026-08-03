@@ -366,7 +366,31 @@ async fn apply_stale_expiry(
   bridge: &Bridge,
   guards: &MaintainGuards,
 ) {
-  let expired = registry.expire_stale(DEFAULT_STALE_TTL);
+  // macOS: mDNS Rmv + grace is primary leave; TTL is a silent-disappear backstop.
+  // Linux: ServiceRemoved is ignored; leave only when last_seen > TTL AND Cast warm
+  // worker reports unreachable (healthy Cast keeps the AirPlay ad forever).
+  let expired = {
+    #[cfg(target_os = "linux")]
+    {
+      use crate::registry::should_leave_linux_stale;
+      registry.expire_stale_where(DEFAULT_STALE_TTL, |dev| {
+        let cast_reachable = cast_pool.is_reachable(&dev.id);
+        let leave = should_leave_linux_stale(true, cast_reachable);
+        if !leave {
+          tracing::debug!(
+            id = %dev.id,
+            cast_reachable,
+            "stale mDNS last_seen but Cast reachable; not expiring"
+          );
+        }
+        leave
+      })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+      registry.expire_stale(DEFAULT_STALE_TTL)
+    }
+  };
   for dev in &expired {
     tracing::info!(id = %dev.id, name = %dev.name, "expired stale Chromecast");
     // Stale expiry: no session → withdraw immediately (min_gone effectively already met).
