@@ -20,6 +20,11 @@ const RAOP_PORT_SPAN: u64 = 1000;
 const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
+/// RTSP `Audio-Latency` advertised on RECORD (samples at stream rate).
+///
+/// Stream rate is not known at receiver build (passthrough). Use 2 s at 48 kHz
+/// so the constant is visible product-side and matches shairplay's default.
+const AUDIO_LATENCY_SAMPLES: u32 = 48_000 * 2;
 /// Lifecycle events from an AirPlay receiver toward the bridge.
 #[derive(Debug, Clone)]
 pub enum AirPlaySessionEvent {
@@ -308,6 +313,7 @@ impl AirPlayReceiver {
       .hwaddr(hwaddr.to_vec())
       .port(port)
       .output_max_channels(OUTPUT_MAX_CHANNELS)
+      .audio_latency_samples(AUDIO_LATENCY_SAMPLES)
       .build(handler)
       .map_err(|err| Error::AirPlay(format!("build RaopServer for {name_owned}: {err}")))?;
 

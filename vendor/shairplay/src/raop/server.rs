@@ -55,6 +55,15 @@ fn derive_pi_from_hwaddr(hwaddr: &[u8]) -> String {
     )
 }
 
+/// Default `Audio-Latency` RECORD header value in samples (2 s at 48 kHz).
+///
+/// Classic RAOP / AirPlay 2 clients treat this as the receiver buffer depth in
+/// stream-rate samples. Sample rate is not always known at server build time
+/// (passthrough hosts), so this fixed default is honest for 48 kHz media and
+/// still a reasonable ~2 s lead at 44.1 kHz. Hosts that know the rate can set
+/// [`RaopServerBuilder::audio_latency_samples`] (e.g. `2 * sample_rate`).
+pub const DEFAULT_AUDIO_LATENCY_SAMPLES: u32 = 96_000;
+
 /// Builder for [`RaopServer`].
 pub struct RaopServerBuilder {
     max_clients: usize,
@@ -68,6 +77,8 @@ pub struct RaopServerBuilder {
     mode: AirPlayMode,
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
+    /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
+    audio_latency_samples: u32,
     #[cfg(feature = "ap2")]
     pin: Option<String>,
     #[cfg(feature = "video")]
@@ -97,6 +108,7 @@ impl RaopServerBuilder {
             mode: AirPlayMode::default(),
             output_sample_rate: None,
             output_max_channels: None,
+            audio_latency_samples: DEFAULT_AUDIO_LATENCY_SAMPLES,
             #[cfg(feature = "ap2")]
             pin: None,
             #[cfg(feature = "video")]
@@ -167,6 +179,15 @@ impl RaopServerBuilder {
     /// Default: pass through native channel count.
     pub fn output_max_channels(mut self, channels: u8) -> Self {
         self.output_max_channels = Some(channels);
+        self
+    }
+
+    /// Set the RTSP `Audio-Latency` value returned on RECORD (samples at stream rate).
+    ///
+    /// Default: [`DEFAULT_AUDIO_LATENCY_SAMPLES`] (2 s at 48 kHz). Prefer
+    /// `2 * sample_rate` when the host knows the stream rate at build time.
+    pub fn audio_latency_samples(mut self, samples: u32) -> Self {
+        self.audio_latency_samples = samples;
         self
     }
 
@@ -248,6 +269,7 @@ impl RaopServerBuilder {
             identity_seed,
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
+            audio_latency_samples: self.audio_latency_samples,
             #[cfg(feature = "ap2")]
             pin: self.pin,
             #[cfg(feature = "video")]

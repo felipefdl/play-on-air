@@ -824,12 +824,13 @@ fn setup_stream_video(
 #[cfg(feature = "ap2")]
 /// AP2 RECORD: start buffered audio playout.
 pub(crate) fn handle_record(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     _request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     tracing::debug!("RECORD");
-    response.add_header("Audio-Latency", "0");
+    // Samples at stream rate — builder-configurable (default ~2 s @ 48 kHz).
+    response.add_header("Audio-Latency", &conn.shared.audio_latency_samples.to_string());
     None
 }
 

@@ -34,6 +34,8 @@ pub(crate) struct RaopShared {
     /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
     #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
     pub(crate) output_max_channels: Option<u8>,
+    /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
+    pub(crate) audio_latency_samples: u32,
     #[cfg(feature = "ap2")]
     pub(crate) pin: Option<String>,
     #[cfg(feature = "video")]
