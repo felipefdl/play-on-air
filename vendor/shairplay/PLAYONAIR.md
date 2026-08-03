@@ -27,7 +27,12 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
    realtime) and takes `playout_cmd` instead of a best-effort async Stop.
 10. Playout anchors/scheduling use `mono_now_ns()` (`Instant`); wall `now_ns()` remains for PTP only.
 11. Delivery caps due AAC packets per tick (`MAX_FRAMES_PER_TICK`) so catch-up cannot flood the host ring.
-12. Playout RTP math uses `source_sample_rate`; FLUSHBUFFERED range compare is wrap-safe; map capped ~30s.
+12. Playout RTP math uses `source_sample_rate`; FLUSHBUFFERED range compare is wrap-safe. Buffered map
+    uses **read-driven flow control** (target ~60 s / resume ~50 s hysteresis, aligned with advertised
+    `audioBufferSize = 0x100000`): when full, the receive loop stops reading TCP so the kernel window
+    paces iOS. Delivery/`notify_all` after consume, flush, and stop unpark the waiter. Drop-oldest was
+    removed — it punched holes at the playhead. Pathological backstop only: refuse **newest** past 3×
+    target (~180 s).
 13. Playout mutex/condvar locks use `unwrap_or_else(PoisonError::into_inner)` (poison-proof).
 14. Realtime type 96: RTP seq reorder window (drop dups, silence for aged gaps; ALAC in order only).
     Decode failure fills the same silence length as a Lost packet (keeps PCM clock length).
@@ -38,6 +43,6 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 
 ### Accepted deviations
 
-- **Buffered `BTreeMap<u32, …>` RTP key order:** keys are raw `u32` RTP timestamps. Across a wrap, `BTreeMap` order is not wrap-aware (high keys sort after low keys). The ~30 s map cap keeps the live span ≪ 2^32 samples, so wrap-within-map does not occur for normal sessions. Revisit only if multi-hour sessions keep a map that can span a wrap.
+- **Buffered `BTreeMap<u32, …>` RTP key order:** keys are raw `u32` RTP timestamps. Across a wrap, `BTreeMap` order is not wrap-aware (high keys sort after low keys). The ~60 s target depth (and 3× newest-drop backstop) keeps the live span ≪ 2^32 samples, so wrap-within-map does not occur for normal sessions. Revisit only if multi-hour sessions keep a map that can span a wrap.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

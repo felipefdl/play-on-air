@@ -30,17 +30,28 @@ use crate::util::mono_now_ns;
 /// stay in the map for the next tick.
 const MAX_FRAMES_PER_TICK: usize = 16;
 
-/// Max RTP-timestamp span retained in the playout map (~30 s of source audio).
+/// Target playout-map depth (~60 s of source audio).
 ///
-/// While rate=0 (paused) or the client buffers far ahead, the map can grow without
-/// bound. Cap by source-clock duration and by packet count (1024-sample AAC frames).
-const MAX_BUFFER_DURATION_SECS: u32 = 30;
+/// Consistent with the AP2 SETUP advertised `audioBufferSize = 0x100000` (1 MB) in
+/// `handlers_ap2` — iOS buffered mode is deep-buffer and may burst far ahead of real
+/// time. Holding ~60 s of AAC frames keeps the map comfortably above that window.
+/// Do **not** shrink the advertised `audioBufferSize`; flow control is read-driven
+/// (pause TCP reads when full) rather than dropping frames at the playhead.
+const TARGET_BUFFER_DURATION_SECS: u32 = 60;
+
+/// Resume TCP reads once map depth falls below this (hysteresis under target).
+const RESUME_BUFFER_DURATION_SECS: u32 = 50;
+
+/// Pathological backstop: refuse **newest** frames if the map exceeds 3× target.
+///
+/// Should be unreachable with paced reads. Never drops the head (playhead) side.
+const BACKSTOP_BUFFER_DURATION_SECS: u32 = 180;
 
 /// Typical AAC frame length in source samples (ADTS / AirPlay buffered path).
 const AAC_FRAME_SAMPLES: u32 = 1024;
 
-/// Minimum interval between buffer-cap warning logs (1 s of mono time).
-const BUFFER_CAP_WARN_INTERVAL_NS: u64 = 1_000_000_000;
+/// Minimum interval between backstop warning logs (1 s of mono time).
+const BACKSTOP_WARN_INTERVAL_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone)]
 /// Output configuration passed from the server builder.
@@ -91,10 +102,10 @@ struct PlayoutState {
     pending_rate: Option<u32>,
     /// Set by the command task on FLUSHBUFFERED; drained by `delivery_loop`.
     pending_flush: bool,
-    /// Cumulative map entries dropped by the duration/count cap.
-    buffer_cap_drops: u64,
-    /// Mono time of last rate-limited buffer-cap warning.
-    last_cap_warn_ns: u64,
+    /// Cumulative map entries refused by the newest-drop pathological backstop.
+    backstop_newest_drops: u64,
+    /// Mono time of last rate-limited backstop warning.
+    last_backstop_warn_ns: u64,
 }
 
 /// Synchronous, abort-safe stop handle for buffered playout.
@@ -148,21 +159,64 @@ fn take_due_frames(buffer: &mut BTreeMap<u32, Vec<f32>>, target_rtp: u32, max_fr
         .collect()
 }
 
-/// Drop oldest map entries until span ≤ `max_secs` of `source_sample_rate` and
-/// packet count is within ~30 s of typical AAC frames. Returns entries dropped.
-fn enforce_buffer_cap(buffer: &mut BTreeMap<u32, Vec<f32>>, source_sample_rate: u32, max_secs: u32) -> usize {
-    if buffer.is_empty() || source_sample_rate == 0 || max_secs == 0 {
+/// Max AAC packets for `secs` of source audio at 1024 samples/frame.
+fn max_packets_for_secs(source_sample_rate: u32, secs: u32) -> usize {
+    if source_sample_rate == 0 || secs == 0 {
         return 0;
     }
-    let max_span = source_sample_rate.saturating_mul(max_secs);
-    let max_packets = (u64::from(source_sample_rate)
-        .saturating_mul(u64::from(max_secs))
+    (u64::from(source_sample_rate)
+        .saturating_mul(u64::from(secs))
         .div_ceil(u64::from(AAC_FRAME_SAMPLES)))
-    .max(1) as usize;
+    .max(1) as usize
+}
+
+/// True when the playout map is at/above `secs` of source audio by packet count or RTP span.
+fn buffer_at_or_above_depth(buffer: &BTreeMap<u32, Vec<f32>>, source_sample_rate: u32, secs: u32) -> bool {
+    if buffer.is_empty() || source_sample_rate == 0 || secs == 0 {
+        return false;
+    }
+    if buffer.len() >= max_packets_for_secs(source_sample_rate, secs) {
+        return true;
+    }
+    if let (Some((&first, _)), Some((&last, _))) = (buffer.first_key_value(), buffer.last_key_value()) {
+        let span = last.wrapping_sub(first);
+        let max_span = source_sample_rate.saturating_mul(secs);
+        // Raw u32 BTree order: only treat non-wrapping positive spans as depth.
+        if (span as i32) >= 0 && span >= max_span {
+            return true;
+        }
+    }
+    false
+}
+
+/// Block until the map is below the resume threshold or the session is stopped.
+///
+/// Entry condition is applied by the caller (depth ≥ target). Once waiting, stay
+/// parked until depth &lt; resume (hysteresis) or `stopped`. Wakes on delivery consume,
+/// flush, stop, and rate/command `notify_all`.
+fn wait_for_map_space(lock: &Mutex<PlayoutState>, cvar: &Condvar) {
+    let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    if s.stopped || !buffer_at_or_above_depth(&s.buffer, s.source_sample_rate, TARGET_BUFFER_DURATION_SECS) {
+        return;
+    }
+    while !s.stopped && buffer_at_or_above_depth(&s.buffer, s.source_sample_rate, RESUME_BUFFER_DURATION_SECS) {
+        s = cvar.wait(s).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Pathological backstop: drop **newest** entries until under 3× target depth.
+///
+/// Never removes the head of the map (frames about to be delivered). Returns count dropped.
+fn enforce_newest_backstop(buffer: &mut BTreeMap<u32, Vec<f32>>, source_sample_rate: u32) -> usize {
+    if buffer.is_empty() || source_sample_rate == 0 {
+        return 0;
+    }
+    let max_packets = max_packets_for_secs(source_sample_rate, BACKSTOP_BUFFER_DURATION_SECS);
+    let max_span = source_sample_rate.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
 
     let mut dropped = 0usize;
     while buffer.len() > max_packets {
-        if buffer.pop_first().is_some() {
+        if buffer.pop_last().is_some() {
             dropped += 1;
         } else {
             break;
@@ -170,11 +224,10 @@ fn enforce_buffer_cap(buffer: &mut BTreeMap<u32, Vec<f32>>, source_sample_rate: 
     }
     while let (Some((&first, _)), Some((&last, _))) = (buffer.first_key_value(), buffer.last_key_value()) {
         let span = last.wrapping_sub(first);
-        // BTreeMap is ordered by raw u32; after wrap, span as i32 is negative — still drop oldest.
         if (span as i32) >= 0 && span <= max_span {
             break;
         }
-        if buffer.pop_first().is_some() {
+        if buffer.pop_last().is_some() {
             dropped += 1;
         } else {
             break;
@@ -222,8 +275,8 @@ impl BufferedAudioProcessor {
                 format_changed: false,
                 pending_rate: None,
                 pending_flush: false,
-                buffer_cap_drops: 0,
-                last_cap_warn_ns: 0,
+                backstop_newest_drops: 0,
+                last_backstop_warn_ns: 0,
             }),
             Condvar::new(),
         ));
@@ -357,6 +410,37 @@ async fn receive_loop(
     let mut output_channels: u8 = 2;
 
     loop {
+        // Read-driven flow control: before the next length-prefixed packet, if the
+        // playout map is at/above target depth, park until delivery/flush drains it
+        // below the resume threshold (or stop). Not reading fills the kernel RCVBUF
+        // and TCP window so iOS paces itself. Condvar wait runs on the blocking pool
+        // because the RTSP connection uses a current_thread runtime.
+        // Guard must end in its own block so it is not held across `.await` (Send).
+        let (stopped, need_wait) = {
+            let (lock, _cvar) = &*state;
+            let s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let stopped = s.stopped;
+            let need_wait =
+                !stopped && buffer_at_or_above_depth(&s.buffer, s.source_sample_rate, TARGET_BUFFER_DURATION_SECS);
+            (stopped, need_wait)
+        };
+        if stopped {
+            break;
+        }
+        if need_wait {
+            let state_wait = Arc::clone(&state);
+            let stopped_after = tokio::task::spawn_blocking(move || {
+                let (lock, cvar) = &*state_wait;
+                wait_for_map_space(lock, cvar);
+                lock.lock().unwrap_or_else(PoisonError::into_inner).stopped
+            })
+            .await
+            .unwrap_or(true);
+            if stopped_after {
+                break;
+            }
+        }
+
         if stream.read_exact(&mut len_buf).await.is_err() {
             break;
         }
@@ -445,17 +529,19 @@ async fn receive_loop(
             let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
             s.buffer.insert(timestamp, samples);
             let source_sr = s.source_sample_rate;
-            let dropped = enforce_buffer_cap(&mut s.buffer, source_sr, MAX_BUFFER_DURATION_SECS);
+            // Pathological only: refuse newest if somehow past 3× target (paced reads
+            // should keep depth near target). Never drop the playhead (oldest) side.
+            let dropped = enforce_newest_backstop(&mut s.buffer, source_sr);
             if dropped > 0 {
-                s.buffer_cap_drops = s.buffer_cap_drops.saturating_add(dropped as u64);
+                s.backstop_newest_drops = s.backstop_newest_drops.saturating_add(dropped as u64);
                 let now = mono_now_ns();
-                if now.saturating_sub(s.last_cap_warn_ns) >= BUFFER_CAP_WARN_INTERVAL_NS {
+                if now.saturating_sub(s.last_backstop_warn_ns) >= BACKSTOP_WARN_INTERVAL_NS {
                     warn!(
                         dropped_now = dropped,
-                        dropped_total = s.buffer_cap_drops,
-                        "Buffered audio map exceeded ~30s; dropped oldest frames"
+                        dropped_total = s.backstop_newest_drops,
+                        "Buffered audio map exceeded backstop; dropped newest frames"
                     );
-                    s.last_cap_warn_ns = now;
+                    s.last_backstop_warn_ns = now;
                 }
             }
             cvar.notify_all();
@@ -515,6 +601,10 @@ fn delivery_loop(
             let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
             ready = take_due_frames(&mut s.buffer, target_rtp, MAX_FRAMES_PER_TICK);
+            // Wake a receive-loop waiter parked on full-map flow control.
+            if !ready.is_empty() {
+                cvar.notify_all();
+            }
         }
         drop(s);
 
@@ -659,8 +749,8 @@ mod tests {
                 format_changed: false,
                 pending_rate: None,
                 pending_flush: false,
-                buffer_cap_drops: 0,
-                last_cap_warn_ns: 0,
+                backstop_newest_drops: 0,
+                last_backstop_warn_ns: 0,
             }),
             Condvar::new(),
         ))
@@ -1015,44 +1105,184 @@ mod tests {
         }
     }
 
+    fn fill_map_packets(buffer: &mut BTreeMap<u32, Vec<f32>>, count: usize) {
+        for i in 0..count {
+            buffer.insert((i as u32).wrapping_mul(AAC_FRAME_SAMPLES), vec![i as f32]);
+        }
+    }
+
+    /// At ≥ target depth, reads pause (waiter blocks); delivery drain below resume unblocks.
+    /// No backstop drops while depth plateaus at target.
     #[test]
-    fn buffer_cap_drops_oldest_beyond_30s() {
+    fn read_flow_control_hysteresis_pauses_and_resumes() {
+        let source_sr = 48_000u32;
+        let state = fresh_state(source_sr, 2);
+        let target_pkts = max_packets_for_secs(source_sr, TARGET_BUFFER_DURATION_SECS);
+        let resume_pkts = max_packets_for_secs(source_sr, RESUME_BUFFER_DURATION_SECS);
+        assert!(target_pkts > resume_pkts);
+
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            fill_map_packets(&mut s.buffer, target_pkts);
+            assert!(buffer_at_or_above_depth(
+                &s.buffer,
+                source_sr,
+                TARGET_BUFFER_DURATION_SECS
+            ));
+            assert_eq!(s.buffer.len(), target_pkts, "map should plateau at target (no drops)");
+        }
+
+        let state_wait = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            let (lock, cvar) = &*state_wait;
+            wait_for_map_space(lock, cvar);
+        });
+
+        // Waiter must stay parked while depth stays at target.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "read flow-control must pause while map is at target depth"
+        );
+        {
+            let s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(s.buffer.len(), target_pkts, "depth must not drop without delivery");
+            assert_eq!(s.backstop_newest_drops, 0);
+        }
+
+        // Simulate delivery: shrink below resume and notify (as delivery_loop does).
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            while s.buffer.len() >= resume_pkts {
+                let _ = s.buffer.pop_first();
+            }
+            assert!(!buffer_at_or_above_depth(
+                &s.buffer,
+                source_sr,
+                RESUME_BUFFER_DURATION_SECS
+            ));
+            cvar.notify_all();
+        }
+
+        join_with_timeout(waiter, "flow-control waiter after drain");
+        let s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(s.buffer.len() < resume_pkts);
+        assert_eq!(s.backstop_newest_drops, 0);
+    }
+
+    /// Stop while read-paused must wake the waiter promptly (abort-safe path).
+    #[test]
+    fn stop_unblocks_read_flow_control_wait() {
+        let source_sr = 48_000u32;
+        let state = fresh_state(source_sr, 2);
+        let target_pkts = max_packets_for_secs(source_sr, TARGET_BUFFER_DURATION_SECS);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            fill_map_packets(&mut s.buffer, target_pkts);
+        }
+
+        let state_wait = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            let (lock, cvar) = &*state_wait;
+            wait_for_map_space(lock, cvar);
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!waiter.is_finished(), "waiter should be parked on full map");
+
+        PlayoutStop {
+            state: Arc::clone(&state),
+        }
+        .stop();
+        join_with_timeout(waiter, "flow-control waiter after stop");
+
+        let s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(s.stopped);
+        assert!(s.buffer.is_empty(), "stop clears the map");
+    }
+
+    /// Flush while read-paused empties enough of the map and unblocks the waiter.
+    #[test]
+    fn flush_unblocks_read_flow_control_wait() {
+        let source_sr = 48_000u32;
+        let state = fresh_state(source_sr, 2);
+        let target_pkts = max_packets_for_secs(source_sr, TARGET_BUFFER_DURATION_SECS);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            fill_map_packets(&mut s.buffer, target_pkts);
+        }
+
+        let state_wait = Arc::clone(&state);
+        let waiter = std::thread::spawn(move || {
+            let (lock, cvar) = &*state_wait;
+            wait_for_map_space(lock, cvar);
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!waiter.is_finished(), "waiter should be parked on full map");
+
+        // Command-path flush: clear map + notify_all (same as PlayoutCommand::Flush full clear).
+        {
+            let (lock, cvar) = &*state;
+            let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            s.buffer.clear();
+            s.pending_flush = true;
+            cvar.notify_all();
+        }
+
+        join_with_timeout(waiter, "flow-control waiter after flush");
+        let s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(s.buffer.is_empty());
+        assert!(!s.stopped, "flush must not stop the session");
+    }
+
+    /// Pathological backstop drops newest only; head (playhead) stays intact.
+    #[test]
+    fn backstop_drops_newest_preserves_head() {
         let source_sr = 48_000u32;
         let mut buffer = BTreeMap::new();
-        // Insert packets spanning well over 30s of RTP time (1024 samples each).
-        let packets = source_sr * 40 / AAC_FRAME_SAMPLES + 10;
-        for i in 0..packets {
-            buffer.insert(i * AAC_FRAME_SAMPLES, vec![i as f32]);
-        }
-        let before = buffer.len();
-        assert!(before > (source_sr * MAX_BUFFER_DURATION_SECS / AAC_FRAME_SAMPLES) as usize);
+        let backstop_pkts = max_packets_for_secs(source_sr, BACKSTOP_BUFFER_DURATION_SECS);
+        let over = backstop_pkts + 64;
+        fill_map_packets(&mut buffer, over);
+        let head_before = *buffer.keys().next().expect("non-empty");
+        let tail_before = *buffer.keys().next_back().expect("non-empty");
 
-        let dropped = enforce_buffer_cap(&mut buffer, source_sr, MAX_BUFFER_DURATION_SECS);
-        assert!(dropped > 0, "expected oldest packets dropped");
-        assert!(buffer.len() < before);
-
-        let max_packets = (u64::from(source_sr)
-            .saturating_mul(u64::from(MAX_BUFFER_DURATION_SECS))
-            .div_ceil(u64::from(AAC_FRAME_SAMPLES))) as usize;
+        let dropped = enforce_newest_backstop(&mut buffer, source_sr);
+        assert!(dropped > 0, "expected newest packets refused past 3× target");
         assert!(
-            buffer.len() <= max_packets,
-            "len={} max_packets={max_packets}",
+            buffer.len() <= backstop_pkts,
+            "len={} backstop_pkts={backstop_pkts}",
             buffer.len()
         );
 
-        // Oldest should be gone: first remaining key is not 0.
-        let first = *buffer.keys().next().expect("non-empty after cap");
-        assert!(first > 0, "oldest RTP ts should have been dropped; first={first}");
+        let head_after = *buffer.keys().next().expect("non-empty after backstop");
+        assert_eq!(head_after, head_before, "head/playhead must remain intact");
+        let tail_after = *buffer.keys().next_back().expect("non-empty after backstop");
+        assert!(
+            tail_after < tail_before,
+            "newest/tail must shrink; before={tail_before} after={tail_after}"
+        );
+
+        // Under limit: no-op.
+        let mut small = BTreeMap::new();
+        fill_map_packets(&mut small, 10);
+        assert_eq!(enforce_newest_backstop(&mut small, source_sr), 0);
+        assert_eq!(small.len(), 10);
     }
 
+    /// Wait returns immediately when the map is under the target depth.
     #[test]
-    fn buffer_cap_noop_when_under_limit() {
-        let mut buffer = BTreeMap::new();
-        for i in 0u32..10 {
-            buffer.insert(i * AAC_FRAME_SAMPLES, vec![0.0]);
+    fn wait_for_map_space_noop_when_under_target() {
+        let source_sr = 48_000u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            fill_map_packets(&mut s.buffer, 8);
         }
-        let dropped = enforce_buffer_cap(&mut buffer, 44_100, MAX_BUFFER_DURATION_SECS);
-        assert_eq!(dropped, 0);
-        assert_eq!(buffer.len(), 10);
+        let (lock, cvar) = &*state;
+        // Must not block.
+        wait_for_map_space(lock, cvar);
+        assert!(!state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped);
     }
 }
