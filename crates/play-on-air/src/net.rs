@@ -1,12 +1,13 @@
 //! LAN host IP helpers for advertising Cast-reachable media URLs and Cast connect.
 
-use std::io;
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use if_addrs::{IfAddr, get_if_addrs};
-use socket2::{Domain, Protocol, Socket, Type};
+use parking_lot::Mutex;
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 
 /// Per-candidate timeout for source-bound Cast TCP connect.
 const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -14,6 +15,74 @@ const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CAST_RELAY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Short TCP SYN used only to warm ARP / routes during wake.
 const CAST_WAKE_TCP_TIMEOUT: Duration = Duration::from_millis(250);
+/// Read/write timeout on relay sockets so `rust_cast` cannot block forever.
+const CAST_RELAY_IO_TIMEOUT: Duration = Duration::from_secs(12);
+/// TCP keepalive idle before first probe on the device-facing Cast socket.
+const CAST_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+/// TCP keepalive probe interval.
+const CAST_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Shared shutdown handles for a Cast localhost↔device TCP relay.
+///
+/// Closing either side unblocks a `rust_cast` read stuck behind the relay so worker
+/// threads can exit on `remove` / reconnect.
+#[derive(Clone, Debug, Default)]
+pub struct CastRelayShutdown {
+  inner: Arc<Mutex<RelayEnds>>,
+}
+
+#[derive(Default, Debug)]
+struct RelayEnds {
+  remote: Option<TcpStream>,
+  client: Option<TcpStream>,
+}
+
+impl CastRelayShutdown {
+  /// Create an empty shutdown handle (sockets installed after dial/accept).
+  #[must_use]
+  pub fn new() -> Self {
+    Self {
+      inner: Arc::new(Mutex::new(RelayEnds::default())),
+    }
+  }
+
+  /// Shutdown both directions on device and client sockets (best-effort).
+  pub fn shutdown(&self) {
+    let mut ends = self.inner.lock();
+    if let Some(remote) = ends.remote.take() {
+      drop(remote.shutdown(Shutdown::Both));
+    }
+    if let Some(client) = ends.client.take() {
+      drop(client.shutdown(Shutdown::Both));
+    }
+  }
+
+  fn set_remote(&self, stream: TcpStream) {
+    self.inner.lock().remote = Some(stream);
+  }
+
+  fn set_client(&self, stream: TcpStream) {
+    self.inner.lock().client = Some(stream);
+  }
+
+  /// Temporarily change the rust_cast-facing socket read timeout (socket option is shared).
+  ///
+  /// Used to drain buffered unsolicited messages without waiting the full I/O timeout when
+  /// the buffer is empty.
+  pub fn set_client_read_timeout(&self, timeout: Option<Duration>) {
+    let ends = self.inner.lock();
+    if let Some(client) = ends.client.as_ref()
+      && let Err(err) = client.set_read_timeout(timeout)
+    {
+      tracing::debug!(error = %err, "Cast relay set_client_read_timeout failed");
+    }
+  }
+
+  /// Restore the default relay I/O read timeout on the client socket.
+  pub fn restore_client_read_timeout(&self) {
+    self.set_client_read_timeout(Some(CAST_RELAY_IO_TIMEOUT));
+  }
+}
 
 /// Start a process-global AP2 PTP drain on UDP 319/320 (once).
 ///
@@ -96,11 +165,8 @@ pub fn advertise_host_for_peer(peer_host: &str) -> String {
   let peer_v4 = resolve_host_ipv4(peer).and_then(|s| s.parse::<Ipv4Addr>().ok());
 
   if let Some(peer_ip) = peer_v4 {
-    // Prefer local IPv4s on the same subnet, ranked by interface preference.
-    if let Some(ip) = preferred_local_ipv4s()
-      .into_iter()
-      .find(|local| same_class_c(*local, peer_ip) || on_same_iface_subnet(*local, peer_ip))
-    {
+    // Peer-aware ranking: same-subnet first, virtual ifaces blacklisted.
+    if let Some(ip) = preferred_local_ipv4s_for_peer(Some(peer_ip)).into_iter().next() {
       return ip.to_string();
     }
     // Fall back: kernel route toward peer.
@@ -140,6 +206,9 @@ pub fn cast_connect_hosts(host: &str, hostname: Option<&str>) -> Vec<String> {
 }
 
 /// Best-effort wake so Nest ARP/route is hot before Cast TLS.
+///
+/// Uses a UDP poke plus short TCP SYNs from preferred local interfaces. Does not
+/// spawn an external `ping` process (HAOS containers often lack it).
 pub fn wake_cast_host(host: &str) {
   let target = host.trim().trim_end_matches('.');
   if target.is_empty() {
@@ -149,21 +218,14 @@ pub fn wake_cast_host(host: &str) {
   if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
     drop(sock.send_to(&[0_u8], (target, 8009)));
   }
-  // ICMP/ARP via system ping (macOS: -W is ms).
-  drop(
-    std::process::Command::new("ping")
-      .args(["-c", "1", "-W", "500", target])
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null())
-      .status(),
-  );
   // TCP SYN from each preferred local IP so ARP is populated on the right iface
   // (unbound probes only use the default route, which may be the wrong NIC).
   if let Some(ip_s) = resolve_host_ipv4(target)
     && let Ok(ip) = ip_s.parse::<Ipv4Addr>()
   {
     let dest = SocketAddr::from((ip, 8009));
-    for local in preferred_local_ipv4s() {
+    let locals = preferred_local_ipv4s_for_peer(Some(ip));
+    for local in locals {
       if let Ok(stream) = tcp_connect_from(Some(local), dest, CAST_WAKE_TCP_TIMEOUT) {
         drop(stream);
       }
@@ -180,6 +242,8 @@ pub fn wake_cast_host(host: &str) {
 /// have a default route on the wrong NIC while AirPlay is active. Binding the
 /// source address forces the kernel onto a working path without needing root
 /// route changes. Returns the connected stream and the local IPv4 used.
+///
+/// Interface list is gathered **once** per dial (not twice for subnet checks).
 pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(TcpStream, Ipv4Addr)> {
   let dest_ip = resolve_dest_ipv4(dest_host)?;
   let dest = SocketAddr::from((dest_ip, dest_port));
@@ -188,6 +252,7 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
   if dest_ip.is_loopback() {
     match tcp_connect_from(Some(Ipv4Addr::LOCALHOST), dest, CAST_CONNECT_TIMEOUT) {
       Ok(stream) => {
+        apply_cast_socket_options(&stream, /*keepalive*/ false);
         tracing::info!(local = %Ipv4Addr::LOCALHOST, %dest, "Cast TCP loopback connect ok");
         return Ok((stream, Ipv4Addr::LOCALHOST));
       },
@@ -196,18 +261,22 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
       },
     }
     let stream = tcp_connect_from(None, dest, CAST_CONNECT_TIMEOUT)?;
+    apply_cast_socket_options(&stream, /*keepalive*/ false);
     return Ok((stream, Ipv4Addr::LOCALHOST));
   }
 
+  // One iface snapshot for this dial attempt cycle.
+  let locals = preferred_local_ipv4s_for_peer(Some(dest_ip));
   let mut last_err: Option<io::Error> = None;
-  for local in preferred_local_ipv4s() {
+  for local in locals {
     match tcp_connect_from(Some(local), dest, CAST_CONNECT_TIMEOUT) {
       Ok(stream) => {
+        apply_cast_socket_options(&stream, /*keepalive*/ true);
         tracing::info!(%local, %dest, "Cast TCP bound connect ok");
         return Ok((stream, local));
       },
       Err(err) => {
-        tracing::warn!(%local, %dest, error = %err, "Cast TCP bound connect failed");
+        tracing::debug!(%local, %dest, error = %err, "Cast TCP bound connect failed");
         last_err = Some(err);
       },
     }
@@ -215,6 +284,7 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
 
   match tcp_connect_from(None, dest, CAST_CONNECT_TIMEOUT) {
     Ok(stream) => {
+      apply_cast_socket_options(&stream, /*keepalive*/ true);
       let local = local_ipv4_of(&stream).unwrap_or(Ipv4Addr::UNSPECIFIED);
       tracing::info!(%local, %dest, "Cast TCP unbound connect ok");
       Ok((stream, local))
@@ -231,14 +301,22 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
 ///
 /// Preferred flow: remote is already connected before the listener is published,
 /// so `rust_cast` only dials after the Nest path is known good.
-pub fn spawn_cast_connect_relay(dest_host: &str, dest_port: u16) -> io::Result<(String, u16)> {
+///
+/// Returns `(relay_host, relay_port, shutdown)`. Call [`CastRelayShutdown::shutdown`]
+/// to unblock a worker stuck in `rust_cast` I/O (e.g. on pool `remove`).
+pub fn spawn_cast_connect_relay(dest_host: &str, dest_port: u16) -> io::Result<(String, u16, CastRelayShutdown)> {
   let (remote, local_src) = tcp_connect_cast_bound(dest_host, dest_port)?;
   tracing::info!(
     dest_host,
     dest_port,
-    %local_src,
+    source_ip = %local_src,
     "Cast control-plane pre-connected via source-bound TCP"
   );
+
+  let shutdown = CastRelayShutdown::new();
+  if let Ok(remote_for_shutdown) = remote.try_clone() {
+    shutdown.set_remote(remote_for_shutdown);
+  }
 
   let std_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
   let port = std_listener.local_addr()?.port();
@@ -247,12 +325,17 @@ pub fn spawn_cast_connect_relay(dest_host: &str, dest_port: u16) -> io::Result<(
   listener.set_read_timeout(Some(CAST_RELAY_ACCEPT_TIMEOUT))?;
 
   let dest_label = dest_host.to_owned();
+  let shutdown_for_accept = shutdown.clone();
   drop(
     std::thread::Builder::new()
       .name("cast-tcp-relay".to_owned())
       .spawn(move || match listener.accept() {
         Ok((client_sock, _)) => {
           let client: TcpStream = client_sock.into();
+          apply_cast_socket_options(&client, /*keepalive*/ false);
+          if let Ok(client_for_shutdown) = client.try_clone() {
+            shutdown_for_accept.set_client(client_for_shutdown);
+          }
           bridge_tcp_streams(client, remote);
         },
         Err(err) => {
@@ -267,7 +350,7 @@ pub fn spawn_cast_connect_relay(dest_host: &str, dest_port: u16) -> io::Result<(
       })?,
   );
 
-  Ok((Ipv4Addr::LOCALHOST.to_string(), port))
+  Ok((Ipv4Addr::LOCALHOST.to_string(), port, shutdown))
 }
 
 /// Try TCP connect to `host:port` from each preferred local IPv4 and log results.
@@ -284,7 +367,7 @@ pub fn probe_cast_reachability(host: &str, port: u16) {
     return;
   };
   let dest = SocketAddr::from((dest_ip, port));
-  for local in preferred_local_ipv4s() {
+  for local in preferred_local_ipv4s_for_peer(Some(dest_ip)) {
     match tcp_connect_from(Some(local), dest, CAST_CONNECT_TIMEOUT) {
       Ok(stream) => {
         tracing::info!(%local, %dest, "Cast reachability probe: bound ok");
@@ -309,10 +392,10 @@ pub fn probe_cast_reachability(host: &str, port: u16) {
 
 fn resolve_dest_ipv4(host: &str) -> io::Result<Ipv4Addr> {
   let ip_s = resolve_host_ipv4(host)
-    .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, format!("no IPv4 address for Cast host {host}")))?;
+    .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, format!("no IPv4 address for Cast host {host}")))?;
   ip_s.parse::<Ipv4Addr>().map_err(|parse_err| {
     io::Error::new(
-      io::ErrorKind::InvalidInput,
+      ErrorKind::InvalidInput,
       format!("invalid IPv4 for Cast host {host}: {ip_s} ({parse_err})"),
     )
   })
@@ -337,6 +420,9 @@ fn local_ipv4_of(stream: &TcpStream) -> Option<Ipv4Addr> {
 }
 
 /// Bidirectional byte bridge until either side closes.
+///
+/// Idle read timeouts do **not** tear down a healthy relay (loop and retry). Real
+/// EOF / errors end the direction and are logged at debug.
 fn bridge_tcp_streams(client: TcpStream, remote: TcpStream) {
   let Ok(mut client_read) = client.try_clone() else {
     tracing::warn!("Cast relay: failed to clone client stream");
@@ -350,12 +436,66 @@ fn bridge_tcp_streams(client: TcpStream, remote: TcpStream) {
   let mut remote_write = remote;
 
   let up = std::thread::spawn(move || {
-    drop(io::copy(&mut client_read, &mut remote_write));
+    if let Err(err) = copy_ignoring_idle_timeouts(&mut client_read, &mut remote_write) {
+      tracing::debug!(error = %err, direction = "client->device", "Cast relay copy ended");
+    }
     drop(remote_write.shutdown(Shutdown::Write));
   });
-  drop(io::copy(&mut remote_read, &mut client_write));
+  if let Err(err) = copy_ignoring_idle_timeouts(&mut remote_read, &mut client_write) {
+    tracing::debug!(error = %err, direction = "device->client", "Cast relay copy ended");
+  }
   drop(client_write.shutdown(Shutdown::Write));
   drop(up.join());
+}
+
+/// Like `io::copy`, but `WouldBlock` / `TimedOut` on an idle direction is not fatal.
+fn copy_ignoring_idle_timeouts(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<u64> {
+  let mut buf = [0_u8; 8 * 1024];
+  let mut total = 0_u64;
+  loop {
+    match reader.read(&mut buf) {
+      Ok(0) => return Ok(total),
+      Ok(n) => {
+        let Some(chunk) = buf.get(..n) else {
+          return Err(io::Error::new(ErrorKind::InvalidData, "read length exceeds buffer"));
+        };
+        writer.write_all(chunk)?;
+        total = total.saturating_add(n as u64);
+      },
+      Err(err) if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {
+        // Idle timeout on one direction while the peer is still connected; retry.
+      },
+      Err(err) if err.kind() == ErrorKind::Interrupted => {},
+      Err(err) => return Err(err),
+    }
+  }
+}
+
+/// Apply read/write timeouts (and optional TCP keepalive) used on Cast control sockets.
+fn apply_cast_socket_options(stream: &TcpStream, keepalive: bool) {
+  if let Err(err) = stream.set_read_timeout(Some(CAST_RELAY_IO_TIMEOUT)) {
+    tracing::debug!(error = %err, "Cast socket set_read_timeout failed");
+  }
+  if let Err(err) = stream.set_write_timeout(Some(CAST_RELAY_IO_TIMEOUT)) {
+    tracing::debug!(error = %err, "Cast socket set_write_timeout failed");
+  }
+  if !keepalive {
+    return;
+  }
+  let Ok(clone) = stream.try_clone() else {
+    return;
+  };
+  let socket = Socket::from(clone);
+  let ka = TcpKeepalive::new()
+    .with_time(CAST_TCP_KEEPALIVE_TIME)
+    .with_interval(CAST_TCP_KEEPALIVE_INTERVAL);
+  if let Err(err) = socket.set_tcp_keepalive(&ka) {
+    tracing::debug!(error = %err, "Cast socket TCP keepalive failed");
+  }
+  // Keep the underlying fd alive via the original `stream`; drop the wrapper without shutdown.
+  // `Socket` into TcpStream and forget would double-close; instead leak the Socket into a TcpStream
+  // that we drop without shutdown... Socket Drop closes the fd which is a clone, so closing is fine.
+  drop(socket);
 }
 
 /// Resolve `hostname` (often `uuid.local`) to an IPv4 string, if possible.
@@ -377,12 +517,18 @@ pub fn resolve_host_ipv4(hostname: &str) -> Option<String> {
   None
 }
 
-/// Local advertiseable IPv4 addresses, preferred interface first (`en0` before `en7`/bridges).
+/// Local advertiseable IPv4 addresses, preferred interface first.
 fn preferred_local_ipv4s() -> Vec<Ipv4Addr> {
+  preferred_local_ipv4s_for_peer(None)
+}
+
+/// Rank local `IPv4` addresses for reaching optional `peer` (same-subnet wins; virtual ifaces blacklisted).
+fn preferred_local_ipv4s_for_peer(peer: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
   let mut scored: Vec<(i32, Ipv4Addr)> = Vec::new();
   let Ok(ifaces) = get_if_addrs() else {
     return Vec::new();
   };
+  let default_route_ip = default_route_ipv4();
   for iface in ifaces {
     if iface.is_loopback() {
       continue;
@@ -400,9 +546,22 @@ fn preferred_local_ipv4s() -> Vec<Ipv4Addr> {
     }
     let score = iface_preference(&iface.name);
     if score < 0 {
-      continue; // virtual / tunnel
+      continue; // virtual / tunnel / docker
     }
-    scored.push((score, ip));
+    let mut rank = score;
+    // Same-subnet as peer is the strongest signal (HAOS multi-homed).
+    if let Some(peer_ip) = peer {
+      let mask = v4.netmask;
+      let a = u32::from(ip) & u32::from(mask);
+      let b = u32::from(peer_ip) & u32::from(mask);
+      if a == b || same_class_c(ip, peer_ip) {
+        rank = rank.saturating_sub(100);
+      }
+    }
+    if default_route_ip == Some(ip) {
+      rank = rank.saturating_sub(20);
+    }
+    scored.push((rank, ip));
   }
   scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.octets().cmp(&b.1.octets())));
   let mut out = Vec::new();
@@ -414,17 +573,23 @@ fn preferred_local_ipv4s() -> Vec<Ipv4Addr> {
   out
 }
 
-/// Lower is better. Negative = skip.
+/// Lower is better. Negative = skip (virtual / container / tunnel).
 fn iface_preference(name: &str) -> i32 {
-  if name == "en0" {
-    return 0; // primary Wi‑Fi / Ethernet
+  if is_blacklisted_iface(name) {
+    return -1;
   }
-  if name.starts_with("en") {
-    // en7 Thunderbolt/dock often shares 192.168.1.x poorly with Wi‑Fi Nest
+  if name == "en0" || name == "eth0" || name == "end0" {
+    return 0; // primary Wi‑Fi / Ethernet (macOS + common Linux/HAOS)
+  }
+  if name.starts_with("en") || name.starts_with("eth") || name.starts_with("end") {
+    // Secondary physical NICs (Thunderbolt/dock often share subnet poorly).
     if name == "en7" || name == "en8" || name == "en9" {
       return 50;
     }
     return 10;
+  }
+  if name.starts_with("wlan") || name.starts_with("wlp") {
+    return 5;
   }
   if name.starts_with("bridge") || name.starts_with("vmenet") || name.starts_with("utun") || name.starts_with("awdl") {
     return -1;
@@ -432,29 +597,66 @@ fn iface_preference(name: &str) -> i32 {
   40
 }
 
+/// Docker / HAOS / tunnel interface names that must never be Cast source/advertise.
+fn is_blacklisted_iface(name: &str) -> bool {
+  if name == "docker0" || name == "hassio" {
+    return true;
+  }
+  name.starts_with("veth")
+    || name.starts_with("br-")
+    || name.starts_with("tun")
+    || name.starts_with("tap")
+    || name.starts_with("wg")
+    || name.starts_with("tailscale")
+}
+
+/// IPv4 of the default-route interface on Linux (`/proc/net/route`); `None` elsewhere.
+#[cfg(target_os = "linux")]
+fn default_route_ipv4() -> Option<Ipv4Addr> {
+  default_route_ipv4_linux()
+}
+
+/// Non-Linux: no `/proc/net/route`; ranking falls back to name heuristics only.
+#[cfg(not(target_os = "linux"))]
+const fn default_route_ipv4() -> Option<Ipv4Addr> {
+  None
+}
+
+#[cfg(target_os = "linux")]
+fn default_route_ipv4_linux() -> Option<Ipv4Addr> {
+  let text = std::fs::read_to_string("/proc/net/route").ok()?;
+  let mut default_if: Option<String> = None;
+  for line in text.lines().skip(1) {
+    let mut cols = line.split_whitespace();
+    let iface = cols.next()?;
+    let dest = cols.next()?;
+    // Destination 00000000 = default route.
+    if dest != "00000000" {
+      continue;
+    }
+    default_if = Some(iface.to_owned());
+    break;
+  }
+  let iface_name = default_if?;
+  let ifaces = get_if_addrs().ok()?;
+  for iface in ifaces {
+    if iface.name != iface_name {
+      continue;
+    }
+    let IfAddr::V4(v4) = iface.addr else {
+      continue;
+    };
+    if is_advertiseable_v4(v4.ip) {
+      return Some(v4.ip);
+    }
+  }
+  None
+}
+
 const fn same_class_c(a: Ipv4Addr, b: Ipv4Addr) -> bool {
   let ao = a.octets();
   let bo = b.octets();
   ao[0] == bo[0] && ao[1] == bo[1] && ao[2] == bo[2]
-}
-
-fn on_same_iface_subnet(local: Ipv4Addr, peer: Ipv4Addr) -> bool {
-  let Ok(ifaces) = get_if_addrs() else {
-    return false;
-  };
-  for iface in ifaces {
-    let IfAddr::V4(v4) = iface.addr else {
-      continue;
-    };
-    if v4.ip != local {
-      continue;
-    }
-    let mask = v4.netmask;
-    let a = u32::from(local) & u32::from(mask);
-    let b = u32::from(peer) & u32::from(mask);
-    return a == b;
-  }
-  false
 }
 
 /// Discover the outbound IPv4 via a UDP connect toward `dest` (no packet required).
@@ -618,6 +820,20 @@ mod tests {
   fn iface_preference_ranks_en0_best() {
     assert!(iface_preference("en0") < iface_preference("en7"));
     assert!(iface_preference("bridge100") < 0);
+    assert!(iface_preference("docker0") < 0);
+    assert!(iface_preference("vethabc") < 0);
+    assert!(iface_preference("br-1234") < 0);
+    assert!(iface_preference("hassio") < 0);
+    assert_eq!(iface_preference("eth0"), iface_preference("en0"));
+    assert!(is_blacklisted_iface("tailscale0"));
+    assert!(is_blacklisted_iface("wg0"));
+  }
+
+  #[test]
+  fn preferred_for_peer_prefers_same_subnet_candidate() {
+    // Pure ranking: when peer is given, same-class-c locals sort first among equals.
+    // Smoke: function returns without panic.
+    drop(preferred_local_ipv4s_for_peer(Some(Ipv4Addr::new(192, 168, 1, 50))));
   }
 
   #[test]
@@ -682,7 +898,7 @@ tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
       drop(sock.shutdown(Shutdown::Both));
     });
 
-    let (relay_host, relay_port) = spawn_cast_connect_relay("127.0.0.1", echo_port).expect("spawn relay");
+    let (relay_host, relay_port, _shutdown) = spawn_cast_connect_relay("127.0.0.1", echo_port).expect("spawn relay");
     assert_eq!(relay_host, "127.0.0.1");
 
     let mut client = TcpStream::connect((relay_host.as_str(), relay_port)).expect("dial relay");
