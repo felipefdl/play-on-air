@@ -19,3 +19,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Third-party components
+
+### vendor/shairplay
+
+`vendor/shairplay` is a fork of the [`shairplay`](https://crates.io/crates/shairplay) Rust crate (upstream project: [metaneutrons/shairplay-rust](https://github.com/metaneutrons/shairplay-rust)), licensed **LGPL-3.0-or-later**.
+
+The compiled PlayOnAir binary and Docker images on GHCR statically link this library. Its complete corresponding source is included in this repository under `vendor/shairplay/`, which satisfies the LGPL source-availability obligations for the combined work. The license text for that component is `vendor/shairplay/LICENSE`.
+
+All other first-party code and documentation in this repository remain under the MIT License above.
