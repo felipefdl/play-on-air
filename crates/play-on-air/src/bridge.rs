@@ -19,10 +19,13 @@ use crate::media::{MediaContent, MediaServer, MediaServerHandle, RolloverSignal}
 use crate::net::advertise_host_for_peer;
 use crate::registry::DeviceRegistry;
 
-/// Frames to wait for before starting Cast load (~0.5 s at 44.1/48 kHz).
+/// Frames of real PCM required before Cast LOAD (~0.5 s at 48 kHz).
+///
+/// Prebuffer feeds the first real-PCM HTTP chunks after silence preroll; the media
+/// server's silence preroll builds the Cast-side cushion; `LIVE_LEAD` maintains it.
 const PREBUFFER_FRAMES: usize = 24_000;
-/// Max prebuffer poll iterations (~3 s at 50 ms).
-const PREBUFFER_POLLS: u32 = 60;
+/// Max prebuffer poll iterations (160 × 50 ms = 8 s). Fail if still incomplete.
+const PREBUFFER_POLLS: u32 = 160;
 const PREBUFFER_POLL: Duration = Duration::from_millis(50);
 /// Frames copied for the FLAC quality-path snapshot at session start.
 const SNAPSHOT_FRAMES: usize = 2048;
@@ -696,9 +699,10 @@ async fn device_worker_loop(
   tracing::debug!(%device_id, "device session worker exited");
 }
 
-/// Poll until prebuffer frames are available, or the ring is superseded / empty.
+/// Poll until a full prebuffer is available, or the ring is superseded.
 ///
-/// Returns `Ok(true)` when enough (or any) PCM is ready to start Cast load.
+/// Returns `Ok(true)` only when [`PREBUFFER_FRAMES`] complete frames are ready.
+/// Returns `Ok(false)` if the session restarted (stale ring). Errors on timeout.
 async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn RingLookup) -> Result<bool> {
   for _ in 0..PREBUFFER_POLLS {
     let still_current = rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, ring));
@@ -707,15 +711,18 @@ async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn Ri
       return Ok(false);
     }
     if ring.available_frames() >= PREBUFFER_FRAMES {
-      break;
+      return Ok(true);
     }
     sleep(PREBUFFER_POLL).await;
   }
 
-  if ring.available_frames() == 0 {
-    return Err(Error::Bridge("no PCM available at session start".to_owned()));
+  let available = ring.available_frames();
+  if available >= PREBUFFER_FRAMES {
+    return Ok(true);
   }
-  Ok(true)
+  Err(Error::Bridge(format!(
+    "prebuffer timeout after 8s: {available} frames available, need {PREBUFFER_FRAMES}"
+  )))
 }
 
 /// Cast LOAD of buffered progressive WAV (shared by initial start and rollover re-LOAD).
@@ -1570,7 +1577,7 @@ mod tests {
         assert_eq!(content_type, "audio/flac");
         assert!(body.len() > 42);
       },
-      MediaContent::LiveWav { .. } | MediaContent::Empty => {
+      MediaContent::LiveWav { .. } | MediaContent::LiveFlac { .. } | MediaContent::Empty => {
         panic!("expected Static media content");
       },
     }

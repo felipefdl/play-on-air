@@ -33,7 +33,6 @@ serde_json = "1"
 # See vendor/shairplay/PLAYONAIR.md. Version pins lockfile/deny (path alone is `*`).
 shairplay = { path = "vendor/shairplay", version = "0.7.0", features = ["ap2"] }
 socket2 = "0.6"
-symphonia = { version = "0.6", default-features = false, features = ["aac"] }
 thiserror = "2"
 tokio = { version = "1", features = [
   "macros",
