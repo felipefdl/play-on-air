@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::error::{Error, Result};
-use crate::registry::{DEFAULT_PENDING_LEAVE, Device, DeviceRegistry};
+#[cfg(target_os = "macos")]
+use crate::registry::DEFAULT_PENDING_LEAVE;
+use crate::registry::{Device, DeviceRegistry};
 
 /// DNS-SD service type for Google Cast (no domain suffix).
 pub const GOOGLECAST_REGTYPE: &str = "_googlecast._tcp";
@@ -398,6 +400,9 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
 ///
 /// Exact match only: by stored TXT `id` or by the instance string recorded at appear.
 /// Info-logs only on the first transition into pending leave (not on re-marks).
+/// macOS-only: the Linux backend ignores `ServiceRemoved` (TTL + Cast reachability
+/// drive leave there), so this has no Linux caller.
+#[cfg(target_os = "macos")]
 fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
   let now = Instant::now();
   match registry.mark_pending_leave_by_instance(instance, now, DEFAULT_PENDING_LEAVE) {
