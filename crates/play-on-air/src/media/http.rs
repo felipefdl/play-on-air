@@ -20,16 +20,21 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::sleep;
 
-use crate::audio::{PcmRing, continuous_wav_header};
+use crate::audio::{
+  FLAC_BLOCK_SIZE, PcmRing, continuous_wav_header, encode_i16_block_to_frame, live_frame_buf, live_stream_header_bytes,
+  live_stream_info, round_up_to_flac_blocks, verified_encoder_config,
+};
 use crate::error::{Error, Result};
 
-// ── LiveWav pacing / cushion constants ──────────────────────────────────────
+// ── Live stream pacing / cushion constants ──────────────────────────────────
 //
 // Three layers keep Nest from underrunning:
 // 1. Bridge prebuffer (~0.5 s real PCM) before Cast LOAD — first real chunks.
 // 2. Silence preroll (~2 s) at body start, unpaced — Cast-side cushion; counts
 //    toward `frames_emitted` so the pacer starts ~LIVE_LEAD ahead.
 // 3. LIVE_LEAD (~2 s) steady-state pace cap — Nest may not pull further ahead.
+//
+// Shared by `LiveWav` and `LiveFlac`. FLAC has no Content-Length rollover.
 
 /// Frames requested per `LiveWav` chunk (~21 ms at 48 kHz).
 const LIVE_CHUNK_FRAMES: usize = 1024;
@@ -66,6 +71,15 @@ pub enum MediaContent {
     /// Channel count advertised in the WAV header.
     channels: u16,
     /// Sample rate (Hz) advertised in the WAV header.
+    sample_rate: u32,
+  },
+  /// Continuous FLAC pulled from a live PCM ring (chunked; no Content-Length).
+  LiveFlac {
+    /// Shared decode ring (AirPlay → bridge).
+    ring: Arc<PcmRing>,
+    /// Channel count for STREAMINFO / encode.
+    channels: u16,
+    /// Sample rate (Hz) for STREAMINFO / encode.
     sample_rate: u32,
   },
   /// Empty placeholder until a session attaches real bytes.
@@ -282,7 +296,7 @@ impl MediaServer {
   }
 }
 
-/// GET `/stream` — may supersede a prior `LiveWav` body (generation bump).
+/// GET `/stream` — may supersede a prior live body (generation bump).
 async fn serve_stream(State(state): State<AppState>) -> Response {
   let snapshot = state.content.read().clone();
   match snapshot {
@@ -312,6 +326,23 @@ async fn serve_stream(State(state): State<AppState>) -> Response {
         Arc::clone(&state.bytes_served),
         Arc::clone(&state.last_body_write),
         Arc::clone(&state.rollover),
+      )
+    },
+    MediaContent::LiveFlac { ring, channels, sample_rate } => {
+      let generation = state.live_generation.fetch_add(1, Ordering::AcqRel) + 1;
+      if generation > 1 {
+        tracing::info!(generation, "new LiveFlac request supersedes previous body");
+      }
+      state.bytes_served.store(0, Ordering::Release);
+      *state.last_body_write.write() = None;
+      live_flac_response(
+        ring,
+        channels,
+        sample_rate,
+        Arc::clone(&state.live_generation),
+        generation,
+        Arc::clone(&state.bytes_served),
+        Arc::clone(&state.last_body_write),
       )
     },
     MediaContent::Empty => (StatusCode::NOT_FOUND, "no stream").into_response(),
@@ -347,6 +378,24 @@ async fn serve_stream_head(State(state): State<AppState>) -> Response {
           .headers_mut()
           .insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("none")),
       );
+      response
+    },
+    MediaContent::LiveFlac { .. } => {
+      // Empty stream (not empty fixed body) so hyper does not invent Content-Length: 0 —
+      // GET is unbounded/chunked and HEAD must match (no Content-Length).
+      let mut response = Body::from_stream(stream::empty::<std::result::Result<Bytes, Infallible>>()).into_response();
+      *response.status_mut() = StatusCode::OK;
+      drop(
+        response
+          .headers_mut()
+          .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("audio/flac")),
+      );
+      drop(
+        response
+          .headers_mut()
+          .insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("none")),
+      );
+      let _removed = response.headers_mut().remove(header::CONTENT_LENGTH);
       response
     },
     MediaContent::Empty => (StatusCode::NOT_FOUND, "no stream").into_response(),
@@ -415,6 +464,92 @@ fn live_wav_response(
     drop(response.headers_mut().insert(header::CONTENT_LENGTH, val));
   }
   // Discourage range probes that restart the progressive body mid-stream.
+  drop(
+    response
+      .headers_mut()
+      .insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("none")),
+  );
+  response
+}
+
+/// Chunked live FLAC response: STREAMINFO once, silence preroll as FLAC frames, then paced PCM.
+///
+/// No Content-Length and no rollover — the stream is unbounded until superseded or the peer drops.
+#[expect(
+  clippy::too_many_arguments,
+  reason = "live stream wiring carries generation and progress atomics explicitly"
+)]
+fn live_flac_response(
+  ring: Arc<PcmRing>,
+  channels: u16,
+  sample_rate: u32,
+  live_generation: Arc<AtomicU64>,
+  generation: u64,
+  bytes_served: Arc<AtomicU64>,
+  last_body_write: Arc<RwLock<Option<Instant>>>,
+) -> Response {
+  let ch = channels.max(1);
+  let rate = sample_rate.max(1);
+  let stream_info = match live_stream_info(rate, ch) {
+    Ok(info) => info,
+    Err(err) => {
+      tracing::error!(error = %err, "failed to build live FLAC StreamInfo");
+      return (StatusCode::INTERNAL_SERVER_ERROR, "flac streaminfo").into_response();
+    },
+  };
+  let header = match live_stream_header_bytes(&stream_info) {
+    Ok(h) => h,
+    Err(err) => {
+      tracing::error!(error = %err, "failed to build live FLAC header");
+      return (StatusCode::INTERNAL_SERVER_ERROR, "flac header").into_response();
+    },
+  };
+  let encoder_config = match verified_encoder_config() {
+    Ok(cfg) => cfg,
+    Err(err) => {
+      tracing::error!(error = %err, "failed to build live FLAC encoder config");
+      return (StatusCode::INTERNAL_SERVER_ERROR, "flac config").into_response();
+    },
+  };
+  let framebuf = match live_frame_buf(ch) {
+    Ok(fb) => fb,
+    Err(err) => {
+      tracing::error!(error = %err, "failed to allocate live FLAC FrameBuf");
+      return (StatusCode::INTERNAL_SERVER_ERROR, "flac framebuf").into_response();
+    },
+  };
+
+  // Fixed-block live stream: round silence preroll up so every frame is FLAC_BLOCK_SIZE.
+  let preroll_frames = round_up_to_flac_blocks(silence_preroll_frames(rate));
+  tracing::info!(
+    channels = ch,
+    sample_rate = rate,
+    preroll_frames,
+    flac_block_size = FLAC_BLOCK_SIZE,
+    "Cast client pulling LiveFlac stream"
+  );
+
+  let stream = live_flac_byte_stream(
+    ring,
+    ch,
+    rate,
+    header,
+    preroll_frames,
+    stream_info,
+    encoder_config,
+    framebuf,
+    live_generation,
+    generation,
+    bytes_served,
+    last_body_write,
+  );
+  let mut response = Body::from_stream(stream).into_response();
+  drop(
+    response
+      .headers_mut()
+      .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("audio/flac")),
+  );
+  // Chunked transfer: do not set Content-Length. Unbounded stream (no rollover).
   drop(
     response
       .headers_mut()
@@ -556,6 +691,215 @@ fn live_wav_byte_stream(
   })
 }
 
+/// Progressive async FLAC stream: STREAMINFO, silence preroll frames, then paced PCM blocks.
+///
+/// Unbounded (no Content-Length / no rollover). Full [`FLAC_BLOCK_SIZE`] blocks in steady state;
+/// wait for real PCM on underrun (no mid-stream silence inject). Generation check **before** pop.
+#[expect(
+  clippy::too_many_arguments,
+  reason = "stream state is assembled once; splitting would obscure the data path"
+)]
+fn live_flac_byte_stream(
+  ring: Arc<PcmRing>,
+  channels: u16,
+  sample_rate: u32,
+  header: Vec<u8>,
+  preroll_frames: usize,
+  stream_info: flacenc::component::StreamInfo,
+  encoder_config: flacenc::error::Verified<flacenc::config::Encoder>,
+  framebuf: flacenc::source::FrameBuf,
+  live_generation: Arc<AtomicU64>,
+  generation: u64,
+  bytes_served: Arc<AtomicU64>,
+  last_body_write: Arc<RwLock<Option<Instant>>>,
+) -> impl stream::Stream<Item = std::result::Result<Bytes, Infallible>> + Send {
+  let ch = channels.max(1);
+  let initial = LiveFlacState {
+    ring,
+    header: Some(Bytes::from(header)),
+    preroll_frames_left: preroll_frames,
+    i16_buf: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
+    i32_scratch: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
+    channels: ch,
+    sample_rate: sample_rate.max(1),
+    live_generation,
+    generation,
+    bytes_sent: 0,
+    frames_emitted: 0,
+    pace_origin: None,
+    bytes_served,
+    last_body_write,
+    last_drop_log: None,
+    last_drops_seen: 0,
+    stream_info,
+    encoder_config,
+    framebuf,
+    frame_number: 0,
+  };
+
+  stream::unfold(initial, |mut live| async move {
+    if live.is_superseded() {
+      return None;
+    }
+
+    if let Some(hdr) = live.header.take() {
+      return Some(live.emit_chunk(hdr, 0));
+    }
+
+    if live.preroll_frames_left > 0 {
+      // Fixed-size blocks: preroll is rounded up so this is always a full block.
+      let n = live.preroll_frames_left.min(FLAC_BLOCK_SIZE);
+      live.preroll_frames_left = live.preroll_frames_left.saturating_sub(n);
+      let samples = n.saturating_mul(usize::from(live.channels));
+      live.i16_buf.clear();
+      live.i16_buf.resize(samples, 0);
+      // Preroll silence does not sleep — Nest should buffer it fast.
+      // Counts toward frames_emitted so the pacer starts ~LIVE_LEAD ahead.
+      match live.encode_current_i16_buf() {
+        Ok(chunk) => return Some(live.emit_chunk(chunk, n)),
+        Err(err) => {
+          tracing::error!(error = %err, generation = live.generation, "LiveFlac preroll encode failed");
+          return None;
+        },
+      }
+    }
+
+    loop {
+      // Supersede check BEFORE pop so we never drop already-popped PCM.
+      if live.is_superseded() {
+        return None;
+      }
+      live.maybe_log_ring_drops();
+
+      // Steady state: wait for a full FLAC block of real PCM (no short mid-stream frames).
+      if live.ring.available_frames() < FLAC_BLOCK_SIZE {
+        sleep(LIVE_UNDERRUN_SLEEP).await;
+        continue;
+      }
+      if live.is_superseded() {
+        return None;
+      }
+      let frames = live.ring.pop_i16(FLAC_BLOCK_SIZE, &mut live.i16_buf);
+      if frames == 0 {
+        // Wait for real PCM. Injecting silence here would be audible cuts.
+        sleep(LIVE_UNDERRUN_SLEEP).await;
+        continue;
+      }
+      if frames < FLAC_BLOCK_SIZE {
+        // Partial pop should be rare after available_frames check; wait for a full block next.
+        // Put samples back by not encoding — but we already popped. Re-push is not available.
+        // Encode what we have only if frames > 0 after another wait attempt is not possible.
+        // Prefer: if partial, still encode short block so PCM is not lost.
+        tracing::debug!(
+          frames,
+          generation = live.generation,
+          "LiveFlac encoding short block after partial pop"
+        );
+      }
+      live.pace_realtime(frames).await;
+      match live.encode_current_i16_buf() {
+        Ok(chunk) => return Some(live.emit_chunk(chunk, frames)),
+        Err(err) => {
+          tracing::error!(error = %err, generation = live.generation, "LiveFlac frame encode failed");
+          return None;
+        },
+      }
+    }
+  })
+}
+
+struct LiveFlacState {
+  ring: Arc<PcmRing>,
+  header: Option<Bytes>,
+  preroll_frames_left: usize,
+  i16_buf: Vec<i16>,
+  i32_scratch: Vec<i32>,
+  channels: u16,
+  sample_rate: u32,
+  live_generation: Arc<AtomicU64>,
+  generation: u64,
+  bytes_sent: u64,
+  /// PCM frames emitted including silence preroll (used for realtime pacing).
+  frames_emitted: u64,
+  pace_origin: Option<Instant>,
+  bytes_served: Arc<AtomicU64>,
+  last_body_write: Arc<RwLock<Option<Instant>>>,
+  last_drop_log: Option<Instant>,
+  last_drops_seen: u64,
+  stream_info: flacenc::component::StreamInfo,
+  encoder_config: flacenc::error::Verified<flacenc::config::Encoder>,
+  framebuf: flacenc::source::FrameBuf,
+  frame_number: usize,
+}
+
+impl LiveFlacState {
+  fn is_superseded(&self) -> bool {
+    self.live_generation.load(Ordering::Acquire) != self.generation
+  }
+
+  fn encode_current_i16_buf(&mut self) -> Result<Bytes> {
+    let frame_bytes = encode_i16_block_to_frame(
+      &self.i16_buf,
+      self.channels,
+      self.frame_number,
+      &self.encoder_config,
+      &self.stream_info,
+      &mut self.framebuf,
+      &mut self.i32_scratch,
+    )?;
+    self.frame_number = self.frame_number.saturating_add(1);
+    Ok(Bytes::from(frame_bytes))
+  }
+
+  fn maybe_log_ring_drops(&mut self) {
+    let drops = self.ring.frames_dropped_overflow();
+    if drops <= self.last_drops_seen {
+      return;
+    }
+    let now = Instant::now();
+    let due = self
+      .last_drop_log
+      .is_none_or(|t| now.saturating_duration_since(t) >= DROP_LOG_INTERVAL);
+    if !due {
+      return;
+    }
+    let delta = drops.saturating_sub(self.last_drops_seen);
+    tracing::warn!(
+      frames_dropped = delta,
+      frames_dropped_total = drops,
+      underrun_polls = self.ring.underrun_polls(),
+      occupancy = self.ring.occupancy_frames(),
+      generation = self.generation,
+      "PCM ring overflow drops while serving LiveFlac"
+    );
+    self.last_drops_seen = drops;
+    self.last_drop_log = Some(now);
+  }
+
+  async fn pace_realtime(&mut self, next_frames: usize) {
+    pace_realtime_shared(
+      self.frames_emitted,
+      &mut self.pace_origin,
+      self.sample_rate,
+      next_frames,
+      &self.ring,
+      FLAC_BLOCK_SIZE,
+    )
+    .await;
+  }
+
+  fn emit_chunk(mut self, chunk: Bytes, pcm_frames: usize) -> (std::result::Result<Bytes, Infallible>, Self) {
+    let n = chunk.len() as u64;
+    self.bytes_sent = self.bytes_sent.saturating_add(n);
+    self.bytes_served.store(self.bytes_sent, Ordering::Release);
+    *self.last_body_write.write() = Some(Instant::now());
+    if pcm_frames > 0 {
+      self.frames_emitted = self.frames_emitted.saturating_add(u64::try_from(pcm_frames).unwrap_or(0));
+    }
+    (Ok(chunk), self)
+  }
+}
+
 struct LiveStreamState {
   ring: Arc<PcmRing>,
   header: Option<Bytes>,
@@ -644,35 +988,17 @@ impl LiveStreamState {
 
   /// Hold Nest pull so it stays at most [`LIVE_LEAD`] ahead of wall-clock audio time.
   ///
-  /// When `now` is past the scheduled wake:
-  /// - no sleep (emit immediately);
-  /// - if late beyond [`PACE_LATE_SLACK`] **and** the ring has no backlog, advance the
-  ///   pace origin by the lateness so the schedule reflects reality;
-  /// - if the ring still holds backlog (consumer was stalled while AirPlay filled), keep
-  ///   the origin fixed so successive ticks stay unpaced until `frames_emitted` catches
-  ///   wall clock — that rushes Nest's cushion back up; pacing re-engages when current.
+  /// Shared with [`LiveFlacState`] via [`pace_realtime_shared`].
   async fn pace_realtime(&mut self, next_frames: usize) {
-    let origin = *self.pace_origin.get_or_insert_with(Instant::now);
-    let now = Instant::now();
-    let plan = pace_plan(
+    pace_realtime_shared(
       self.frames_emitted,
-      next_frames,
+      &mut self.pace_origin,
       self.sample_rate,
-      origin,
-      now,
-      LIVE_LEAD,
-      PACE_LATE_SLACK,
-    );
-    if let Some(lateness) = plan.rebaseline {
-      // With backlog, prefer unpaced catch-up over snapping the schedule.
-      let has_backlog = self.ring.occupancy_frames() >= LIVE_CHUNK_FRAMES;
-      if !has_backlog && let Some(origin_mut) = self.pace_origin.as_mut() {
-        *origin_mut += lateness;
-      }
-    }
-    if let Some(delay) = plan.sleep {
-      sleep(delay).await;
-    }
+      next_frames,
+      &self.ring,
+      LIVE_CHUNK_FRAMES,
+    )
+    .await;
   }
 
   fn emit_chunk(mut self, chunk: Bytes, pcm_frames: usize) -> (std::result::Result<Bytes, Infallible>, Self) {
@@ -693,7 +1019,47 @@ impl LiveStreamState {
   }
 }
 
-/// Pure pacing decision for unit tests and [`LiveStreamState::pace_realtime`].
+/// Shared realtime pacing for `LiveWav` and `LiveFlac`.
+///
+/// When `now` is past the scheduled wake:
+/// - no sleep (emit immediately);
+/// - if late beyond [`PACE_LATE_SLACK`] **and** the ring has no backlog, advance the
+///   pace origin by the lateness so the schedule reflects reality;
+/// - if the ring still holds backlog (consumer was stalled while AirPlay filled), keep
+///   the origin fixed so successive ticks stay unpaced until `frames_emitted` catches
+///   wall clock — that rushes Nest's cushion back up; pacing re-engages when current.
+async fn pace_realtime_shared(
+  frames_emitted: u64,
+  pace_origin: &mut Option<Instant>,
+  sample_rate: u32,
+  next_frames: usize,
+  ring: &PcmRing,
+  backlog_threshold: usize,
+) {
+  let origin = *pace_origin.get_or_insert_with(Instant::now);
+  let now = Instant::now();
+  let plan = pace_plan(
+    frames_emitted,
+    next_frames,
+    sample_rate,
+    origin,
+    now,
+    LIVE_LEAD,
+    PACE_LATE_SLACK,
+  );
+  if let Some(lateness) = plan.rebaseline {
+    // With backlog, prefer unpaced catch-up over snapping the schedule.
+    let has_backlog = ring.occupancy_frames() >= backlog_threshold;
+    if !has_backlog && let Some(origin_mut) = pace_origin.as_mut() {
+      *origin_mut += lateness;
+    }
+  }
+  if let Some(delay) = plan.sleep {
+    sleep(delay).await;
+  }
+}
+
+/// Pure pacing decision for unit tests and [`pace_realtime_shared`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PacePlan {
   /// Sleep this long before emitting (schedule is early).
@@ -1358,5 +1724,269 @@ mod tests {
       rest = after_size.get(size + 2..).unwrap_or(&[]);
     }
     out
+  }
+
+  /// Decode as many complete FLAC samples as claxon can from a (possibly truncated) bitstream.
+  fn claxon_decode_prefix(flac: &[u8]) -> (u32, u32, Vec<i32>) {
+    let mut reader = claxon::FlacReader::new(std::io::Cursor::new(flac)).expect("claxon open live flac");
+    let sample_rate = reader.streaminfo().sample_rate;
+    let channels = reader.streaminfo().channels;
+    let mut samples = Vec::new();
+    for sample in reader.samples() {
+      match sample {
+        Ok(s) => samples.push(s),
+        Err(_) => break, // truncated last frame is expected for live prefix reads
+      }
+    }
+    (sample_rate, channels, samples)
+  }
+
+  /// Read a live body for up to `duration`, returning decoded payload bytes (chunked-aware).
+  ///
+  /// Live FLAC is unbounded and highly compressible; a fixed max-body read can hang once the
+  /// ring underruns. Timed reads match production (peer closes when it has enough).
+  async fn http_get_body_timed(url: &str, duration: Duration) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let without_scheme = url.strip_prefix("http://").expect("http");
+    let (host_port, raw_path) = without_scheme.split_once('/').expect("path");
+    let request_path = format!("/{raw_path}");
+
+    let mut stream = TcpStream::connect(host_port).await.expect("connect");
+    let req = format!("GET {request_path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.expect("write");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+      let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+      if remaining.is_zero() {
+        break;
+      }
+      match tokio::time::timeout(remaining, stream.read(&mut tmp)).await {
+        Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+        _ => break,
+      }
+    }
+    let split = find_header_end(&buf).expect("headers");
+    let headers = buf.get(..split).unwrap_or(&[]);
+    let raw_body = buf.get(split..).unwrap_or(&[]);
+    if headers_indicate_chunked(headers) {
+      decode_chunked_prefix(raw_body, raw_body.len())
+    } else {
+      raw_body.to_vec()
+    }
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn live_flac_preroll_then_bit_exact_pcm() {
+    use crate::audio::{FLAC_BLOCK_SIZE, round_up_to_flac_blocks};
+
+    let sample_rate = 8_000_u32;
+    let channels = 1_u16;
+    // Real SILENCE_PREROLL (2 s) at 8 kHz, rounded up to fixed FLAC blocks.
+    let preroll = round_up_to_flac_blocks(silence_preroll_frames(sample_rate));
+    assert!(preroll >= silence_preroll_frames(sample_rate));
+    assert_eq!(preroll % FLAC_BLOCK_SIZE, 0);
+
+    // One full FLAC block of known pattern after silence (f32 → ring → i16 path).
+    let pattern_frames = FLAC_BLOCK_SIZE;
+    let mut pattern_f32 = Vec::with_capacity(pattern_frames);
+    for i in 0..pattern_frames {
+      let t = i as f32 / sample_rate as f32;
+      let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+      pattern_f32.push(s);
+    }
+    // Capture expected i16 via the same ring conversion production uses.
+    let probe = PcmRing::new(channels, pattern_frames);
+    probe.push_f32(&pattern_f32);
+    let mut expected_i16 = Vec::new();
+    assert_eq!(probe.pop_i16(pattern_frames, &mut expected_i16), pattern_frames);
+
+    let ring = Arc::new(PcmRing::new(channels, pattern_frames.saturating_mul(4)));
+    ring.push_f32(&pattern_f32);
+
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac {
+      ring: Arc::clone(&ring),
+      channels,
+      sample_rate,
+    });
+
+    let url = handle.stream_url();
+    // Preroll encode is unpaced; one paced audio block follows. A few seconds is plenty.
+    let body = http_get_body_timed(&url, Duration::from_secs(8)).await;
+    assert!(body.len() > 42, "expected STREAMINFO + frames, got {}", body.len());
+    assert_eq!(&body[0..4], b"fLaC");
+
+    let (got_rate, got_ch, decoded) = claxon_decode_prefix(&body);
+    assert_eq!(got_rate, sample_rate);
+    assert_eq!(got_ch, u32::from(channels));
+
+    // Need full preroll silence + full pattern block.
+    let need = preroll.saturating_add(pattern_frames);
+    assert!(
+      decoded.len() >= need,
+      "decoded {} samples, need at least {need} (preroll={preroll} + pattern={pattern_frames}); body={}",
+      decoded.len(),
+      body.len()
+    );
+
+    // First ~SILENCE_PREROLL (and padding to block boundary) must be zero.
+    for (i, &s) in decoded.iter().take(preroll).enumerate() {
+      assert_eq!(s, 0, "preroll sample {i} must be silence, got {s}");
+    }
+    // At least the real SILENCE_PREROLL duration is silent.
+    let bare_preroll = silence_preroll_frames(sample_rate);
+    for (i, &s) in decoded.iter().take(bare_preroll).enumerate() {
+      assert_eq!(s, 0, "bare preroll sample {i} must be silence");
+    }
+
+    // Bit-exact PCM after preroll.
+    let after = &decoded[preroll..preroll + pattern_frames];
+    for (i, (&orig, &dec)) in expected_i16.iter().zip(after.iter()).enumerate() {
+      assert_eq!(i32::from(orig), dec, "PCM mismatch at sample {i}");
+    }
+
+    handle.shutdown();
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn live_flac_second_get_reemits_header_and_supersedes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let sample_rate = 8_000_u32;
+    let channels = 1_u16;
+    let ring = Arc::new(PcmRing::new(channels, 48_000));
+    // Continuous soft tone so bodies keep flowing after preroll.
+    let mut samples = Vec::with_capacity(16_000);
+    for n in 0..16_000 {
+      let t = n as f32 / sample_rate as f32;
+      let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.1;
+      samples.push(s);
+    }
+    ring.push_f32(&samples);
+
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac {
+      ring: Arc::clone(&ring),
+      channels,
+      sample_rate,
+    });
+
+    let host_port = format!("127.0.0.1:{}", handle.addr.port());
+    let req = format!("GET /stream HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+
+    let mut first = TcpStream::connect(&host_port).await.expect("connect first");
+    first.write_all(req.as_bytes()).await.expect("write first");
+    let mut first_buf = Vec::new();
+    let mut tmp = [0_u8; 4096];
+    while first_buf.len() < 128 {
+      let n = first.read(&mut tmp).await.expect("read first");
+      assert!(n > 0, "first LiveFlac body must produce bytes");
+      first_buf.extend_from_slice(&tmp[..n]);
+    }
+    let first_split = find_header_end(&first_buf).expect("first headers");
+    let first_raw = first_buf.get(first_split..).unwrap_or(&[]);
+    let first_body = if headers_indicate_chunked(first_buf.get(..first_split).unwrap_or(&[])) {
+      decode_chunked_prefix(first_raw, 64)
+    } else {
+      first_raw.get(..64.min(first_raw.len())).unwrap_or(&[]).to_vec()
+    };
+    assert_eq!(&first_body[0..4], b"fLaC", "first GET must start with fLaC");
+
+    let mut second = TcpStream::connect(&host_port).await.expect("connect second");
+    second.write_all(req.as_bytes()).await.expect("write second");
+    let mut second_buf = Vec::new();
+    while second_buf.len() < 128 {
+      let n = second.read(&mut tmp).await.expect("read second");
+      assert!(n > 0, "second LiveFlac body must produce bytes");
+      second_buf.extend_from_slice(&tmp[..n]);
+    }
+    let second_split = find_header_end(&second_buf).expect("second headers");
+    let second_headers = second_buf.get(..second_split).unwrap_or(&[]);
+    let second_raw = second_buf.get(second_split..).unwrap_or(&[]);
+    let second_body = if headers_indicate_chunked(second_headers) {
+      decode_chunked_prefix(second_raw, 64)
+    } else {
+      second_raw.get(..64.min(second_raw.len())).unwrap_or(&[]).to_vec()
+    };
+    assert_eq!(&second_body[0..4], b"fLaC", "second GET must re-emit fLaC header");
+
+    // Superseded first body must terminate.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async move {
+      let mut sink = [0_u8; 8192];
+      loop {
+        match first.read(&mut sink).await {
+          Ok(0) | Err(_) => break,
+          Ok(_) => {},
+        }
+      }
+    })
+    .await;
+    assert!(ended.is_ok(), "superseded LiveFlac body must end");
+    assert_eq!(handle.rollover_signal().count(), 0, "LiveFlac must not signal rollover");
+    handle.shutdown();
+  }
+
+  #[tokio::test]
+  async fn live_flac_headers_are_audio_flac_chunked_no_content_length() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let ring = Arc::new(PcmRing::new(1, 8_192));
+    ring.push_f32(&[0.0; 4_096]);
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac { ring, channels: 1, sample_rate: 8_000 });
+
+    let host_port = format!("127.0.0.1:{}", handle.addr.port());
+    let get_req = format!("GET /stream HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    let mut stream = TcpStream::connect(&host_port).await.expect("connect");
+    stream.write_all(get_req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 2048];
+    while find_header_end(&buf).is_none() {
+      let n = stream.read(&mut tmp).await.expect("read");
+      assert!(n > 0, "headers must arrive");
+      buf.extend_from_slice(&tmp[..n]);
+    }
+    let split = find_header_end(&buf).expect("headers");
+    let headers = String::from_utf8_lossy(buf.get(..split).unwrap_or(&[]));
+    let headers_lc = headers.to_ascii_lowercase();
+    assert!(headers_lc.contains("content-type: audio/flac"), "headers: {headers}");
+    assert!(
+      headers_lc.contains("transfer-encoding: chunked") || !headers_lc.contains("content-length:"),
+      "LiveFlac must be chunked (no Content-Length); headers: {headers}"
+    );
+    assert!(
+      !headers_lc.contains("content-length:"),
+      "LiveFlac must not set Content-Length: {headers}"
+    );
+    assert!(headers_lc.contains("accept-ranges: none"), "headers: {headers}");
+
+    // HEAD must not bump generation or set Content-Length.
+    let head_req = format!("HEAD /stream HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    let mut head = TcpStream::connect(&host_port).await.expect("connect head");
+    head.write_all(head_req.as_bytes()).await.expect("write head");
+    let mut head_buf = Vec::new();
+    loop {
+      match head.read(&mut tmp).await {
+        Ok(0) | Err(_) => break,
+        Ok(n) => head_buf.extend_from_slice(&tmp[..n]),
+      }
+    }
+    let head_text = String::from_utf8_lossy(&head_buf);
+    let head_lc = head_text.to_ascii_lowercase();
+    assert!(head_text.starts_with("HTTP/1.1 200"), "HEAD: {head_text}");
+    assert!(head_lc.contains("content-type: audio/flac"), "HEAD: {head_text}");
+    assert!(
+      !head_lc.contains("content-length:"),
+      "HEAD LiveFlac must omit Content-Length: {head_text}"
+    );
+
+    handle.shutdown();
   }
 }

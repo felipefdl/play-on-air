@@ -1565,7 +1565,7 @@ mod tests {
         assert_eq!(content_type, "audio/flac");
         assert!(body.len() > 42);
       },
-      MediaContent::LiveWav { .. } | MediaContent::Empty => {
+      MediaContent::LiveWav { .. } | MediaContent::LiveFlac { .. } | MediaContent::Empty => {
         panic!("expected Static media content");
       },
     }
