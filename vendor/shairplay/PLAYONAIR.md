@@ -25,5 +25,9 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
    abort unblocks the delivery thread (async `PlayoutCommand::Stop` alone was abort-unsafe).
 9. TEARDOWN calls `hard_stop_sessions()` (clears active_audio, aborts session tasks including
    realtime) and takes `playout_cmd` instead of a best-effort async Stop.
+10. Playout anchors/scheduling use `mono_now_ns()` (`Instant`); wall `now_ns()` remains for PTP only.
+11. Delivery caps due AAC packets per tick (`MAX_FRAMES_PER_TICK`) so catch-up cannot flood the host ring.
+12. Playout RTP math uses `source_sample_rate`; FLUSHBUFFERED range compare is wrap-safe; map capped ~30s.
+13. Playout mutex/condvar locks use `unwrap_or_else(PoisonError::into_inner)` (poison-proof).
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.
