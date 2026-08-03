@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::error::{Error, Result};
-use crate::registry::{Device, DeviceRegistry};
+use crate::registry::{DEFAULT_PENDING_LEAVE, Device, DeviceRegistry};
 
 /// DNS-SD service type for Google Cast (no domain suffix).
 pub const GOOGLECAST_REGTYPE: &str = "_googlecast._tcp";
@@ -158,21 +158,37 @@ pub struct ResolveInfo {
   pub address: Option<String>,
 }
 
+/// One "can be reached at" line from `dns-sd -L`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LookupReachable {
+  hostname: String,
+  port: u16,
+  /// Optional address if the reach line used an IPv4 instead of a hostname.
+  address: Option<String>,
+  /// Interface ordinal when present (`(interface N)`).
+  interface: Option<u32>,
+}
+
 /// Parse `dns-sd -L` output for host, port, and TXT blob.
+///
+/// When multiple "can be reached at" lines exist (multi-homed hosts), prefer a
+/// line whose host equals or shares a /24 with a preferred local IPv4, else the
+/// first line (deterministic).
 pub fn parse_lookup_output(output: &str) -> Option<ResolveInfo> {
-  let mut hostname = None;
-  let mut port = None;
+  parse_lookup_output_with_preferred(output, &[])
+}
+
+/// Like [`parse_lookup_output`] but with an explicit preferred-IPv4 list (testable).
+pub fn parse_lookup_output_with_preferred(output: &str, preferred_ipv4: &[String]) -> Option<ResolveInfo> {
+  let mut reachables = Vec::new();
   let mut txt = String::new();
 
   for raw in output.lines() {
     let trimmed = raw.trim();
-    if let Some(reached) = trimmed.find("can be reached at ") {
-      let rest = trimmed.get(reached + "can be reached at ".len()..)?;
-      // HOST:PORT (interface …
-      let hostport = rest.split_whitespace().next()?;
-      let (h, p) = hostport.rsplit_once(':')?;
-      hostname = Some(h.trim_end_matches('.').to_owned());
-      port = p.parse().ok();
+    if let Some(reached) = trimmed.find("can be reached at ")
+      && let Some(entry) = parse_reachable_line(trimmed, reached)
+    {
+      reachables.push(entry);
     }
     // TXT keys often appear on the same or following line starting with spaces + id=
     if trimmed.contains("id=") || trimmed.contains("fn=") {
@@ -183,12 +199,110 @@ pub fn parse_lookup_output(output: &str) -> Option<ResolveInfo> {
     }
   }
 
+  let chosen = choose_reachable(&reachables, preferred_ipv4)?;
   Some(ResolveInfo {
-    hostname: hostname?,
-    port: port.unwrap_or(8009),
+    hostname: chosen.hostname,
+    port: chosen.port,
     txt,
-    address: None,
+    address: chosen.address,
   })
+}
+
+fn parse_reachable_line(trimmed: &str, reached_idx: usize) -> Option<LookupReachable> {
+  let prefix_len = "can be reached at ".len();
+  let rest = trimmed.get(reached_idx + prefix_len..)?;
+  // HOST:PORT (interface …
+  let hostport = rest.split_whitespace().next()?;
+  let (h, p) = hostport.rsplit_once(':')?;
+  let host_raw = h.trim_end_matches('.').to_owned();
+  let port = p.parse().unwrap_or(8009);
+  let interface = trimmed.find("(interface ").and_then(|i| {
+    let after = trimmed.get(i + "(interface ".len()..)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+  });
+  // Prefer treating a dotted-quad as address for Cast host selection.
+  let address = if is_ipv4_literal(&host_raw) {
+    Some(host_raw.clone())
+  } else {
+    None
+  };
+  Some(LookupReachable {
+    hostname: host_raw,
+    port,
+    address,
+    interface,
+  })
+}
+
+/// Pure: pick the best reach line.
+///
+/// Preference order:
+/// 1. Exact match of a preferred local IPv4 to the reach host/address
+/// 2. Same IPv4 /24 (first three octets) as a preferred local address
+/// 3. First reach line (stable, not last-wins)
+fn choose_reachable(reachables: &[LookupReachable], preferred_ipv4: &[String]) -> Option<LookupReachable> {
+  if reachables.is_empty() {
+    return None;
+  }
+  // Exact host/address match against preferred local IPs.
+  for pref in preferred_ipv4 {
+    if let Some(hit) = reachables
+      .iter()
+      .find(|r| r.address.as_deref() == Some(pref.as_str()) || r.hostname == *pref)
+    {
+      return Some(hit.clone());
+    }
+  }
+  // Same /24 as a preferred local IPv4 (typical LAN multi-homed Cast).
+  for pref in preferred_ipv4 {
+    if let Some(pref_net) = ipv4_slash24_key(pref)
+      && let Some(hit) = reachables.iter().find(|r| {
+        let host = r.address.as_deref().unwrap_or(r.hostname.as_str());
+        ipv4_slash24_key(host) == Some(pref_net)
+      })
+    {
+      return Some(hit.clone());
+    }
+  }
+  // First match wins (deterministic; avoids last-line-wins nondeterminism).
+  reachables.first().cloned()
+}
+
+/// First three IPv4 octets as a stable key, or `None` if not a dotted-quad.
+fn ipv4_slash24_key(s: &str) -> Option<[u8; 3]> {
+  if !is_ipv4_literal(s) {
+    return None;
+  }
+  let mut parts = s.split('.');
+  let a = parts.next()?.parse().ok()?;
+  let b = parts.next()?.parse().ok()?;
+  let c = parts.next()?.parse().ok()?;
+  Some([a, b, c])
+}
+
+fn is_ipv4_literal(s: &str) -> bool {
+  let mut parts = s.split('.');
+  let mut n = 0;
+  for part in parts.by_ref() {
+    if part.is_empty() || part.len() > 3 {
+      return false;
+    }
+    if !part.chars().all(|c| c.is_ascii_digit()) {
+      return false;
+    }
+    let Ok(v) = part.parse::<u16>() else {
+      return false;
+    };
+    if v > 255 {
+      return false;
+    }
+    n += 1;
+    if n > 4 {
+      return false;
+    }
+  }
+  n == 4
 }
 
 /// Parse a DNS-SD TXT blob (`key=value` space-separated, `\` escapes spaces in values).
@@ -277,31 +391,38 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
     .filter(|a| !a.is_empty())
     .map_or_else(|| resolve_cast_host(&hostname), ToOwned::to_owned);
   let port = if info.port == 0 { 8009 } else { info.port };
-  Device {
-    id,
-    name,
-    host,
-    hostname,
-    port,
-    last_seen: Instant::now(),
-  }
+  Device::new(id, name, host, hostname, port, instance)
 }
 
-/// Remove a registry entry when macOS `dns-sd` reports a real leave.
+/// Mark a device pending leave when mDNS reports a remove (debounced ~20s).
 ///
-/// Linux mdns-sd `ServiceRemoved` is ignored (noisy re-query); stale TTL handles
-/// true departures there, so this helper is macOS-only.
-#[cfg(target_os = "macos")]
+/// Exact match only: by stored TXT `id` or by the instance string recorded at appear.
+/// Info-logs only on the first transition into pending leave (not on re-marks).
 fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
-  // Instance name may match id or be a prefix of name; also try TXT id later.
-  let list = registry.list();
-  let rid = list
-    .iter()
-    .find(|d| d.id == instance || d.name == instance || d.id.contains(instance) || instance.contains(&d.id))
-    .map(|d| d.id.clone());
-  if let Some(id) = rid {
-    tracing::info!(%id, instance, "Chromecast left");
-    drop(registry.leave(&id));
+  let now = Instant::now();
+  match registry.mark_pending_leave_by_instance(instance, now, DEFAULT_PENDING_LEAVE) {
+    Some((id, crate::registry::PendingLeaveMark::NewlyMarked)) => {
+      tracing::info!(
+        %id,
+        instance,
+        grace_secs = DEFAULT_PENDING_LEAVE.as_secs(),
+        "Chromecast pending leave"
+      );
+    },
+    Some((_id, crate::registry::PendingLeaveMark::AlreadyPending)) => {
+      // Already pending: keep quiet to avoid re-remove spam.
+    },
+    Some((id, crate::registry::PendingLeaveMark::NotFound)) => {
+      // Matched under read lock then vanished before write lock (TOCTOU).
+      tracing::debug!(
+        %id,
+        instance,
+        "pending leave mark lost race (device gone between match and mark)"
+      );
+    },
+    None => {
+      tracing::debug!(instance, "leave for unknown Chromecast instance (ignored)");
+    },
   }
 }
 
@@ -372,14 +493,31 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     match event.kind {
       BrowseKind::Add => match resolve_instance_dns_sd(&event.instance, shutdown) {
         Ok(device) => {
-          tracing::info!(
-            id = %device.id,
-            name = %device.name,
-            host = %device.host,
-            port = device.port,
-            "Chromecast appeared"
-          );
-          registry.appear(device);
+          let was_pending = registry.is_pending_leave(&device.id);
+          let is_new = registry.appear(device.clone());
+          if was_pending {
+            tracing::info!(
+              id = %device.id,
+              name = %device.name,
+              "Chromecast pending leave cancelled"
+            );
+          }
+          if is_new {
+            tracing::info!(
+              id = %device.id,
+              name = %device.name,
+              host = %device.host,
+              port = device.port,
+              instance = %device.instance,
+              "Chromecast appeared"
+            );
+          } else if !was_pending {
+            tracing::debug!(
+              id = %device.id,
+              host = %device.host,
+              "Chromecast re-announced"
+            );
+          }
         },
         Err(err) => {
           tracing::warn!(
@@ -416,7 +554,9 @@ fn spawn_dns_sd_browse() -> Result<Child> {
 #[cfg(target_os = "macos")]
 fn resolve_instance_dns_sd(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<Device> {
   let output = run_lookup_dns_sd(instance, shutdown)?;
-  let info = parse_lookup_output(&output)
+  // Prefer a resolve line that matches this host's primary LAN IPv4 when multi-homed.
+  let preferred = vec![crate::net::advertise_host_ip()];
+  let info = parse_lookup_output_with_preferred(&output, &preferred)
     .ok_or_else(|| Error::Discovery(format!("could not parse dns-sd -L for {instance}")))?;
   Ok(device_from_resolve(instance, &info))
 }
@@ -688,31 +828,37 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     match receiver.recv_timeout(MDNS_RECV_POLL) {
       Ok(ServiceEvent::ServiceResolved(resolved)) => {
         let device = device_from_mdns_resolved(resolved.as_ref());
-        let is_new = registry.get(&device.id).is_none();
+        let was_pending = registry.is_pending_leave(&device.id);
+        let is_new = registry.appear(device.clone());
+        if was_pending {
+          tracing::info!(
+            id = %device.id,
+            name = %device.name,
+            "Chromecast pending leave cancelled"
+          );
+        }
         if is_new {
           tracing::info!(
             id = %device.id,
             name = %device.name,
             host = %device.host,
             port = device.port,
+            instance = %device.instance,
             "Chromecast appeared"
           );
-        } else {
+        } else if !was_pending {
           tracing::debug!(
             id = %device.id,
             host = %device.host,
             "Chromecast re-resolved"
           );
         }
-        registry.appear(device);
       },
       Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
-        // mdns-sd often emits ServiceRemoved during re-query / interface churn even
-        // while the Cast device is still online. Acting on that withdraws AirPlay
-        // ads and breaks iOS (RC-only probes, TEARDOWN, no audio). Rely on
-        // expire_stale for true departures; only refresh last_seen via Resolved.
+        // mdns-sd can emit ServiceRemoved during re-query / interface churn.
+        // Debounce via pending-leave (~20s); a re-resolve cancels the leave.
         let instance = instance_from_mdns_fullname(&fullname);
-        tracing::debug!(instance, "ignoring mdns-sd ServiceRemoved (debounce via stale TTL)");
+        leave_by_instance(registry, instance);
       },
       Ok(ServiceEvent::SearchStopped(ty)) => {
         tracing::warn!(%ty, "mdns-sd search stopped");
@@ -773,14 +919,8 @@ fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
     let p = resolved.get_port();
     if p == 0 { 8009 } else { p }
   };
-  Device {
-    id,
-    name,
-    host,
-    hostname,
-    port,
-    last_seen: Instant::now(),
-  }
+  let instance = instance_from_mdns_fullname(resolved.get_fullname()).to_owned();
+  Device::new(id, name, host, hostname, port, instance)
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +974,46 @@ Lookup Nest-Audio-x._googlecast._tcp.local.
     assert_eq!(d.id, "56cb7fe7e13f325625325c4a304c57fa");
     assert_eq!(d.name, "Gym speaker");
     assert_eq!(d.port, 8009);
+    assert_eq!(d.instance, "Nest-Audio-x");
+  }
+
+  #[test]
+  fn parse_lookup_prefers_preferred_ipv4_not_last_line() {
+    let out = r"
+Lookup multi-homed._googlecast._tcp.local.
+10:00:00.001  multi-homed._googlecast._tcp.local. can be reached at 10.0.0.5:8009 (interface 4) Flags: 1
+10:00:00.002  multi-homed._googlecast._tcp.local. can be reached at 192.168.1.50:8009 (interface 15) Flags: 1
+10:00:00.003  multi-homed._googlecast._tcp.local. can be reached at 172.16.0.9:8009 (interface 8) Flags: 1
+ id=aabbcc fn=Kitchen
+";
+    // Without preference: first line wins (not last).
+    let first = parse_lookup_output(out).expect("lookup");
+    assert_eq!(first.hostname, "10.0.0.5");
+    assert_eq!(first.address.as_deref(), Some("10.0.0.5"));
+
+    // Preferred LAN IPv4 selects the middle line, not last-wins.
+    let preferred = vec!["192.168.1.50".to_owned()];
+    let chosen = parse_lookup_output_with_preferred(out, &preferred).expect("lookup");
+    assert_eq!(chosen.hostname, "192.168.1.50");
+    assert_eq!(chosen.port, 8009);
+    assert_eq!(chosen.address.as_deref(), Some("192.168.1.50"));
+  }
+
+  #[test]
+  fn parse_lookup_prefers_same_slash24_as_local_ip() {
+    // Preferred is the *local* host address (advertise_host_ip), not the Cast address.
+    // Equality match almost never hits; same /24 must select the LAN reach line.
+    let out = r"
+Lookup multi-homed._googlecast._tcp.local.
+10:00:00.001  multi-homed._googlecast._tcp.local. can be reached at 10.0.0.5:8009 (interface 4) Flags: 1
+10:00:00.002  multi-homed._googlecast._tcp.local. can be reached at 192.168.1.50:8009 (interface 15) Flags: 1
+ id=aabbcc fn=Kitchen
+";
+    let preferred = vec!["192.168.1.10".to_owned()];
+    let chosen = parse_lookup_output_with_preferred(out, &preferred).expect("lookup");
+    assert_eq!(chosen.hostname, "192.168.1.50");
+    assert_eq!(chosen.address.as_deref(), Some("192.168.1.50"));
+    assert_eq!(chosen.port, 8009);
   }
 
   #[test]

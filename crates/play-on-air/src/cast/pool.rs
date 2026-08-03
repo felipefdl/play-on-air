@@ -1838,6 +1838,9 @@ mod tests {
       // Discard port — connect fails fast; worker still starts and accepts Shutdown.
       port: 9,
       last_seen: Instant::now(),
+      instance: id.to_owned(),
+      pending_leave_deadline: None,
+      pending_leave_since: None,
     }
   }
 
