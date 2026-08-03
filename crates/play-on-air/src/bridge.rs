@@ -241,10 +241,8 @@ struct PlayingSession {
 enum DeviceState {
   #[default]
   Idle,
-  Starting {
-    generation: u64,
-    ring: Arc<PcmRing>,
-  },
+  /// In-flight session start (prebuffer / Cast LOAD). Ring identity is only on the event path.
+  Starting { generation: u64 },
   Playing {
     generation: u64,
     session: Box<PlayingSession>,
@@ -276,7 +274,7 @@ impl DeviceSlot {
 
   const fn live_gen(&self) -> Option<u64> {
     match self.state {
-      DeviceState::Starting { generation, .. } | DeviceState::Playing { generation, .. } => Some(generation),
+      DeviceState::Starting { generation } | DeviceState::Playing { generation, .. } => Some(generation),
       DeviceState::Idle | DeviceState::Draining { .. } => None,
     }
   }
@@ -422,7 +420,8 @@ impl Bridge {
 
     // Accept start: bump generation, install Starting, detach prior Playing teardown.
     // Do NOT await prior Cast STOP — new LOAD replaces the app session (SkipStopForReplace).
-    let (generation, prior) = self.accept_start(device_id, &ring);
+    // Every non-install exit after this point must clear Starting for this generation.
+    let (generation, prior) = self.accept_start(device_id);
 
     if let Some(old) = prior {
       tracing::info!(
@@ -433,19 +432,26 @@ impl Bridge {
       detach_teardown(*old, TeardownCastPolicy::SkipStopForReplace);
     }
 
-    let device = self
-      .registry
-      .get(device_id)
-      .ok_or_else(|| Error::Bridge(format!("unknown device {device_id}")))?;
+    let Some(device) = self.registry.get(device_id) else {
+      self.clear_starting_if(device_id, generation);
+      return Err(Error::Bridge(format!("unknown device {device_id}")));
+    };
 
     let fmt = StreamFormat {
       channels: ring.channels().max(1),
       sample_rate: sample_rate.max(1),
     };
 
-    if !wait_for_prebuffer(device_id, &ring, rings.as_ref()).await? {
-      self.clear_starting_if(device_id, generation);
-      return Ok(());
+    match wait_for_prebuffer(device_id, &ring, rings.as_ref()).await {
+      Ok(true) => {},
+      Ok(false) => {
+        self.clear_starting_if(device_id, generation);
+        return Ok(());
+      },
+      Err(err) => {
+        self.clear_starting_if(device_id, generation);
+        return Err(err);
+      },
     }
 
     if !is_current(&ring) || !self.starting_still(device_id, generation) {
@@ -458,12 +464,12 @@ impl Bridge {
   }
 
   /// Bump generation, install `Starting`, return prior `Playing` session if any.
-  fn accept_start(&self, device_id: &str, ring: &Arc<PcmRing>) -> (u64, Option<Box<PlayingSession>>) {
+  fn accept_start(&self, device_id: &str) -> (u64, Option<Box<PlayingSession>>) {
     let mut devices = self.devices.lock();
     let slot = devices.entry(device_id.to_owned()).or_default();
     slot.generation = slot.generation.saturating_add(1);
     let generation = slot.generation;
-    let previous = std::mem::replace(&mut slot.state, DeviceState::Starting { generation, ring: Arc::clone(ring) });
+    let previous = std::mem::replace(&mut slot.state, DeviceState::Starting { generation });
     let prior = match previous {
       DeviceState::Playing { generation: old_gen, session } => {
         // Prior session tears down on a detached task; slot is already Starting{new}.
@@ -471,7 +477,7 @@ impl Bridge {
         tracing::debug!(%device_id, old_gen, new_gen = generation, "prior Playing moved to detached drain");
         Some(session)
       },
-      DeviceState::Starting { generation: old_gen, .. } => {
+      DeviceState::Starting { generation: old_gen } => {
         tracing::debug!(%device_id, old_gen, new_gen = generation, "superseding in-flight Starting");
         None
       },
@@ -486,7 +492,7 @@ impl Bridge {
     let Some(slot) = devices.get_mut(device_id) else {
       return;
     };
-    if matches!(slot.state, DeviceState::Starting { generation: g, .. } if g == generation) {
+    if matches!(slot.state, DeviceState::Starting { generation: g } if g == generation) {
       slot.state = DeviceState::Idle;
     }
     drop(devices);
@@ -496,7 +502,7 @@ impl Bridge {
     let devices = self.devices.lock();
     devices
       .get(device_id)
-      .is_some_and(|slot| matches!(slot.state, DeviceState::Starting { generation: g, .. } if g == generation))
+      .is_some_and(|slot| matches!(slot.state, DeviceState::Starting { generation: g } if g == generation))
   }
 
   async fn start_cast_session(
@@ -508,7 +514,13 @@ impl Bridge {
     fmt: StreamFormat,
   ) -> Result<()> {
     let host = advertise_host_for_peer(&device.host);
-    let media = MediaServer::start(&host).await?;
+    let media = match MediaServer::start(&host).await {
+      Ok(media) => media,
+      Err(err) => {
+        self.clear_starting_if(device_id, generation);
+        return Err(err);
+      },
+    };
     let stream_url = media.stream_url();
 
     let remembered_wav = self.flac_fallback.lock().contains(device_id);
@@ -531,6 +543,23 @@ impl Bridge {
 
     match load_result {
       Ok(session) => {
+        // Post-LOAD liveness: do not install if Ended / superseding start cancelled Starting.
+        if !self.starting_still(device_id, generation) {
+          tracing::info!(
+            %device_id,
+            generation,
+            "Cast LOAD completed but start was cancelled; discarding session"
+          );
+          media.shutdown();
+          let pool = Arc::clone(&self.cast_pool);
+          let id = device_id.to_owned();
+          let _stop = tokio::task::spawn_blocking(move || {
+            pool.stop_best_effort(&id, Duration::from_secs(2));
+          })
+          .await;
+          self.clear_starting_if(device_id, generation);
+          return Ok(());
+        }
         tracing::info!(
           %device_id,
           generation,
@@ -704,7 +733,7 @@ impl Bridge {
     let orphan = {
       let mut devices = self.devices.lock();
       let result = match devices.get_mut(device_id) {
-        Some(slot) if matches!(slot.state, DeviceState::Starting { generation: g, .. } if g == generation) => {
+        Some(slot) if matches!(slot.state, DeviceState::Starting { generation: g } if g == generation) => {
           slot.state = DeviceState::Playing { generation, session: Box::new(playing) };
           None
         },
@@ -780,10 +809,18 @@ impl Bridge {
 
   /// Resolve `Ended` with generation / ring defense in depth.
   ///
-  /// Ingest guarantees no stale `Ended` after a newer `Started`, but we still only
-  /// tear down when the live session's ring is no longer the receiver's current ring
-  /// (genuine end replaced the slot) or the receiver is gone.
+  /// For `Playing`: tear down only when the live session's ring is no longer the
+  /// receiver's current ring (genuine end) or the receiver is gone. Ring still
+  /// current ⇒ stale `Ended` for a prior generation.
+  ///
+  /// For `Starting`: always clear that generation. Ring still current means the
+  /// client ended while we were still starting — not a stale event.
   async fn handle_ended(&self, device_id: &str, rings: &dyn RingLookup) {
+    enum EndedDecision {
+      Starting { generation: u64 },
+      Playing { generation: u64, stale: bool },
+    }
+
     let decision = {
       let devices = self.devices.lock();
       let Some(slot) = devices.get(device_id) else {
@@ -794,13 +831,12 @@ impl Bridge {
           let still_current = rings
             .ring_for(device_id)
             .is_some_and(|current| Arc::ptr_eq(&current, &session.ring));
-          // Live ring still matches ⇒ stale Ended for a prior generation.
-          Some((*generation, still_current))
+          Some(EndedDecision::Playing {
+            generation: *generation,
+            stale: still_current,
+          })
         },
-        DeviceState::Starting { generation, ring } => {
-          let still_current = rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, ring));
-          Some((*generation, still_current))
-        },
+        DeviceState::Starting { generation } => Some(EndedDecision::Starting { generation: *generation }),
         DeviceState::Idle | DeviceState::Draining { .. } => {
           tracing::debug!(%device_id, "dropping Ended; no live session generation");
           None
@@ -810,24 +846,24 @@ impl Bridge {
       result
     };
 
-    let Some((generation, stale)) = decision else {
-      return;
-    };
-    if stale {
-      tracing::debug!(%device_id, generation, "dropping stale Ended (session ring still current)");
-      return;
+    match decision {
+      None => {},
+      Some(EndedDecision::Starting { generation }) => {
+        self.clear_starting_if(device_id, generation);
+        tracing::info!(%device_id, generation, "bridge Starting cancelled by Ended");
+      },
+      Some(EndedDecision::Playing { generation, stale: true }) => {
+        tracing::debug!(%device_id, generation, "dropping stale Ended (session ring still current)");
+      },
+      Some(EndedDecision::Playing { generation, stale: false }) => {
+        let removed = self.take_live_session_if_gen(device_id, generation);
+        if let Some(session) = removed {
+          teardown_playing(*session, TeardownCastPolicy::StopBestEffort).await;
+          self.clear_draining_if(device_id, generation);
+          tracing::info!(%device_id, generation, "bridge session ended (media dropped; Cast STOP best-effort)");
+        }
+      },
     }
-
-    let removed = self.take_live_session_if_gen(device_id, generation);
-    let Some(session) = removed else {
-      // Starting with no Playing body: just clear.
-      self.clear_starting_if(device_id, generation);
-      tracing::info!(%device_id, generation, "bridge Starting cancelled by Ended");
-      return;
-    };
-    teardown_playing(*session, TeardownCastPolicy::StopBestEffort).await;
-    self.clear_draining_if(device_id, generation);
-    tracing::info!(%device_id, generation, "bridge session ended (media dropped; Cast STOP best-effort)");
   }
 
   fn take_live_session(&self, device_id: &str) -> Option<(u64, Box<PlayingSession>)> {
@@ -839,8 +875,10 @@ impl Bridge {
         Some((generation, session))
       },
       DeviceState::Idle => None,
-      DeviceState::Starting { generation, ring } => {
-        slot.state = DeviceState::Starting { generation, ring };
+      DeviceState::Starting { generation } => {
+        // Cancel Starting (leave Idle) so ownership kick / external end cannot leave
+        // `has_session` true forever.
+        tracing::debug!(%device_id, generation, "cleared Starting on session end");
         None
       },
       DeviceState::Draining { generation } => {
@@ -954,7 +992,7 @@ impl Bridge {
   }
 
   /// Resume Cast media after AirPlay playout restarts.
-  async fn handle_resume(&self, device_id: &str) {
+  async fn handle_resume(self: &Arc<Self>, device_id: &str) {
     let action = {
       let mut devices = self.devices.lock();
       let Some(slot) = devices.get_mut(device_id) else {
@@ -991,18 +1029,20 @@ impl Bridge {
           if let Err(err) = play_result {
             tracing::debug!(device_id = %device_id, generation, error = %err, "Cast play task join failed; re-LOADing");
           }
-          let _reloaded = self.reload_playing_media(device_id, generation, "resume_play_failed").await;
+          // Off the device worker so Paused/Ended can proceed while re-LOAD runs.
+          self.spawn_reload_playing_media(device_id, generation, "resume_play_failed");
         }
       },
       ResumeAction::Reload { generation } => {
         tracing::info!(%device_id, generation, "AirPlay resumed after long pause; re-LOADing Cast media");
-        let _reloaded = self.reload_playing_media(device_id, generation, "long_pause_resume").await;
+        // Detached: long Cast re-LOAD must not HOL-block the device worker FIFO.
+        self.spawn_reload_playing_media(device_id, generation, "long_pause_resume");
       },
     }
   }
 
   /// Flush: ring already cleared by ingest; re-LOAD to discard Cast's ~2 s buffer.
-  async fn handle_flush(&self, device_id: &str) {
+  fn handle_flush(self: &Arc<Self>, device_id: &str) {
     let decision = {
       let mut devices = self.devices.lock();
       let Some(slot) = devices.get_mut(device_id) else {
@@ -1030,7 +1070,17 @@ impl Bridge {
       return;
     };
     tracing::info!(%device_id, generation, "AirPlay flushed; re-LOADing Cast media");
-    let _reloaded = self.reload_playing_media(device_id, generation, "flush").await;
+    // Detached generation-scoped re-LOAD keeps flush off the worker FIFO.
+    self.spawn_reload_playing_media(device_id, generation, "flush");
+  }
+
+  /// Spawn a generation-scoped re-LOAD off the device worker (gen checks inside reload).
+  fn spawn_reload_playing_media(self: &Arc<Self>, device_id: &str, generation: u64, reason: &'static str) {
+    let bridge = Arc::clone(self);
+    let id = device_id.to_owned();
+    drop(tokio::spawn(async move {
+      let _ok = bridge.reload_playing_media(&id, generation, reason).await;
+    }));
   }
 
   /// Stall watchdog tick for a Playing generation (called from a detached task).
@@ -1058,11 +1108,13 @@ impl Bridge {
       snap
     };
 
-    let Some(last_write) = snapshot.last_write else {
-      // No body write yet: still preroll / Cast not connected. Not a stall kick.
-      return;
-    };
-    if last_write.elapsed() < STALL_BODY_STALE {
+    // Body age: last HTTP write, or time since session start if Cast never pulled.
+    // Never-pulled while the ring has data after STALL_BODY_STALE is a stall.
+    let body_stale = snapshot.last_write.map_or_else(
+      || snapshot.started_at.elapsed() >= STALL_BODY_STALE,
+      |at| at.elapsed() >= STALL_BODY_STALE,
+    );
+    if !body_stale {
       return;
     }
     // Empty ring + no recent body = sender silence, not Cast stall.
@@ -1084,11 +1136,9 @@ impl Bridge {
     }
 
     if snapshot.last_stall.is_some_and(|at| at.elapsed() < STALL_REPEAT_WINDOW) {
-      tracing::warn!(%device_id, generation, "media stall repeated within window; ending session");
-      if let Some(session) = self.take_live_session_if_gen(device_id, generation) {
-        teardown_playing(*session, TeardownCastPolicy::StopBestEffort).await;
-        self.clear_draining_if(device_id, generation);
-      }
+      self
+        .terminal_stall_end(device_id, generation, "media stall repeated within window")
+        .await;
       return;
     }
 
@@ -1105,10 +1155,22 @@ impl Bridge {
 
     tracing::warn!(%device_id, generation, "media stall detected; re-LOADing Cast media");
     let ok = self.reload_playing_media(device_id, generation, "stall").await;
-    if !ok && let Some(session) = self.take_live_session_if_gen(device_id, generation) {
-      tracing::warn!(%device_id, generation, "stall re-LOAD failed; ending session");
+    if !ok {
+      self.terminal_stall_end(device_id, generation, "stall re-LOAD failed").await;
+    }
+  }
+
+  /// Tear down Playing and kick AirPlay so the phone shows the session is dead.
+  async fn terminal_stall_end(self: &Arc<Self>, device_id: &str, generation: u64, reason: &str) {
+    tracing::warn!(%device_id, generation, reason, "terminal media stall; ending session");
+    if let Some(session) = self.take_live_session_if_gen(device_id, generation) {
       teardown_playing(*session, TeardownCastPolicy::StopBestEffort).await;
       self.clear_draining_if(device_id, generation);
+    }
+    if let Some(airplay) = self.airplay.as_ref()
+      && let Err(err) = airplay.kick_clients(device_id).await
+    {
+      tracing::warn!(%device_id, error = %err, "AirPlay kick after terminal stall failed");
     }
   }
 
@@ -1144,6 +1206,9 @@ impl Bridge {
     let Some((pool, request, volume, alive, inflight_load)) = load_plan else {
       return false;
     };
+
+    // Single-flight: finish any prior LOAD before publishing a new one (no detached race).
+    join_prior_inflight_load(&inflight_load, device_id).await;
 
     let id = device_id.to_owned();
     let (result_tx, result_rx) = oneshot::channel();
@@ -1194,6 +1259,53 @@ impl Bridge {
         tracing::debug!(%device_id, generation, reason, "Cast re-LOAD result dropped (session teardown)");
         false
       },
+    }
+  }
+
+  /// Pool re-LOAD recovered media (IDLE/BUFFERING path). Early FLAC → WAV when in window.
+  pub async fn on_media_recovered(self: &Arc<Self>, device_id: &str) {
+    let early_flac_gen = {
+      let devices = self.devices.lock();
+      let Some(slot) = devices.get(device_id) else {
+        drop(devices);
+        tracing::info!(%device_id, "Cast pool re-LOAD recovered media (no bridge session)");
+        return;
+      };
+      let early = match &slot.state {
+        DeviceState::Playing { generation, session }
+          if session.egress == EgressKind::FlacLive && session.started_at.elapsed() < FLAC_FALLBACK_WINDOW =>
+        {
+          Some(*generation)
+        },
+        DeviceState::Idle
+        | DeviceState::Starting { .. }
+        | DeviceState::Playing { .. }
+        | DeviceState::Draining { .. } => {
+          let generation = slot.live_gen();
+          tracing::info!(
+            %device_id,
+            session_generation = ?generation,
+            "Cast pool re-LOAD recovered media session"
+          );
+          None
+        },
+      };
+      drop(devices);
+      early
+    };
+    let Some(generation) = early_flac_gen else {
+      return;
+    };
+
+    tracing::warn!(
+      %device_id,
+      generation,
+      "early FLAC media_recovered (IDLE recovery); falling back to WAV BUFFERED"
+    );
+    self.remember_flac_fallback(device_id);
+    let switched = self.switch_playing_to_wav(device_id, generation).await;
+    if !switched {
+      tracing::debug!(%device_id, generation, "early FLAC media_recovered fallback did not switch (session gone or already WAV)");
     }
   }
 
@@ -1296,7 +1408,7 @@ async fn device_worker_loop(
         bridge.handle_resume(&event_device).await;
       },
       AirPlaySessionEvent::Flushed { device_id: event_device } => {
-        bridge.handle_flush(&event_device).await;
+        bridge.handle_flush(&event_device);
       },
       AirPlaySessionEvent::Volume { device_id: event_device, volume_db } => {
         bridge.handle_volume(&event_device, volume_db).await;
@@ -1348,6 +1460,25 @@ fn cast_load_media(
   Ok(session)
 }
 
+/// Abort + join any prior in-flight LOAD so a new publish cannot race a detached handle.
+async fn join_prior_inflight_load(inflight_load: &Mutex<Option<tokio::task::JoinHandle<()>>>, device_id: &str) {
+  let prior = inflight_load.lock().take();
+  let Some(handle) = prior else {
+    return;
+  };
+  handle.abort();
+  match tokio::time::timeout(INFLIGHT_LOAD_JOIN_TIMEOUT, handle).await {
+    Ok(Ok(())) => {},
+    Ok(Err(err)) if err.is_cancelled() => {},
+    Ok(Err(err)) => {
+      tracing::warn!(%device_id, error = %err, "prior in-flight Cast LOAD join failed");
+    },
+    Err(_) => {
+      tracing::warn!(%device_id, "prior in-flight Cast LOAD join timed out");
+    },
+  }
+}
+
 /// Spawn a task that re-LOADs the same stream URL each time `LiveWav` hits its body cap.
 #[expect(
   clippy::too_many_arguments,
@@ -1385,6 +1516,12 @@ fn spawn_rollover_reload_loop(
           let title = cast_name.clone();
           let last_volume = *last_volume_linear.lock();
           let alive = Arc::clone(&session_alive);
+          // Single-flight: finish any prior LOAD before publishing (no detached race).
+          join_prior_inflight_load(&inflight_load, &device_id).await;
+          if !session_alive.load(Ordering::Acquire) {
+            tracing::debug!(%device_id, "skipping LiveWav rollover re-LOAD; session ended after prior join");
+            break;
+          }
           // Result channel lets this loop observe LOAD while `inflight_load` stays joinable by teardown.
           let (result_tx, result_rx) = oneshot::channel();
           // Publish under the same lock as the alive re-check so teardown cannot
@@ -1649,10 +1786,7 @@ mod tests {
         "dev".to_owned(),
         DeviceSlot {
           generation: 1,
-          state: DeviceState::Starting {
-            generation: 1,
-            ring: Arc::new(PcmRing::new(2, 64)),
-          },
+          state: DeviceState::Starting { generation: 1 },
         },
       ));
     }
@@ -1682,14 +1816,13 @@ mod tests {
     let ring1 = Arc::new(PcmRing::new(2, 64));
     insert_playing(&bridge, "dev", 1, test_playing_session(media, "dev", pool, Arc::clone(&ring1)));
 
-    let ring2 = Arc::new(PcmRing::new(2, 64));
-    let (generation, prior) = bridge.accept_start("dev", &ring2);
+    let (generation, prior) = bridge.accept_start("dev");
     assert_eq!(generation, 2);
     assert!(prior.is_some());
     assert!(bridge.has_session("dev"));
     assert!(matches!(
       bridge.devices.lock().get("dev").map(|s| &s.state),
-      Some(DeviceState::Starting { generation: 2, .. })
+      Some(DeviceState::Starting { generation: 2 })
     ));
     // Detached teardown of prior would normally run; drop it here to shut media.
     if let Some(old) = prior {
@@ -2178,7 +2311,7 @@ mod tests {
   #[tokio::test]
   async fn flush_debounces_within_window() {
     let pool = Arc::new(CastPool::new(None));
-    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     insert_playing(
       &bridge,
@@ -2187,9 +2320,9 @@ mod tests {
       test_playing_session(media, "dev-flush", pool, Arc::new(PcmRing::new(2, 64))),
     );
 
-    bridge.handle_flush("dev-flush").await;
+    bridge.handle_flush("dev-flush");
     // Immediate second flush is debounced (still Playing; no panic without worker).
-    bridge.handle_flush("dev-flush").await;
+    bridge.handle_flush("dev-flush");
     {
       let devices = bridge.devices.lock();
       let DeviceState::Playing { session, .. } = &devices.get("dev-flush").expect("slot").state else {
@@ -2206,5 +2339,142 @@ mod tests {
     let req = MediaLoadRequest::flac("http://127.0.0.1/stream", CastStreamKind::Live);
     assert_eq!(req.content_type, "audio/flac");
     assert_eq!(req.stream_kind, CastStreamKind::Live);
+  }
+
+  #[tokio::test]
+  async fn end_session_clears_starting() {
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
+    {
+      let mut devices = bridge.devices.lock();
+      drop(devices.insert(
+        "dev-start-end".to_owned(),
+        DeviceSlot {
+          generation: 2,
+          state: DeviceState::Starting { generation: 2 },
+        },
+      ));
+    }
+    assert!(bridge.has_session("dev-start-end"));
+    bridge.end_session("dev-start-end").await;
+    assert!(
+      !bridge.has_session("dev-start-end"),
+      "end_session must clear Starting so has_session cannot stick"
+    );
+  }
+
+  #[tokio::test]
+  async fn ended_while_starting_with_current_ring_clears() {
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
+    let ring = Arc::new(PcmRing::new(2, 64));
+    {
+      let mut devices = bridge.devices.lock();
+      drop(devices.insert(
+        "dev-start-ended".to_owned(),
+        DeviceSlot {
+          generation: 1,
+          state: DeviceState::Starting { generation: 1 },
+        },
+      ));
+    }
+    // Ring still current would have been treated as "stale" before the fix; Starting always clears.
+    let rings = FixedRingLookup { current: Some(Arc::clone(&ring)) };
+    bridge.handle_ended("dev-start-ended", &rings).await;
+    assert!(
+      !bridge.has_session("dev-start-ended"),
+      "Ended while Starting must clear even when ring is still current"
+    );
+  }
+
+  #[tokio::test]
+  async fn session_start_unknown_device_clears_starting() {
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None))));
+    let ring = Arc::new(PcmRing::new(2, 64));
+    let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
+    let err = bridge
+      .handle_session_start("missing-dev", 48_000, ring, rings)
+      .await
+      .expect_err("unknown device must fail");
+    assert!(err.to_string().contains("unknown device"), "unexpected error: {err}");
+    assert!(!bridge.has_session("missing-dev"), "failed start path must clear Starting");
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn session_start_prebuffer_timeout_clears_starting() {
+    let registry = Arc::new(DeviceRegistry::new());
+    let _appeared = registry.appear(Device {
+      id: "dev-prebuf".to_owned(),
+      name: "Prebuf".to_owned(),
+      host: "127.0.0.1".to_owned(),
+      hostname: "prebuf.local".to_owned(),
+      port: 9,
+      last_seen: Instant::now(),
+      instance: "dev-prebuf".to_owned(),
+      pending_leave_deadline: None,
+      pending_leave_since: None,
+    });
+    let bridge = Arc::new(Bridge::new(registry, Arc::new(CastPool::new(None))));
+    // Current ring but empty → prebuffer polls until timeout (virtual time advances).
+    let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 2));
+    let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
+    let err = bridge
+      .handle_session_start("dev-prebuf", 48_000, ring, rings)
+      .await
+      .expect_err("empty ring must prebuffer-timeout");
+    assert!(err.to_string().contains("prebuffer timeout"), "unexpected error: {err}");
+    assert!(!bridge.has_session("dev-prebuf"), "prebuffer timeout must clear Starting");
+  }
+
+  #[tokio::test]
+  async fn on_media_recovered_early_flac_switches_to_wav() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, "dev-recov", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    playing.started_at = Instant::now();
+    insert_playing(&bridge, "dev-recov", 1, playing);
+
+    bridge.on_media_recovered("dev-recov").await;
+
+    assert!(
+      bridge.flac_fallback.lock().contains("dev-recov"),
+      "early media_recovered must remember WAV fallback"
+    );
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session: live, .. } = &devices.get("dev-recov").expect("slot").state else {
+        panic!("expected Playing after media_recovered");
+      };
+      assert_eq!(live.egress, EgressKind::WavBuffered);
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-recov").await;
+  }
+
+  #[tokio::test]
+  async fn on_media_recovered_outside_window_keeps_flac() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, "dev-late", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    // Started well before the early-fallback window.
+    playing.started_at = Instant::now()
+      .checked_sub(FLAC_FALLBACK_WINDOW + Duration::from_secs(1))
+      .unwrap_or_else(Instant::now);
+    insert_playing(&bridge, "dev-late", 1, playing);
+
+    bridge.on_media_recovered("dev-late").await;
+
+    assert!(!bridge.flac_fallback.lock().contains("dev-late"));
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session: live, .. } = &devices.get("dev-late").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert_eq!(live.egress, EgressKind::FlacLive);
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-late").await;
   }
 }

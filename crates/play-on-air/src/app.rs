@@ -111,16 +111,11 @@ impl App {
       }
     });
 
-    // Pool-internal IDLE/BUFFERING re-LOAD recovery; log with bridge session generation.
+    // Pool-internal IDLE/BUFFERING re-LOAD recovery → bridge early FLAC→WAV when in window.
     let recovered_bridge = Arc::clone(&bridge);
     let media_recovered_watch = tokio::spawn(async move {
       while let Some(device_id) = media_recovered_rx.recv().await {
-        let generation = recovered_bridge.session_generation(&device_id);
-        tracing::info!(
-          %device_id,
-          session_generation = ?generation,
-          "Cast pool re-LOAD recovered media session"
-        );
+        recovered_bridge.on_media_recovered(&device_id).await;
       }
     });
 
