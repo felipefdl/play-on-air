@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0
+
+- **FLAC to Cast by default**: lossless FLAC over a live chunked stream (`streamType` LIVE). Devices that reject FLAC fall back to WAV automatically.
+- **~2 s playback cushion**: silence preroll fills the Cast buffer at start and a maintained lead keeps it there, so brief Wi-Fi or sender hiccups no longer pause playback; the cushion self-heals after stalls.
+- iPhone pause, resume, and track-skip flush arrive as real AirPlay 2 events: Cast pauses promptly, resume after a long pause rejoins live instead of replaying stale audio, and skips re-load for a fast track change.
+- Mixed 44.1/48 kHz queues no longer kill the session on track boundaries (format changes rebuild the stream in place).
+- Cast control recovers instead of disconnecting: reconnects with backoff, a single failed heartbeat no longer kicks the iPhone, media errors and stuck buffering re-load the stream, and a stall watchdog restarts a dead pull.
+- Discovery blips no longer tear down live playback (debounced removal on macOS and Linux, live sessions are guarded); devices that really leave withdraw within minutes instead of 24 h.
+- Mac system audio (realtime ALAC): packet reorder and loss concealment keep the clock steady on busy Wi-Fi.
+- Playout runs on a monotonic clock, immune to NTP steps on the host.
+- One termination signal stops the process cleanly; a second forces exit.
+- License notices for the vendored LGPL-3.0 AirPlay stack; macOS CI job covers the platform-specific discovery code.
+
 ## 0.1.14
 
 - Stop Cast-PAUSE on PCM idle/underrun (iPhone could keep Streaming while Nest stayed paused forever). Cast PAUSE only on explicit AirPlay FLUSH; PCM again resumes Cast.
