@@ -360,7 +360,7 @@ fn service_info_txt_records() {
             .iter()
             .find(|(k, _)| k == "model")
             .map(|(_, v)| v.as_str()),
-        Some("AppleTV2,1")
+        Some("PlayOnAir1,1")
     );
 }
 

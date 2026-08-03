@@ -4,7 +4,7 @@
 //! Single Source of Truth (SSOT) for global AirPlay receiver capabilities and profiles.
 
 /// Global device hardware model advertised to Apple clients.
-pub(crate) const GLOBAL_MODEL: &str = "AppleTV2,1";
+pub(crate) const GLOBAL_MODEL: &str = "PlayOnAir1,1";
 
 /// RTSP/mDNS protocol version for AirPlay 2.
 #[cfg(feature = "ap2")]

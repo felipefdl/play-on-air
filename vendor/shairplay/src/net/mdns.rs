@@ -399,7 +399,7 @@ mod tests {
         assert!(find("features").is_some());
         assert!(find("flags").is_some());
         assert!(find("gid").is_some());
-        assert_eq!(find("model"), Some("AppleTV2,1"));
+        assert_eq!(find("model"), Some("PlayOnAir1,1"));
         assert_eq!(find("protovers"), Some("1.1"));
         assert!(find("pi").is_some());
         assert!(find("pk").is_some());
