@@ -88,19 +88,39 @@ impl DeviceAudioState {
     *self.ring_slot.lock() = ring;
   }
 
-  /// Atomically claim stream end if `ring` is still the live slot.
+  /// If `ring` is still the live slot, clear it, install a placeholder, and emit
+  /// [`AirPlaySessionEvent::Ended`] under the same `ring_slot` lock that
+  /// [`Self::replace_ring`] uses.
   ///
-  /// On success, installs a drained placeholder under the same `ring_slot` lock
-  /// that [`Self::replace_ring`] uses, so a concurrent `audio_init` cannot leave
-  /// a later `Started` followed by this session's `Ended`. Caller must clear the
-  /// old ring and emit [`AirPlaySessionEvent::Ended`] only when this returns true.
+  /// Sending `Ended` inside the critical section is load-bearing: a concurrent
+  /// `audio_init` cannot publish `Started` until this lock is released, so the
+  /// bridge never sees `Started` then a stale `Ended` for the same device.
+  /// Returns whether this session owned the slot and emitted `Ended`.
+  fn end_if_current(&self, ring: &Arc<PcmRing>) -> bool {
+    let mut slot = self.ring_slot.lock();
+    if !Arc::ptr_eq(&*slot, ring) {
+      return false;
+    }
+    ring.clear();
+    // Release ownership while still holding the lock. Placeholder keeps
+    // `current_ring()` valid for idle readers until the next `audio_init`.
+    *slot = Arc::new(PcmRing::new(ring.channels(), DEFAULT_RING_FRAMES));
+    if let Some(tx) = &self.event_tx {
+      // Send while `slot` is still held so concurrent `audio_init` cannot
+      // publish `Started` before this `Ended` (TOCTOU if send is after unlock).
+      drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.device_id.clone() }));
+    }
+    drop(slot);
+    true
+  }
+
+  /// Test/helpers: claim end without emitting (ownership release only).
+  #[cfg(test)]
   fn claim_end_if_current(&self, ring: &Arc<PcmRing>) -> bool {
     let mut slot = self.ring_slot.lock();
     if !Arc::ptr_eq(&*slot, ring) {
       return false;
     }
-    // Release ownership while still holding the lock. Placeholder keeps
-    // `current_ring()` valid for idle readers until the next `audio_init`.
     *slot = Arc::new(PcmRing::new(ring.channels(), DEFAULT_RING_FRAMES));
     true
   }
@@ -192,19 +212,16 @@ impl AudioSession for RingSession {
 impl Drop for RingSession {
   fn drop(&mut self) {
     // Delivery does drop-then-replace on format change (Ended then Started).
-    // Cross-connection SETUP may replace-then-drop. Claim ownership under the
-    // same `ring_slot` lock as `replace_ring` so a superseded session can never
-    // emit Ended after a later Started (TOCTOU: check-then-send is not enough).
-    if !self.state.claim_end_if_current(&self.ring) {
+    // Cross-connection SETUP may replace-then-drop. Decide and send Ended under
+    // the same `ring_slot` lock as `replace_ring` so a superseded session can
+    // never emit Ended after a later Started (claim-then-send outside the lock
+    // still races).
+    if !self.state.end_if_current(&self.ring) {
       tracing::debug!(
         device_id = %self.state.device_id,
         "AirPlay audio session dropped (stale ring; suppress Ended)"
       );
       return;
-    }
-    self.ring.clear();
-    if let Some(tx) = &self.state.event_tx {
-      drop(tx.send(AirPlaySessionEvent::Ended { device_id: self.state.device_id.clone() }));
     }
     tracing::debug!(
       device_id = %self.state.device_id,
