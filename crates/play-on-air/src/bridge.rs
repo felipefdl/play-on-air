@@ -29,7 +29,12 @@ use crate::registry::DeviceRegistry;
 /// Prebuffer feeds the first real-PCM HTTP chunks after silence preroll; the media
 /// server's silence preroll builds the Cast-side cushion; `LIVE_LEAD` maintains it.
 const PREBUFFER_FRAMES: usize = 24_000;
-/// Max prebuffer poll iterations (160 × 50 ms = 8 s). Fail if still incomplete.
+/// Minimum frames after the 8 s poll budget before we still start Cast LOAD (~250 ms at 48 kHz).
+///
+/// HTTP silence preroll provides the Cast-side cushion; the prebuffer only seeds the first
+/// real-PCM chunks. On timeout, start if `available >= PREBUFFER_FLOOR_FRAMES`; otherwise fail.
+const PREBUFFER_FLOOR_FRAMES: usize = 12_000;
+/// Max prebuffer poll iterations (160 × 50 ms = 8 s). On timeout, apply floor leniency.
 const PREBUFFER_POLLS: u32 = 160;
 const PREBUFFER_POLL: Duration = Duration::from_millis(50);
 /// How long the main `run` loop waits for per-device workers after the event channel closes.
@@ -2002,10 +2007,35 @@ async fn device_worker_loop(
   tracing::debug!(%device_id, "device session worker exited");
 }
 
+/// Outcome of the prebuffer poll budget when the preferred target was not met early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrebufferTimeoutOutcome {
+  /// Full preferred target is available — start Cast LOAD.
+  StartFull,
+  /// Below preferred target but at/above the floor — start with a partial prebuffer.
+  StartPartial,
+  /// Below the floor — fail session start.
+  Fail,
+}
+
+/// After the prebuffer poll budget, decide whether to start Cast LOAD.
+///
+/// Prefer `target` frames; accept `floor` (~250 ms) because HTTP preroll already cushions Cast.
+const fn prebuffer_after_timeout(available: usize, target: usize, floor: usize) -> PrebufferTimeoutOutcome {
+  if available >= target {
+    PrebufferTimeoutOutcome::StartFull
+  } else if available >= floor {
+    PrebufferTimeoutOutcome::StartPartial
+  } else {
+    PrebufferTimeoutOutcome::Fail
+  }
+}
+
 /// Poll until a full prebuffer is available, or the ring is superseded.
 ///
-/// Returns `Ok(true)` only when [`PREBUFFER_FRAMES`] complete frames are ready.
-/// Returns `Ok(false)` if the session restarted (stale ring). Errors on timeout.
+/// Returns `Ok(true)` when [`PREBUFFER_FRAMES`] is ready during the poll, or after the 8 s
+/// budget when at least [`PREBUFFER_FLOOR_FRAMES`] are available (partial start).
+/// Returns `Ok(false)` if the session restarted (stale ring). Errors below the floor on timeout.
 async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn RingLookup) -> Result<bool> {
   for _ in 0..PREBUFFER_POLLS {
     let still_current = rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, ring));
@@ -2020,12 +2050,22 @@ async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn Ri
   }
 
   let available = ring.available_frames();
-  if available >= PREBUFFER_FRAMES {
-    return Ok(true);
+  match prebuffer_after_timeout(available, PREBUFFER_FRAMES, PREBUFFER_FLOOR_FRAMES) {
+    PrebufferTimeoutOutcome::StartFull => Ok(true),
+    PrebufferTimeoutOutcome::StartPartial => {
+      tracing::info!(
+        %device_id,
+        available,
+        floor = PREBUFFER_FLOOR_FRAMES,
+        preferred = PREBUFFER_FRAMES,
+        "prebuffer timeout: starting with partial prebuffer above floor"
+      );
+      Ok(true)
+    },
+    PrebufferTimeoutOutcome::Fail => Err(Error::Bridge(format!(
+      "prebuffer timeout after 8s: {available} frames available, need at least {PREBUFFER_FLOOR_FRAMES} (preferred {PREBUFFER_FRAMES})"
+    ))),
   }
-  Err(Error::Bridge(format!(
-    "prebuffer timeout after 8s: {available} frames available, need {PREBUFFER_FRAMES}"
-  )))
 }
 
 /// Cast LOAD helper (shared by initial start, rollover, flush, stall, resume).
@@ -3279,6 +3319,39 @@ mod tests {
     assert!(!bridge.has_session("missing-dev"), "failed start path must clear Starting");
   }
 
+  #[test]
+  fn prebuffer_after_timeout_decision() {
+    let target = PREBUFFER_FRAMES;
+    let floor = PREBUFFER_FLOOR_FRAMES;
+    assert!(floor < target, "floor must be below preferred target");
+
+    assert_eq!(prebuffer_after_timeout(0, target, floor), PrebufferTimeoutOutcome::Fail);
+    assert_eq!(
+      prebuffer_after_timeout(floor.saturating_sub(1), target, floor),
+      PrebufferTimeoutOutcome::Fail
+    );
+    assert_eq!(
+      prebuffer_after_timeout(floor, target, floor),
+      PrebufferTimeoutOutcome::StartPartial
+    );
+    assert_eq!(
+      prebuffer_after_timeout(floor + 1, target, floor),
+      PrebufferTimeoutOutcome::StartPartial
+    );
+    assert_eq!(
+      prebuffer_after_timeout(target.saturating_sub(1), target, floor),
+      PrebufferTimeoutOutcome::StartPartial
+    );
+    assert_eq!(
+      prebuffer_after_timeout(target, target, floor),
+      PrebufferTimeoutOutcome::StartFull
+    );
+    assert_eq!(
+      prebuffer_after_timeout(target + 1, target, floor),
+      PrebufferTimeoutOutcome::StartFull
+    );
+  }
+
   #[tokio::test(start_paused = true)]
   async fn session_start_prebuffer_timeout_clears_starting() {
     let registry = Arc::new(DeviceRegistry::new());
@@ -3294,14 +3367,23 @@ mod tests {
       pending_leave_since: None,
     });
     let bridge = Arc::new(Bridge::new(registry, Arc::new(CastPool::new(None))));
-    // Current ring but empty → prebuffer polls until timeout (virtual time advances).
+    // Current ring but empty (below floor) → prebuffer polls until timeout (virtual time advances).
     let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 2));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
     let err = bridge
       .handle_session_start("dev-prebuf", 48_000, ring, rings)
       .await
       .expect_err("empty ring must prebuffer-timeout");
-    assert!(err.to_string().contains("prebuffer timeout"), "unexpected error: {err}");
+    let msg = err.to_string();
+    assert!(msg.contains("prebuffer timeout"), "unexpected error: {msg}");
+    assert!(
+      msg.contains(&PREBUFFER_FLOOR_FRAMES.to_string()),
+      "timeout error should mention floor: {msg}"
+    );
+    assert!(
+      msg.contains(&PREBUFFER_FRAMES.to_string()),
+      "timeout error should mention preferred target: {msg}"
+    );
     assert!(!bridge.has_session("dev-prebuf"), "prebuffer timeout must clear Starting");
   }
 
