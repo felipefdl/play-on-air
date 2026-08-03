@@ -32,5 +32,7 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 14. Realtime type 96: RTP seq reorder window (drop dups, silence for aged gaps; ALAC in order only).
 15. RTSP `process_connection` read timeout (45s) so half-open iOS sockets release the connection semaphore; accept loop prunes finished `conn_aborts`.
 16. Configurable `Audio-Latency` RECORD header (`RaopServerBuilder::audio_latency_samples`, default 96000 = 2s@48k).
+17. Event channel: 1 MB ciphertext cap, disconnect on decrypt error, exit when command sender closes.
+18. PTP sink abort handles stored and aborted in `RaopServer::stop` (avoids EADDRINUSE on restart).
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

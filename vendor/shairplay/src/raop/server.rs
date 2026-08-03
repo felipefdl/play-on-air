@@ -305,6 +305,8 @@ impl RaopServerBuilder {
             hwaddr,
             #[cfg(feature = "ap2")]
             mode: self.mode,
+            #[cfg(feature = "ap2")]
+            ptp_aborts: Vec::new(),
         })
     }
 }
@@ -331,6 +333,9 @@ pub struct RaopServer {
     hwaddr: Vec<u8>,
     #[cfg(feature = "ap2")]
     mode: AirPlayMode,
+    /// PTP drain tasks on UDP 319/320 — aborted in [`Self::stop`] so ports free.
+    #[cfg(feature = "ap2")]
+    ptp_aborts: Vec<tokio::task::AbortHandle>,
 }
 
 impl RaopServer {
@@ -366,7 +371,11 @@ impl RaopServer {
         // stall the buffered-audio start. No-op if the ports can't be bound.
         #[cfg(feature = "ap2")]
         if self.mode == AirPlayMode::AirPlay2 {
-            crate::net::ptp::spawn_ptp_sink().await;
+            // Drop any prior sink first so restart does not fight ghost sockets.
+            for h in self.ptp_aborts.drain(..) {
+                h.abort();
+            }
+            self.ptp_aborts = crate::net::ptp::spawn_ptp_sink().await;
         }
 
         if std::env::var("CI").is_err() {
@@ -395,6 +404,14 @@ impl RaopServer {
     pub async fn stop(&mut self) {
         #[cfg(feature = "ap2")]
         self.shared.hard_stop_sessions();
+        #[cfg(feature = "ap2")]
+        {
+            for h in self.ptp_aborts.drain(..) {
+                h.abort();
+            }
+            // Let aborted UDP tasks drop sockets before a following start rebinds.
+            tokio::task::yield_now().await;
+        }
         if let Some(mut mdns) = self.mdns.take() {
             mdns.unregister_raop();
             mdns.unregister_airplay();

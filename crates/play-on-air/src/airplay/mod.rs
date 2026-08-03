@@ -379,6 +379,8 @@ impl AirPlayReceiver {
 
 /// How long a speaker stays withdrawn after a hard kick before re-advertise.
 const KICK_WITHDRAW_HOLD: Duration = Duration::from_millis(1_500);
+/// Cap on hard-stop wait during [`AirPlayManager::remove`] so re-advertise is not blocked forever.
+const REMOVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Manages the set of live AirPlay receivers keyed by Cast device id.
 #[derive(Debug, Default)]
@@ -426,20 +428,38 @@ impl AirPlayManager {
   }
 
   /// Stop and drop the receiver for `device_id` (best-effort hard stop when in a runtime).
+  ///
+  /// When a tokio multi-thread runtime is current, hard-stop is **awaited** (with
+  /// [`REMOVE_SHUTDOWN_TIMEOUT`]) so a following [`Self::ensure`] does not race the
+  /// RAOP port. Detached spawn used to leave the old accept loop alive long enough
+  /// for re-bind / iOS session races.
   pub fn remove(&self, device_id: &str) {
     let removed = {
       let mut guard = self.receivers.lock();
       guard.remove(device_id)
     };
     if let Some(mut rx) = removed {
-      tracing::info!(device_id = %rx.device_id, name = %rx.name, "AirPlay receiver withdrawn");
-      // Prefer async hard stop when a tokio runtime is available.
+      let withdrawn_id = rx.device_id.clone();
+      let name = rx.name.clone();
+      let port = rx.port;
+      tracing::info!(device_id = %withdrawn_id, %name, "AirPlay receiver withdrawn");
       if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        drop(handle.spawn(async move {
-          rx.shutdown_hard().await;
-        }));
+        // Callers include async maintain/ensure; block_in_place is safe on the
+        // multi-thread runtime used by `#[tokio::main]`.
+        tokio::task::block_in_place(|| {
+          handle.block_on(async {
+            if tokio::time::timeout(REMOVE_SHUTDOWN_TIMEOUT, rx.shutdown_hard()).await.is_err() {
+              tracing::warn!(
+                device_id = %withdrawn_id,
+                port,
+                "AirPlay hard-stop timed out during remove; force-closing port"
+              );
+              crate::net::force_close_tcp_on_local_port(port);
+            }
+          });
+        });
       } else {
-        crate::net::force_close_tcp_on_local_port(rx.port);
+        crate::net::force_close_tcp_on_local_port(port);
         drop(rx);
       }
     }

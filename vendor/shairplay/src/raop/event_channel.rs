@@ -11,6 +11,10 @@ use tracing::{debug, warn};
 use crate::crypto::chacha_transport::EncryptedChannel;
 use crate::error::NetworkError;
 
+/// Cap on ciphertext accumulated before a full AEAD frame can be decrypted.
+/// Prevents a stuck/malicious peer from growing `encrypted_buf` without bound.
+const MAX_ENCRYPTED_BUF: usize = 1024 * 1024;
+
 /// Handle for sending commands through the event channel.
 #[derive(Clone)]
 pub(crate) struct EventSender {
@@ -69,6 +73,13 @@ impl EventChannel {
                         Ok(0) => { debug!("Event channel closed by client"); break; }
                         Ok(n) => {
                             encrypted_buf.extend_from_slice(&buf[..n]);
+                            if encrypted_buf.len() > MAX_ENCRYPTED_BUF {
+                                warn!(
+                                    len = encrypted_buf.len(),
+                                    "Event channel encrypted buffer exceeded 1 MB; disconnecting"
+                                );
+                                break;
+                            }
                             debug!(n, "Event channel data received");
                             match channel.decrypt_ctx.decrypt(&encrypted_buf) {
                                 Ok((plain, consumed)) => {
@@ -77,13 +88,21 @@ impl EventChannel {
                                         debug!(len = plain.len(), "Event channel message received");
                                     }
                                 }
-                                Err(e) => { warn!("Event channel decrypt error: {e}"); }
+                                Err(e) => {
+                                    // Do not keep growing on permanent decrypt failure.
+                                    warn!("Event channel decrypt error: {e}; disconnecting");
+                                    break;
+                                }
                             }
                         }
                         Err(e) => { warn!("Event channel read error: {e}"); break; }
                     }
                 }
-                Some(data) = cmd_rx.recv() => {
+                maybe_cmd = cmd_rx.recv() => {
+                    let Some(data) = maybe_cmd else {
+                        debug!("Event channel command sender closed");
+                        break;
+                    };
                     debug!(len = data.len(), "Sending on event channel");
                     let encrypted = match channel.encrypt_ctx.encrypt(&data) {
                         Ok(e) => e,

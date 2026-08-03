@@ -148,19 +148,21 @@ pub fn parse_announce(buf: &[u8]) -> Option<u64> {
 /// failure it logs one line and returns, leaving normal operation untouched.
 /// IPv6-unspecified bind (AirPlay timing traffic is IPv6). Set `SHAIRPLAY_NO_PTP`
 /// to skip the bind (for A/B measuring the effect).
-pub(crate) async fn spawn_ptp_sink() {
+/// Bind UDP 319/320 and drain PTP. Returns abort handles for the recv tasks so
+/// [`crate::raop::server::RaopServer::stop`] can free the ports (avoids EADDRINUSE
+/// against a ghost sink after restart).
+pub(crate) async fn spawn_ptp_sink() -> Vec<tokio::task::AbortHandle> {
     if std::env::var("SHAIRPLAY_NO_PTP").is_ok() {
         tracing::info!("PTP sink disabled via SHAIRPLAY_NO_PTP — expect slow AP2 connect");
-        return;
+        return Vec::new();
     }
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut bound = 0u8;
+    let mut handles = Vec::new();
     for port in [319u16, 320u16] {
         match tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).await {
             Ok(sock) => {
-                bound += 1;
                 let seen = seen.clone();
-                tokio::spawn(async move {
+                let join = tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     loop {
                         match sock.recv_from(&mut buf).await {
@@ -172,6 +174,7 @@ pub(crate) async fn spawn_ptp_sink() {
                         }
                     }
                 });
+                handles.push(join.abort_handle());
             }
             Err(e) => tracing::warn!(
                 port,
@@ -180,12 +183,13 @@ pub(crate) async fn spawn_ptp_sink() {
             ),
         }
     }
-    if bound > 0 {
+    if !handles.is_empty() {
         tracing::info!(
-            ports = bound,
+            ports = handles.len(),
             "PTP sink active on 319/320 — accepting sender clock (keeps AP2 connect fast)"
         );
     }
+    handles
 }
 
 /// Decode one inbound PTP datagram at `debug` (message type from the low nibble
