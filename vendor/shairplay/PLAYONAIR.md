@@ -29,5 +29,6 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 11. Delivery caps due AAC packets per tick (`MAX_FRAMES_PER_TICK`) so catch-up cannot flood the host ring.
 12. Playout RTP math uses `source_sample_rate`; FLUSHBUFFERED range compare is wrap-safe; map capped ~30s.
 13. Playout mutex/condvar locks use `unwrap_or_else(PoisonError::into_inner)` (poison-proof).
+14. Realtime type 96: RTP seq reorder window (drop dups, silence for aged gaps; ALAC in order only).
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.
