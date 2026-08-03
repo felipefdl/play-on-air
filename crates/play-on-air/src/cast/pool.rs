@@ -277,6 +277,11 @@ enum CastWorkerCmd {
   Play { reply: SyncSender<Result<()>> },
   /// Best-effort stop; always replies after attempt (or immediately if no session).
   StopBestEffort { reply: SyncSender<()> },
+  /// Bridge-initiated session end: clear ownership tracking without Cast STOP.
+  ///
+  /// Lets probes stand down immediately so a missing media session is not declared
+  /// as "another app took the receiver" after our own teardown.
+  SessionEnded,
   /// Exit the worker loop and drop the Cast device.
   Shutdown,
 }
@@ -294,6 +299,8 @@ struct CastWorkerHandle {
   exiting: bool,
   /// Shared with the worker thread: last known Cast control-plane reachability.
   reachable: Arc<AtomicBool>,
+  /// Bridge-initiated end: probes stand down even before the worker drains cmds.
+  ownership_stand_down: Arc<AtomicBool>,
 }
 
 /// Shared pool of warm Cast control-plane workers (`Send + Sync` via `Arc`).
@@ -385,6 +392,8 @@ impl CastPool {
     let relay_slot_worker = Arc::clone(&relay_slot);
     let reachable = Arc::new(AtomicBool::new(false));
     let reachable_worker = Arc::clone(&reachable);
+    let ownership_stand_down = Arc::new(AtomicBool::new(false));
+    let ownership_stand_down_worker = Arc::clone(&ownership_stand_down);
     let thread_name = format!("cast-warm-{}", short_id(&device_id));
     let join = std::thread::Builder::new()
       .name(thread_name)
@@ -399,6 +408,7 @@ impl CastPool {
           media_recovered,
           relay_slot_worker,
           reachable_worker,
+          ownership_stand_down_worker,
         );
       })
       .ok();
@@ -420,6 +430,7 @@ impl CastPool {
         relay_slot,
         exiting: false,
         reachable,
+        ownership_stand_down,
       },
     ));
     drop(guard);
@@ -602,6 +613,30 @@ impl CastPool {
     }
   }
 
+  /// Mark a bridge-initiated session end so ownership probes stand down.
+  ///
+  /// Fire-and-forget: sets a cross-thread stand-down flag immediately, then queues a
+  /// worker command that clears the tracked active load without sending Cast STOP.
+  /// Call this on full session teardown (terminal stall, session end) **before** or
+  /// with [`Self::stop_best_effort`] so a missing media session is not declared as
+  /// "another app took the receiver".
+  ///
+  /// Do **not** call on replace-path teardowns: a new LOAD may already own (or is
+  /// about to own) the active session.
+  pub fn session_ended(&self, device_id: &str) {
+    let guard = self.workers.lock();
+    let Some(handle) = guard.get(device_id) else {
+      return;
+    };
+    // Instant stand-down: probe must not declare loss while SessionEnded is still queued.
+    handle.ownership_stand_down.store(true, Ordering::Release);
+    let tx = handle.cmd_tx.clone();
+    drop(guard);
+    if tx.send(CastWorkerCmd::SessionEnded).is_err() {
+      tracing::debug!(%device_id, "session_ended: worker gone");
+    }
+  }
+
   fn cmd_tx(&self, device_id: &str) -> Result<mpsc::Sender<CastWorkerCmd>> {
     let guard = self.workers.lock();
     guard
@@ -649,6 +684,8 @@ struct WorkerState {
   reachable: bool,
   /// Shared with the pool handle for cheap cross-thread reachability probes.
   reachable_flag: Arc<AtomicBool>,
+  /// Bridge-initiated end: stand ownership probes down before STOP drains.
+  ownership_stand_down: Arc<AtomicBool>,
   /// Earliest time to try another reconnect.
   next_reconnect_at: Instant,
   /// Last parse-error string warned (once per distinct message).
@@ -679,6 +716,7 @@ fn worker_main(
   media_recovered: Option<UnboundedSender<String>>,
   relay_slot: SharedRelaySlot,
   reachable_flag: Arc<AtomicBool>,
+  ownership_stand_down: Arc<AtomicBool>,
 ) {
   let now = Instant::now();
   let mut state = WorkerState {
@@ -702,6 +740,7 @@ fn worker_main(
     unreachable_since: None,
     reachable: false,
     reachable_flag,
+    ownership_stand_down,
     next_reconnect_at: now,
     last_parse_warn: None,
     logged_source_ip: false,
@@ -814,7 +853,17 @@ fn worker_main(
             "warm Cast STOP best-effort failed"
           );
         }
+        // STOP may fail after take; ensure ownership state is fully cleared either way.
+        state.clear_active_session();
         let _send = reply.send(());
+      },
+      CastWorkerCmd::SessionEnded => {
+        state.clear_active_session();
+        state.ownership_stand_down.store(true, Ordering::Release);
+        tracing::debug!(
+          device_id = %state.device_id,
+          "Cast session ended by bridge; ownership probe stand-down"
+        );
       },
     }
   }
@@ -907,6 +956,8 @@ impl WorkerState {
     self.ownership_loss_streak = 0;
     self.buffering_streak = 0;
     self.reload_attempted = false;
+    // New LOAD re-enables ownership probes (bridge end flag must not stick).
+    self.ownership_stand_down.store(false, Ordering::Release);
   }
 
   /// Run `op` under a hard deadline: if still running after [`WORKER_OP_DEADLINE`],
@@ -1205,15 +1256,21 @@ impl WorkerState {
 
   /// Confirm we still own Cast media while a warm LOAD session is active.
   fn check_ownership(&mut self) {
-    let (transport_id, media_session_id, since) = match (self.active.as_ref(), self.active_since) {
-      (Some(session), Some(since)) => (session.transport_id.clone(), session.media_session_id, since),
-      (None, _) => {
-        self.ownership_loss_streak = 0;
-        self.buffering_streak = 0;
-        return;
-      },
-      (Some(_), None) => return,
+    // Bridge-initiated end (`session_ended`) or no tracked load: stand down so missing
+    // media is not declared as "another app took the receiver".
+    if ownership_probe_stands_down(self.active.is_none(), self.ownership_stand_down.load(Ordering::Acquire)) {
+      self.ownership_loss_streak = 0;
+      self.buffering_streak = 0;
+      return;
+    }
+    let Some(session) = self.active.as_ref() else {
+      return;
     };
+    let Some(since) = self.active_since else {
+      return;
+    };
+    let transport_id = session.transport_id.clone();
+    let media_session_id = session.media_session_id;
     if since.elapsed() < OWNERSHIP_GRACE {
       return;
     }
@@ -1632,12 +1689,13 @@ impl WorkerState {
   }
 
   fn handle_stop(&mut self) -> Result<()> {
-    let Some(session) = self.active.take() else {
+    // Capture session for STOP, then fully clear ownership (including reload_attempted)
+    // so probes stand down even if the Cast STOP I/O hangs under the hard deadline.
+    let stopped = self.active.take();
+    self.clear_active_session();
+    let Some(session) = stopped else {
       return Ok(());
     };
-    self.active_since = None;
-    self.ownership_loss_streak = 0;
-    self.buffering_streak = 0;
     let Some(device) = self.device.as_ref() else {
       return Ok(());
     };
@@ -1906,6 +1964,16 @@ pub(crate) fn apply_hard_deadline_device_clear<T>(device: &mut Option<T>) -> boo
   }
 }
 
+/// Whether Cast ownership probes must stand down.
+///
+/// Returns true when there is no tracked active load, or when the bridge marked the
+/// session ended (`session_ended` flag) so a missing media session is not treated as
+/// a steal by another app.
+#[must_use]
+pub(crate) const fn ownership_probe_stands_down(active_is_none: bool, bridge_ended: bool) -> bool {
+  active_is_none || bridge_ended
+}
+
 /// Whether `remove` may drop the worker map entry after a join attempt.
 ///
 /// On timeout the entry stays as an exiting tombstone until a reaper joins.
@@ -2096,6 +2164,7 @@ mod tests {
           relay_slot: Arc::new(StdMutex::new(None)),
           exiting: true,
           reachable: Arc::new(AtomicBool::new(true)),
+          ownership_stand_down: Arc::new(AtomicBool::new(false)),
         },
       ));
     }
@@ -2234,6 +2303,7 @@ mod tests {
           relay_slot: Arc::new(StdMutex::new(None)),
           exiting: true,
           reachable: Arc::new(AtomicBool::new(false)),
+          ownership_stand_down: Arc::new(AtomicBool::new(false)),
         },
       ));
     }
@@ -2335,6 +2405,68 @@ mod tests {
   fn stop_best_effort_without_worker_is_noop() {
     let pool = CastPool::new(None);
     pool.stop_best_effort("no-such", Duration::from_millis(100));
+  }
+
+  #[test]
+  fn session_ended_without_worker_is_noop() {
+    let pool = CastPool::new(None);
+    pool.session_ended("no-such");
+  }
+
+  #[test]
+  fn ownership_probe_stands_down_without_active_or_after_bridge_end() {
+    assert!(ownership_probe_stands_down(true, false), "no tracked session ⇒ stand down");
+    assert!(
+      ownership_probe_stands_down(false, true),
+      "bridge session_ended flag ⇒ stand down even if active still set"
+    );
+    assert!(ownership_probe_stands_down(true, true), "both clear and flag ⇒ stand down");
+    assert!(
+      !ownership_probe_stands_down(false, false),
+      "active session without bridge end ⇒ probes still run (genuine steal path)"
+    );
+  }
+
+  /// Sequence: bridge ends session → stand-down gate → missing media is not a steal.
+  ///
+  /// While still tracking an active load, absent media is `LostSignal`. After
+  /// `session_ended` / clear, the probe gate stands down so `ownership_action` is
+  /// never consulted and no `ownership_lost` kick is emitted.
+  #[test]
+  fn bridge_session_end_stands_down_before_missing_media_looks_stolen() {
+    let mut stolen = base_inputs();
+    stolen.media_session_present = Some(false);
+    stolen.transport_listed = false;
+    assert_eq!(
+      ownership_action(stolen),
+      OwnershipAction::LostSignal,
+      "while still tracking active, missing media must look like a steal"
+    );
+
+    // After session_ended: active cleared and/or bridge_ended flag set.
+    assert!(
+      ownership_probe_stands_down(/* active_is_none */ true, /* bridge_ended */ false),
+      "clear_active_session path stands down"
+    );
+    assert!(
+      ownership_probe_stands_down(/* active_is_none */ false, /* bridge_ended */ true),
+      "instant stand-down flag path (cmd still queued) stands down"
+    );
+  }
+
+  #[test]
+  fn session_ended_on_live_worker_does_not_emit_ownership_lost() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let pool = CastPool::new(Some(tx));
+    let device = sample_device("session-ended-no-steal");
+    pool.ensure(&device);
+    // Bridge-initiated end while no media was ever loaded: must not kick.
+    pool.session_ended(&device.id);
+    // Allow worker to drain SessionEnded.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(rx.try_recv().is_err(), "session_ended must not emit ownership_lost");
+    pool.shutdown();
+    wait_until_worker_gone(&pool, &device.id);
   }
 
   #[test]

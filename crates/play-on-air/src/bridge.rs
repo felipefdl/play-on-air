@@ -29,7 +29,12 @@ use crate::registry::DeviceRegistry;
 /// Prebuffer feeds the first real-PCM HTTP chunks after silence preroll; the media
 /// server's silence preroll builds the Cast-side cushion; `LIVE_LEAD` maintains it.
 const PREBUFFER_FRAMES: usize = 24_000;
-/// Max prebuffer poll iterations (160 × 50 ms = 8 s). Fail if still incomplete.
+/// Minimum frames after the 8 s poll budget before we still start Cast LOAD (~250 ms at 48 kHz).
+///
+/// HTTP silence preroll provides the Cast-side cushion; the prebuffer only seeds the first
+/// real-PCM chunks. On timeout, start if `available >= PREBUFFER_FLOOR_FRAMES`; otherwise fail.
+const PREBUFFER_FLOOR_FRAMES: usize = 12_000;
+/// Max prebuffer poll iterations (160 × 50 ms = 8 s). On timeout, apply floor leniency.
 const PREBUFFER_POLLS: u32 = 160;
 const PREBUFFER_POLL: Duration = Duration::from_millis(50);
 /// How long the main `run` loop waits for per-device workers after the event channel closes.
@@ -44,8 +49,11 @@ const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(8);
 /// After a long pause the Cast media session may be gone or holding a stale buffer tail.
 /// Re-LOAD instead of PLAY when the pause exceeded this budget.
 const LONG_PAUSE_RELOAD: Duration = Duration::from_secs(30);
-/// Collapse multiple AirPlay flushes within this window to a single Cast re-LOAD.
-const FLUSH_RELOAD_DEBOUNCE: Duration = Duration::from_secs(1);
+/// iOS timeline re-anchors emit pause/flush that are not user intent.
+///
+/// Debounce Cast PAUSE and flush re-LOAD for this window: a `Resumed` (or PCM restart)
+/// cancels both and logs "re-anchor absorbed". A real pause/skip fires ~0.7 s late.
+const REANCHOR_DEBOUNCE: Duration = Duration::from_millis(700);
 /// Stall watchdog poll interval (cheap `MediaServer::progress` read).
 const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// `last_body_write` older than this while PCM is available ⇒ Cast stopped pulling.
@@ -53,7 +61,11 @@ const STALL_BODY_STALE: Duration = Duration::from_secs(5);
 /// Second stall within this window after a stall re-LOAD kicks the session.
 const STALL_REPEAT_WINDOW: Duration = Duration::from_secs(60);
 /// Early-session FLAC → WAV fallback window after a successful FLAC LOAD.
+///
+/// Decisive rejections inside this window (IDLE recovery, stall) fall back immediately.
 const FLAC_FALLBACK_WINDOW: Duration = Duration::from_secs(10);
+/// Two FLAC failure strikes within this window (any session age) → switch LIVE to WAV.
+const FLAC_STRIKE_PAIR_WINDOW: Duration = Duration::from_secs(90);
 
 /// How Cast volume is applied after a progressive media LOAD.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,18 +126,25 @@ enum TeardownCastPolicy {
 /// Ordered teardown steps for a full session end (media first, then Cast STOP).
 ///
 /// [`Bridge::handle_session_end`] always runs these in order: media HTTP first,
-/// then timed best-effort Cast STOP. Media must not wait on STOP success.
+/// clear pool ownership tracking, then timed best-effort Cast STOP. Media must
+/// not wait on STOP success. Ownership clear must not wait on STOP either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEndStep {
   /// Shut down the local media HTTP server (stop underrun immediately).
   MediaShutdown,
+  /// Clear Cast pool ownership tracking so probes stand down (no false steal).
+  ClearSessionOwnership,
   /// Best-effort Cast STOP with timeout (may fail or time out).
   CastStopBestEffort,
 }
 
-/// Shipped full session-end order (media first, then Cast STOP).
-pub const fn session_end_steps() -> [SessionEndStep; 2] {
-  [SessionEndStep::MediaShutdown, SessionEndStep::CastStopBestEffort]
+/// Shipped full session-end order (media → ownership clear → Cast STOP).
+pub const fn session_end_steps() -> [SessionEndStep; 3] {
+  [
+    SessionEndStep::MediaShutdown,
+    SessionEndStep::ClearSessionOwnership,
+    SessionEndStep::CastStopBestEffort,
+  ]
 }
 
 /// Whether replace teardown should skip Cast STOP (new LOAD replaces the app session).
@@ -218,6 +237,61 @@ const fn stall_action(
     return StallAction::TerminalEnd;
   }
   StallAction::Reload
+}
+
+/// Why a FLAC LIVE session counted a failure strike (unit-tested with [`flac_strike_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlacStrikeReason {
+  /// Pool re-LOAD recovery (IDLE ERROR path → internal re-LOAD).
+  MediaRecovered,
+  /// Bridge stall watchdog issued a generation-scoped re-LOAD.
+  StallWatchdogReload,
+}
+
+/// Outcome of recording a FLAC failure strike against optional previous strike state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlacStrikeDecision {
+  /// First strike, or second strike outside the pair window (keep latest as previous).
+  RecordOnly,
+  /// Second strike within the pair window → switch session to WAV and remember fallback.
+  FallbackToWav,
+}
+
+/// Pure FLAC strike accounting: timestamps + reasons in, decision + updated previous out.
+///
+/// Two strikes within `pair_window` → [`FlacStrikeDecision::FallbackToWav`]; otherwise
+/// [`FlacStrikeDecision::RecordOnly`] and the new strike becomes the previous for the next call.
+fn flac_strike_decision(
+  previous: Option<(Instant, FlacStrikeReason)>,
+  now: Instant,
+  reason: FlacStrikeReason,
+  pair_window: Duration,
+) -> (FlacStrikeDecision, Option<(Instant, FlacStrikeReason)>) {
+  let decision = match previous {
+    Some((prev_at, _)) if now.saturating_duration_since(prev_at) < pair_window => FlacStrikeDecision::FallbackToWav,
+    Some(_) | None => FlacStrikeDecision::RecordOnly,
+  };
+  (decision, Some((now, reason)))
+}
+
+/// Apply a FLAC strike on a Playing session; returns whether pair-window fallback is due.
+fn apply_flac_strike(session: &mut PlayingSession, now: Instant, reason: FlacStrikeReason) -> FlacStrikeDecision {
+  let previous = session.flac_strike;
+  let (decision, updated) = flac_strike_decision(previous, now, reason, FLAC_STRIKE_PAIR_WINDOW);
+  session.flac_strike = updated;
+  decision
+}
+
+/// Plan from [`Bridge::on_media_recovered`] locked section when FLAC LIVE needs WAV fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaRecoveredPlan {
+  /// Inside the early decisive window (one recovery is enough).
+  EarlyImmediate { generation: u64 },
+  /// Second strike within [`FLAC_STRIKE_PAIR_WINDOW`].
+  StrikeFallback {
+    generation: u64,
+    first_strike: Option<FlacStrikeReason>,
+  },
 }
 
 /// Clears `Starting{generation}` if still armed when dropped (panic safety for session start).
@@ -332,16 +406,28 @@ struct PlayingSession {
   channels: u16,
   sample_rate: u32,
   egress: EgressKind,
-  /// AirPlay reported paused; Cast PAUSE issued (session stays Playing).
+  /// AirPlay reported paused (local; stall watchdog honors this immediately).
+  ///
+  /// Cast PAUSE is deferred by [`REANCHOR_DEBOUNCE`] so iOS re-anchors can cancel.
   paused: bool,
   /// When the current pause began (for long-pause re-LOAD).
   paused_at: Option<Instant>,
-  /// Last flush-driven re-LOAD (debounce).
+  /// Last flush-driven re-LOAD (set when the debounce timer actually fires).
   last_flush_reload_at: Option<Instant>,
   /// Last stall-driven re-LOAD (repeat → kick).
   last_stall_reload_at: Option<Instant>,
   /// When this Playing generation became active (FLAC early-fallback window).
   started_at: Instant,
+  /// Last FLAC failure strike for this Playing generation (pair-window late fallback).
+  flac_strike: Option<(Instant, FlacStrikeReason)>,
+  /// Arm id for pause debounce; timer callbacks must match to fire Cast PAUSE.
+  pause_debounce_arm: u64,
+  /// Cancel the pending pause debounce timer (oneshot; drop/send aborts fire).
+  pause_debounce_cancel: Option<oneshot::Sender<()>>,
+  /// Arm id for flush debounce; timer callbacks must match to fire re-LOAD.
+  flush_debounce_arm: u64,
+  /// Cancel the pending flush debounce timer (oneshot; drop/send aborts fire).
+  flush_debounce_cancel: Option<oneshot::Sender<()>>,
   /// Drop / send to stop the `LiveWav` Content-Length rollover re-LOAD loop.
   rollover_cancel: Option<oneshot::Sender<()>>,
   rollover_task: Option<tokio::task::JoinHandle<()>>,
@@ -872,6 +958,11 @@ impl Bridge {
       last_flush_reload_at: None,
       last_stall_reload_at: None,
       started_at: Instant::now(),
+      flac_strike: None,
+      pause_debounce_arm: 0,
+      pause_debounce_cancel: None,
+      flush_debounce_arm: 0,
+      flush_debounce_cancel: None,
       rollover_cancel,
       rollover_task,
       watchdog_cancel: Some(watchdog_cancel),
@@ -1090,12 +1181,11 @@ impl Bridge {
 
   /// Pause Cast media (AirPlay rate=0). Keeps HTTP + session in `Playing { paused }`.
   ///
-  /// Local paused bookkeeping is synchronous; Cast PAUSE is detached so the device worker
-  /// never awaits Cast control I/O (same idea as [`Self::spawn_reload_playing_media`]).
-  /// Detached work re-checks generation + `session_alive` so a replaced generation cannot
-  /// PAUSE the new session.
+  /// Local paused bookkeeping is synchronous; Cast PAUSE is **debounced** by
+  /// [`REANCHOR_DEBOUNCE`] so iOS re-anchors that resume quickly never reach Cast.
+  /// Detached Cast PAUSE (after the timer) re-checks generation + `session_alive`.
   fn handle_pause(self: &Arc<Self>, device_id: &str) {
-    let cast_pause = {
+    let arm_plan = {
       let mut devices = self.devices.lock();
       let Some(slot) = devices.get_mut(device_id) else {
         return;
@@ -1105,49 +1195,44 @@ impl Bridge {
         tracing::debug!(%device_id, "dropping Paused; no Playing generation");
         return;
       };
-      if session.paused {
+      if matches!(reanchor_on_paused(session.paused), ReanchorPauseDecision::Ignore) {
         return;
       }
       session.paused = true;
       session.paused_at = Some(Instant::now());
-      let plan = (
-        *generation,
-        Arc::clone(&session.session_alive),
-        Arc::clone(&session.pool),
-        device_id.to_owned(),
-      );
+      let arm = session.pause_debounce_arm.wrapping_add(1);
+      session.pause_debounce_arm = arm;
+      if let Some(prev) = session.pause_debounce_cancel.take() {
+        let _cancelled = prev.send(());
+      }
+      let plan = (*generation, arm);
       drop(devices);
       plan
     };
-    let (generation, alive, pool, id) = cast_pause;
-    tracing::info!(%device_id, generation, "AirPlay paused; pausing Cast media");
-    let bridge = Arc::clone(self);
-    drop(tokio::spawn(async move {
-      let log_id = id.clone();
-      let pause_result = tokio::task::spawn_blocking(move || {
-        let live_gen = bridge.session_generation(&id);
-        if !detached_cast_control_allowed(alive.load(Ordering::Acquire), live_gen, generation) {
-          return Ok(());
-        }
-        pool.pause(&id)
-      })
-      .await;
-      match pause_result {
-        Ok(Ok(())) => {},
-        Ok(Err(err)) => {
-          tracing::debug!(device_id = %log_id, generation, error = %err, "Cast pause failed");
-        },
-        Err(err) => {
-          tracing::debug!(device_id = %log_id, generation, error = %err, "Cast pause task join failed");
-        },
-      }
-    }));
+    let (generation, arm) = arm_plan;
+    tracing::debug!(%device_id, generation, arm, "AirPlay paused; arming re-anchor pause debounce");
+    let cancel = spawn_pause_debounce(Arc::clone(self), device_id.to_owned(), generation, arm);
+    let mut devices = self.devices.lock();
+    let Some(slot) = devices.get_mut(device_id) else {
+      let _cancelled = cancel.send(());
+      return;
+    };
+    let DeviceState::Playing { generation: live_gen, session } = &mut slot.state else {
+      let _cancelled = cancel.send(());
+      return;
+    };
+    if *live_gen != generation || session.pause_debounce_arm != arm {
+      let _cancelled = cancel.send(());
+      return;
+    }
+    session.pause_debounce_cancel = Some(cancel);
+    drop(devices);
   }
 
   /// Resume Cast media after AirPlay playout restarts.
   ///
-  /// Local unpause is synchronous; Cast PLAY (and long-pause re-LOAD) are detached so the
-  /// device worker does not await Cast control I/O. Detached PLAY re-checks generation +
+  /// Cancels pending pause/flush re-anchor timers first. Cast PLAY only if Cast was
+  /// actually paused (debounce already fired). Detached PLAY re-checks generation +
   /// `session_alive` so a replaced generation cannot PLAY the new session.
   fn handle_resume(self: &Arc<Self>, device_id: &str) {
     let action = {
@@ -1160,23 +1245,57 @@ impl Bridge {
         tracing::debug!(%device_id, "dropping Resumed; no Playing generation");
         return;
       };
+      let pause_pending = session.pause_debounce_cancel.is_some();
+      let flush_pending = session.flush_debounce_cancel.is_some();
       let long_pause = session.paused_at.is_some_and(|at| at.elapsed() >= LONG_PAUSE_RELOAD);
-      session.paused = false;
-      session.paused_at = None;
-      let action = if long_pause {
-        ResumeAction::Reload { generation: *generation }
-      } else {
-        ResumeAction::Play {
-          generation: *generation,
-          pool: Arc::clone(&session.pool),
-          session_alive: Arc::clone(&session.session_alive),
+      let decision = reanchor_on_resumed(pause_pending, flush_pending, session.paused, long_pause);
+
+      if pause_pending {
+        session.pause_debounce_arm = session.pause_debounce_arm.wrapping_add(1);
+        if let Some(tx) = session.pause_debounce_cancel.take() {
+          let _cancelled = tx.send(());
         }
+      }
+      if flush_pending {
+        session.flush_debounce_arm = session.flush_debounce_arm.wrapping_add(1);
+        if let Some(tx) = session.flush_debounce_cancel.take() {
+          let _cancelled = tx.send(());
+        }
+      }
+
+      let action = match decision {
+        ReanchorResumeDecision::Absorb => {
+          session.paused = false;
+          session.paused_at = None;
+          tracing::debug!(%device_id, generation = *generation, "re-anchor absorbed");
+          ResumeAction::Absorb
+        },
+        ReanchorResumeDecision::Play => {
+          session.paused = false;
+          session.paused_at = None;
+          ResumeAction::Play {
+            generation: *generation,
+            pool: Arc::clone(&session.pool),
+            session_alive: Arc::clone(&session.session_alive),
+          }
+        },
+        ReanchorResumeDecision::Reload => {
+          session.paused = false;
+          session.paused_at = None;
+          ResumeAction::Reload { generation: *generation }
+        },
+        ReanchorResumeDecision::None => {
+          session.paused = false;
+          session.paused_at = None;
+          ResumeAction::Absorb
+        },
       };
       drop(devices);
       action
     };
 
     match action {
+      ResumeAction::Absorb => {},
       ResumeAction::Play { generation, pool, session_alive } => {
         tracing::info!(%device_id, generation, "AirPlay resumed; resuming Cast media");
         let bridge = Arc::clone(self);
@@ -1214,9 +1333,11 @@ impl Bridge {
     }
   }
 
-  /// Flush: ring already cleared by ingest; re-LOAD to discard Cast's ~2 s buffer.
+  /// Flush: ring already cleared by ingest. Re-LOAD is **debounced** by
+  /// [`REANCHOR_DEBOUNCE`]: a quick resume/re-anchor cancels it; only sustained silence
+  /// (or track-skip drain) issues a generation-scoped re-LOAD.
   fn handle_flush(self: &Arc<Self>, device_id: &str) {
-    let decision = {
+    let arm_plan = {
       let mut devices = self.devices.lock();
       let Some(slot) = devices.get_mut(device_id) else {
         return;
@@ -1226,24 +1347,107 @@ impl Bridge {
         tracing::debug!(%device_id, "dropping Flushed; no Playing generation");
         return;
       };
-      let decision = if session
-        .last_flush_reload_at
-        .is_some_and(|at| at.elapsed() < FLUSH_RELOAD_DEBOUNCE)
-      {
-        tracing::debug!(%device_id, generation = *generation, "debounce: skipping flush re-LOAD");
-        None
-      } else {
-        session.last_flush_reload_at = Some(Instant::now());
-        Some(*generation)
-      };
+      let arm = session.flush_debounce_arm.wrapping_add(1);
+      session.flush_debounce_arm = arm;
+      if let Some(prev) = session.flush_debounce_cancel.take() {
+        tracing::debug!(%device_id, generation = *generation, "re-arming flush re-anchor debounce");
+        let _cancelled = prev.send(());
+      }
+      let plan = (*generation, arm);
       drop(devices);
-      decision
+      plan
     };
-    let Some(generation) = decision else {
+    let (generation, arm) = arm_plan;
+    tracing::debug!(%device_id, generation, arm, "AirPlay flushed; arming re-anchor flush debounce");
+    let cancel = spawn_flush_debounce(Arc::clone(self), device_id.to_owned(), generation, arm);
+    let mut devices = self.devices.lock();
+    let Some(slot) = devices.get_mut(device_id) else {
+      let _cancelled = cancel.send(());
       return;
     };
-    tracing::info!(%device_id, generation, "AirPlay flushed; re-LOADing Cast media");
-    // Detached generation-scoped re-LOAD keeps flush off the worker FIFO.
+    let DeviceState::Playing { generation: live_gen, session } = &mut slot.state else {
+      let _cancelled = cancel.send(());
+      return;
+    };
+    if *live_gen != generation || session.flush_debounce_arm != arm {
+      let _cancelled = cancel.send(());
+      return;
+    }
+    session.flush_debounce_cancel = Some(cancel);
+    drop(devices);
+  }
+
+  /// Pause debounce timer fired: issue Cast PAUSE if still paused for this arm/generation.
+  fn fire_pause_debounce(self: &Arc<Self>, device_id: &str, generation: u64, arm: u64) {
+    let cast_pause = {
+      let mut devices = self.devices.lock();
+      let Some(slot) = devices.get_mut(device_id) else {
+        return;
+      };
+      let DeviceState::Playing { generation: live_gen, session } = &mut slot.state else {
+        return;
+      };
+      if *live_gen != generation || !session.session_alive.load(Ordering::Acquire) {
+        return;
+      }
+      if !reanchor_pause_timer_may_fire(session.paused, session.pause_debounce_arm == arm) {
+        return;
+      }
+      session.pause_debounce_cancel = None;
+      let plan = (
+        Arc::clone(&session.session_alive),
+        Arc::clone(&session.pool),
+        device_id.to_owned(),
+      );
+      drop(devices);
+      plan
+    };
+    let (alive, pool, id) = cast_pause;
+    tracing::info!(%device_id, generation, "AirPlay pause debounce elapsed; pausing Cast media");
+    let bridge = Arc::clone(self);
+    drop(tokio::spawn(async move {
+      let log_id = id.clone();
+      let pause_result = tokio::task::spawn_blocking(move || {
+        let live_gen = bridge.session_generation(&id);
+        if !detached_cast_control_allowed(alive.load(Ordering::Acquire), live_gen, generation) {
+          return Ok(());
+        }
+        pool.pause(&id)
+      })
+      .await;
+      match pause_result {
+        Ok(Ok(())) => {},
+        Ok(Err(err)) => {
+          tracing::debug!(device_id = %log_id, generation, error = %err, "Cast pause failed");
+        },
+        Err(err) => {
+          tracing::debug!(device_id = %log_id, generation, error = %err, "Cast pause task join failed");
+        },
+      }
+    }));
+  }
+
+  /// Flush debounce timer fired: re-LOAD if this arm is still current (no re-anchor).
+  fn fire_flush_debounce(self: &Arc<Self>, device_id: &str, generation: u64, arm: u64) {
+    {
+      let mut devices = self.devices.lock();
+      let Some(slot) = devices.get_mut(device_id) else {
+        return;
+      };
+      let DeviceState::Playing { generation: live_gen, session } = &mut slot.state else {
+        return;
+      };
+      if *live_gen != generation || !session.session_alive.load(Ordering::Acquire) {
+        return;
+      }
+      if !reanchor_flush_timer_may_fire(session.flush_debounce_arm == arm) {
+        return;
+      }
+      session.flush_debounce_cancel = None;
+      session.last_flush_reload_at = Some(Instant::now());
+      drop(devices);
+    }
+    tracing::info!(%device_id, generation, "AirPlay flush debounce elapsed; re-LOADing Cast media");
     self.spawn_reload_playing_media(device_id, generation, "flush");
   }
 
@@ -1258,28 +1462,8 @@ impl Bridge {
 
   /// Stall watchdog tick for a Playing generation (called from a detached task).
   async fn stall_watchdog_tick(self: &Arc<Self>, device_id: &str, generation: u64) {
-    let snapshot = {
-      let devices = self.devices.lock();
-      let Some(slot) = devices.get(device_id) else {
-        return;
-      };
-      let DeviceState::Playing { generation: live_gen, session } = &slot.state else {
-        return;
-      };
-      if *live_gen != generation {
-        return;
-      }
-      let (_bytes, last_write) = session.media.progress();
-      let snap = StallSnapshot {
-        paused: session.paused,
-        last_write,
-        ring_frames: session.ring.available_frames(),
-        started_at: session.started_at,
-        egress: session.egress,
-        last_stall: session.last_stall_reload_at,
-      };
-      drop(devices);
-      snap
+    let Some(snapshot) = self.stall_snapshot(device_id, generation) else {
+      return;
     };
 
     // Body age: last HTTP write, or time since session start if Cast never pulled.
@@ -1329,23 +1513,88 @@ impl Bridge {
           .await;
       },
       StallAction::Reload => {
-        {
-          let mut devices = self.devices.lock();
-          if let Some(DeviceState::Playing { generation: live_gen, session }) =
-            devices.get_mut(device_id).map(|s| &mut s.state)
-            && *live_gen == generation
-          {
-            session.last_stall_reload_at = Some(Instant::now());
-          }
-          drop(devices);
-        }
-
-        tracing::warn!(%device_id, generation, "media stall detected; re-LOADing Cast media");
-        let ok = self.reload_playing_media(device_id, generation, "stall").await;
-        if !ok {
-          self.terminal_stall_end(device_id, generation, "stall re-LOAD failed").await;
-        }
+        self.handle_stall_reload(device_id, generation).await;
       },
+    }
+  }
+
+  fn stall_snapshot(&self, device_id: &str, generation: u64) -> Option<StallSnapshot> {
+    let devices = self.devices.lock();
+    let slot = devices.get(device_id)?;
+    let DeviceState::Playing { generation: live_gen, session } = &slot.state else {
+      return None;
+    };
+    if *live_gen != generation {
+      return None;
+    }
+    let (_bytes, last_write) = session.media.progress();
+    let snap = StallSnapshot {
+      paused: session.paused,
+      last_write,
+      ring_frames: session.ring.available_frames(),
+      started_at: session.started_at,
+      egress: session.egress,
+      last_stall: session.last_stall_reload_at,
+    };
+    drop(devices);
+    Some(snap)
+  }
+
+  /// Stall Reload path: count FLAC strikes; two within the pair window → WAV, else re-LOAD.
+  async fn handle_stall_reload(self: &Arc<Self>, device_id: &str, generation: u64) {
+    let flac_strike_fallback = self.note_stall_reload_and_flac_strike(device_id, generation);
+
+    if let Some(first_strike) = flac_strike_fallback {
+      tracing::info!(
+        %device_id,
+        generation,
+        first_strike = ?first_strike,
+        second_strike = ?FlacStrikeReason::StallWatchdogReload,
+        "FLAC session hit two failure strikes within pair window; falling back to WAV BUFFERED"
+      );
+      self.remember_flac_fallback(device_id);
+      if self.switch_playing_to_wav(device_id, generation).await {
+        return;
+      }
+      tracing::debug!(
+        %device_id,
+        generation,
+        "FLAC strike fallback did not switch (session gone or already WAV); continuing stall re-LOAD"
+      );
+    }
+
+    tracing::warn!(%device_id, generation, "media stall detected; re-LOADing Cast media");
+    let ok = self.reload_playing_media(device_id, generation, "stall").await;
+    if !ok {
+      self.terminal_stall_end(device_id, generation, "stall re-LOAD failed").await;
+    }
+  }
+
+  /// Mark stall re-LOAD time; on FLAC LIVE record a strike.
+  ///
+  /// Returns the prior strike reason when pair-window fallback is due (always `Some` when
+  /// [`FlacStrikeDecision::FallbackToWav`] — the pure helper only falls back with a previous).
+  fn note_stall_reload_and_flac_strike(&self, device_id: &str, generation: u64) -> Option<FlacStrikeReason> {
+    let mut devices = self.devices.lock();
+    let Some(DeviceState::Playing { generation: live_gen, session }) = devices.get_mut(device_id).map(|s| &mut s.state)
+    else {
+      return None;
+    };
+    if *live_gen != generation {
+      return None;
+    }
+    let now = Instant::now();
+    session.last_stall_reload_at = Some(now);
+    if session.egress != EgressKind::FlacLive {
+      return None;
+    }
+    let previous = session.flac_strike;
+    let decision = apply_flac_strike(session, now, FlacStrikeReason::StallWatchdogReload);
+    drop(devices);
+    if decision == FlacStrikeDecision::FallbackToWav {
+      previous.map(|(_, r)| r)
+    } else {
+      None
     }
   }
 
@@ -1459,47 +1708,96 @@ impl Bridge {
     }
   }
 
-  /// Pool re-LOAD recovered media (IDLE/BUFFERING path). Early FLAC → WAV when in window.
+  /// Pool re-LOAD recovered media (IDLE ERROR recovery path).
+  ///
+  /// Early FLAC window → immediate WAV fallback. Outside the window, each recovery is a FLAC
+  /// strike; two strikes within [`FLAC_STRIKE_PAIR_WINDOW`] switch the LIVE session to WAV and
+  /// remember process-lifetime fallback for the device.
   pub async fn on_media_recovered(self: &Arc<Self>, device_id: &str) {
-    let early_flac_gen = {
-      let devices = self.devices.lock();
-      let Some(slot) = devices.get(device_id) else {
-        drop(devices);
-        tracing::info!(%device_id, "Cast pool re-LOAD recovered media (no bridge session)");
-        return;
-      };
-      let early = match &slot.state {
-        DeviceState::Playing { generation, session }
-          if session.egress == EgressKind::FlacLive && session.started_at.elapsed() < FLAC_FALLBACK_WINDOW =>
-        {
-          Some(*generation)
-        },
-        DeviceState::Idle | DeviceState::Starting { .. } | DeviceState::Playing { .. } => {
-          let generation = slot.live_gen();
-          tracing::info!(
-            %device_id,
-            session_generation = ?generation,
-            "Cast pool re-LOAD recovered media session"
-          );
-          None
-        },
-      };
-      drop(devices);
-      early
-    };
-    let Some(generation) = early_flac_gen else {
+    let Some(plan) = self.plan_media_recovered_flac(device_id) else {
       return;
     };
+    self.apply_media_recovered_plan(device_id, plan).await;
+  }
 
-    tracing::warn!(
-      %device_id,
-      generation,
-      "early FLAC media_recovered (IDLE recovery); falling back to WAV BUFFERED"
-    );
+  /// Decide whether a pool recovery should fall back FLAC→WAV (updates strike state under lock).
+  fn plan_media_recovered_flac(&self, device_id: &str) -> Option<MediaRecoveredPlan> {
+    let mut devices = self.devices.lock();
+    let Some(slot) = devices.get_mut(device_id) else {
+      drop(devices);
+      tracing::info!(%device_id, "Cast pool re-LOAD recovered media (no bridge session)");
+      return None;
+    };
+    let plan = match &mut slot.state {
+      DeviceState::Playing { generation: live_gen, session } if session.egress == EgressKind::FlacLive => {
+        let session_gen = *live_gen;
+        if session.started_at.elapsed() < FLAC_FALLBACK_WINDOW {
+          Some(MediaRecoveredPlan::EarlyImmediate { generation: session_gen })
+        } else {
+          let previous = session.flac_strike;
+          let decision = apply_flac_strike(session, Instant::now(), FlacStrikeReason::MediaRecovered);
+          match decision {
+            FlacStrikeDecision::RecordOnly => {
+              tracing::info!(
+                %device_id,
+                generation = session_gen,
+                strike = ?FlacStrikeReason::MediaRecovered,
+                "Cast pool re-LOAD recovered media; FLAC strike recorded"
+              );
+              None
+            },
+            FlacStrikeDecision::FallbackToWav => Some(MediaRecoveredPlan::StrikeFallback {
+              generation: session_gen,
+              first_strike: previous.map(|(_, r)| r),
+            }),
+          }
+        }
+      },
+      DeviceState::Idle | DeviceState::Starting { .. } | DeviceState::Playing { .. } => {
+        let live_generation = slot.live_gen();
+        tracing::info!(
+          %device_id,
+          session_generation = ?live_generation,
+          "Cast pool re-LOAD recovered media session"
+        );
+        None
+      },
+    };
+    drop(devices);
+    plan
+  }
+
+  async fn apply_media_recovered_plan(self: &Arc<Self>, device_id: &str, plan: MediaRecoveredPlan) {
+    let (generation, early) = match plan {
+      MediaRecoveredPlan::EarlyImmediate { generation } => {
+        tracing::warn!(
+          %device_id,
+          generation,
+          "early FLAC media_recovered (IDLE recovery); falling back to WAV BUFFERED"
+        );
+        (generation, true)
+      },
+      MediaRecoveredPlan::StrikeFallback { generation, first_strike } => {
+        tracing::info!(
+          %device_id,
+          generation,
+          first_strike = ?first_strike,
+          second_strike = ?FlacStrikeReason::MediaRecovered,
+          "FLAC session hit two failure strikes within pair window; falling back to WAV BUFFERED"
+        );
+        (generation, false)
+      },
+    };
     self.remember_flac_fallback(device_id);
     let switched = self.switch_playing_to_wav(device_id, generation).await;
     if !switched {
-      tracing::debug!(%device_id, generation, "early FLAC media_recovered fallback did not switch (session gone or already WAV)");
+      let kind = if early { "early" } else { "strike" };
+      tracing::debug!(
+        %device_id,
+        generation,
+        kind,
+        "FLAC media_recovered fallback did not switch (session gone or already WAV)"
+      );
     }
   }
 
@@ -1560,6 +1858,8 @@ struct StallSnapshot {
 }
 
 enum ResumeAction {
+  /// Pending re-anchor pause/flush cancelled; no Cast command.
+  Absorb,
   Play {
     generation: u64,
     pool: Arc<CastPool>,
@@ -1568,6 +1868,99 @@ enum ResumeAction {
   Reload {
     generation: u64,
   },
+}
+
+/// Pure decision for a `Paused` event (unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReanchorPauseDecision {
+  /// Already paused (pending or committed); ignore duplicate.
+  Ignore,
+  /// Arm (or re-arm) the pause debounce timer; set local `paused`.
+  ArmDebounce,
+}
+
+/// Pure decision for a `Resumed` event after inspecting pending debounce state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReanchorResumeDecision {
+  /// Cancel pending pause and/or flush; no Cast command.
+  Absorb,
+  /// Cast was paused; issue PLAY.
+  Play,
+  /// Cast was paused longer than [`LONG_PAUSE_RELOAD`]; re-LOAD.
+  Reload,
+  /// Nothing to do (not paused, no pending timers).
+  None,
+}
+
+const fn reanchor_on_paused(already_paused: bool) -> ReanchorPauseDecision {
+  if already_paused {
+    ReanchorPauseDecision::Ignore
+  } else {
+    ReanchorPauseDecision::ArmDebounce
+  }
+}
+
+#[expect(
+  clippy::fn_params_excessive_bools,
+  reason = "pure decision helper mirrors resume pending/paused flags for unit tests"
+)]
+const fn reanchor_on_resumed(
+  pause_pending: bool,
+  flush_pending: bool,
+  paused: bool,
+  long_pause: bool,
+) -> ReanchorResumeDecision {
+  // Pending pause means Cast was never paused — always absorb (no PLAY).
+  if pause_pending {
+    return ReanchorResumeDecision::Absorb;
+  }
+  // Cast PAUSE already issued (or long-lived paused without pending timer).
+  if paused {
+    if long_pause {
+      return ReanchorResumeDecision::Reload;
+    }
+    return ReanchorResumeDecision::Play;
+  }
+  if flush_pending {
+    return ReanchorResumeDecision::Absorb;
+  }
+  ReanchorResumeDecision::None
+}
+
+/// Whether a pause debounce timer arm may issue Cast PAUSE.
+const fn reanchor_pause_timer_may_fire(still_paused: bool, arm_matches: bool) -> bool {
+  still_paused && arm_matches
+}
+
+/// Whether a flush debounce timer arm may issue re-LOAD.
+const fn reanchor_flush_timer_may_fire(arm_matches: bool) -> bool {
+  arm_matches
+}
+
+fn spawn_pause_debounce(bridge: Arc<Bridge>, device_id: String, generation: u64, arm: u64) -> oneshot::Sender<()> {
+  let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+  drop(tokio::spawn(async move {
+    tokio::select! {
+      _ = &mut cancel_rx => {},
+      () = sleep(REANCHOR_DEBOUNCE) => {
+        bridge.fire_pause_debounce(&device_id, generation, arm);
+      }
+    }
+  }));
+  cancel_tx
+}
+
+fn spawn_flush_debounce(bridge: Arc<Bridge>, device_id: String, generation: u64, arm: u64) -> oneshot::Sender<()> {
+  let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+  drop(tokio::spawn(async move {
+    tokio::select! {
+      _ = &mut cancel_rx => {},
+      () = sleep(REANCHOR_DEBOUNCE) => {
+        bridge.fire_flush_debounce(&device_id, generation, arm);
+      }
+    }
+  }));
+  cancel_tx
 }
 
 const fn event_device_id(event: &AirPlaySessionEvent) -> &str {
@@ -1621,10 +2014,35 @@ async fn device_worker_loop(
   tracing::debug!(%device_id, "device session worker exited");
 }
 
+/// Outcome of the prebuffer poll budget when the preferred target was not met early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrebufferTimeoutOutcome {
+  /// Full preferred target is available — start Cast LOAD.
+  StartFull,
+  /// Below preferred target but at/above the floor — start with a partial prebuffer.
+  StartPartial,
+  /// Below the floor — fail session start.
+  Fail,
+}
+
+/// After the prebuffer poll budget, decide whether to start Cast LOAD.
+///
+/// Prefer `target` frames; accept `floor` (~250 ms) because HTTP preroll already cushions Cast.
+const fn prebuffer_after_timeout(available: usize, target: usize, floor: usize) -> PrebufferTimeoutOutcome {
+  if available >= target {
+    PrebufferTimeoutOutcome::StartFull
+  } else if available >= floor {
+    PrebufferTimeoutOutcome::StartPartial
+  } else {
+    PrebufferTimeoutOutcome::Fail
+  }
+}
+
 /// Poll until a full prebuffer is available, or the ring is superseded.
 ///
-/// Returns `Ok(true)` only when [`PREBUFFER_FRAMES`] complete frames are ready.
-/// Returns `Ok(false)` if the session restarted (stale ring). Errors on timeout.
+/// Returns `Ok(true)` when [`PREBUFFER_FRAMES`] is ready during the poll, or after the 8 s
+/// budget when at least [`PREBUFFER_FLOOR_FRAMES`] are available (partial start).
+/// Returns `Ok(false)` if the session restarted (stale ring). Errors below the floor on timeout.
 async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn RingLookup) -> Result<bool> {
   for _ in 0..PREBUFFER_POLLS {
     let still_current = rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, ring));
@@ -1639,12 +2057,22 @@ async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn Ri
   }
 
   let available = ring.available_frames();
-  if available >= PREBUFFER_FRAMES {
-    return Ok(true);
+  match prebuffer_after_timeout(available, PREBUFFER_FRAMES, PREBUFFER_FLOOR_FRAMES) {
+    PrebufferTimeoutOutcome::StartFull => Ok(true),
+    PrebufferTimeoutOutcome::StartPartial => {
+      tracing::info!(
+        %device_id,
+        available,
+        floor = PREBUFFER_FLOOR_FRAMES,
+        preferred = PREBUFFER_FRAMES,
+        "prebuffer timeout: starting with partial prebuffer above floor"
+      );
+      Ok(true)
+    },
+    PrebufferTimeoutOutcome::Fail => Err(Error::Bridge(format!(
+      "prebuffer timeout after 8s: {available} frames available, need at least {PREBUFFER_FLOOR_FRAMES} (preferred {PREBUFFER_FRAMES})"
+    ))),
   }
-  Err(Error::Bridge(format!(
-    "prebuffer timeout after 8s: {available} frames available, need {PREBUFFER_FRAMES}"
-  )))
 }
 
 /// Cast LOAD helper (shared by initial start, rollover, flush, stall, resume).
@@ -1836,8 +2264,21 @@ async fn teardown_playing(session: PlayingSession, policy: TeardownCastPolicy) {
   // (late_load_should_stop is false). Full end leaves late_stop_allowed true.
   if replace_skips_cast_stop(policy) {
     session.late_stop_allowed.store(false, Ordering::Release);
+  } else {
+    // Full end: stand ownership probes down immediately (before long joins / STOP I/O)
+    // so a terminal-stall media absence cannot be declared as a false steal.
+    // Do not clear on replace — a new LOAD may already own (or will own) active.
+    session.pool.session_ended(&device_id);
   }
   session.session_alive.store(false, Ordering::Release);
+
+  // Drop re-anchor debouncers so timers cannot fire Cast control for a dead generation.
+  if let Some(tx) = session.pause_debounce_cancel {
+    let _cancelled = tx.send(());
+  }
+  if let Some(tx) = session.flush_debounce_cancel {
+    let _cancelled = tx.send(());
+  }
 
   if let Some(tx) = session.watchdog_cancel {
     let _cancelled = tx.send(());
@@ -1900,8 +2341,12 @@ fn end_media_and_maybe_cast_stop(
   media.shutdown();
   if replace_skips_cast_stop(policy) {
     // New LOAD is about to replace the Cast app session; avoid HOL-blocking it.
+    // Do not session_ended here — that would clear the superseding LOAD's active.
     return;
   }
+  // Ownership was already stood down via `session_ended` at the start of full
+  // teardown. Issue Cast STOP best-effort (no-ops if SessionEnded already cleared
+  // active; still useful when only stop_best_effort is used from other paths).
   pool.stop_best_effort(device_id, Duration::from_secs(2));
 }
 
@@ -1993,6 +2438,11 @@ mod tests {
       last_flush_reload_at: None,
       last_stall_reload_at: None,
       started_at: Instant::now(),
+      flac_strike: None,
+      pause_debounce_arm: 0,
+      pause_debounce_cancel: None,
+      flush_debounce_arm: 0,
+      flush_debounce_cancel: None,
       rollover_cancel: None,
       rollover_task: None,
       watchdog_cancel: None,
@@ -2016,9 +2466,10 @@ mod tests {
   #[test]
   fn session_end_steps_media_before_cast_stop() {
     let steps = session_end_steps();
-    assert_eq!(steps.len(), 2);
+    assert_eq!(steps.len(), 3);
     assert_eq!(steps[0], SessionEndStep::MediaShutdown);
-    assert_eq!(steps[1], SessionEndStep::CastStopBestEffort);
+    assert_eq!(steps[1], SessionEndStep::ClearSessionOwnership);
+    assert_eq!(steps[2], SessionEndStep::CastStopBestEffort);
   }
 
   #[test]
@@ -2132,7 +2583,7 @@ mod tests {
     bridge.handle_session_end("dev-pause").await;
   }
 
-  /// `handle_pause` is sync and returns after local bookkeeping; Cast PAUSE is detached.
+  /// `handle_pause` is sync and returns after arming debounce; Cast PAUSE is delayed.
   #[tokio::test]
   async fn handle_pause_returns_without_awaiting_cast() {
     let registry = Arc::new(DeviceRegistry::new());
@@ -2158,7 +2609,11 @@ mod tests {
       let DeviceState::Playing { session, .. } = &devices.get("dev-pause-fast").expect("slot").state else {
         panic!("expected Playing");
       };
-      assert!(session.paused, "paused flag set before Cast PAUSE completes");
+      assert!(session.paused, "local paused set before Cast PAUSE");
+      assert!(
+        session.pause_debounce_cancel.is_some(),
+        "pause debounce armed; Cast PAUSE not issued yet"
+      );
       drop(devices);
     }
     bridge.handle_session_end("dev-pause-fast").await;
@@ -2655,17 +3110,166 @@ mod tests {
     );
 
     bridge.handle_flush("dev-flush");
-    // Immediate second flush is debounced (still Playing; no panic without worker).
+    // Immediate second flush re-arms the same debounce window (still no re-LOAD yet).
     bridge.handle_flush("dev-flush");
     {
       let devices = bridge.devices.lock();
       let DeviceState::Playing { session, .. } = &devices.get("dev-flush").expect("slot").state else {
         panic!("expected Playing");
       };
-      assert!(session.last_flush_reload_at.is_some());
+      assert!(
+        session.last_flush_reload_at.is_none(),
+        "flush re-LOAD only after silence past REANCHOR_DEBOUNCE"
+      );
+      assert!(session.flush_debounce_cancel.is_some(), "flush debounce armed");
+      assert_eq!(session.flush_debounce_arm, 2, "second flush re-arms");
       drop(devices);
     }
     bridge.handle_session_end("dev-flush").await;
+  }
+
+  #[test]
+  fn reanchor_decision_helpers() {
+    assert_eq!(reanchor_on_paused(false), ReanchorPauseDecision::ArmDebounce);
+    assert_eq!(reanchor_on_paused(true), ReanchorPauseDecision::Ignore);
+
+    assert_eq!(reanchor_on_resumed(true, false, true, false), ReanchorResumeDecision::Absorb);
+    assert_eq!(reanchor_on_resumed(true, true, true, false), ReanchorResumeDecision::Absorb);
+    assert_eq!(reanchor_on_resumed(false, true, false, false), ReanchorResumeDecision::Absorb);
+    assert_eq!(reanchor_on_resumed(false, false, true, false), ReanchorResumeDecision::Play);
+    assert_eq!(reanchor_on_resumed(false, false, true, true), ReanchorResumeDecision::Reload);
+    assert_eq!(reanchor_on_resumed(false, false, false, false), ReanchorResumeDecision::None);
+
+    assert!(reanchor_pause_timer_may_fire(true, true));
+    assert!(!reanchor_pause_timer_may_fire(false, true));
+    assert!(!reanchor_pause_timer_may_fire(true, false));
+    assert!(reanchor_flush_timer_may_fire(true));
+    assert!(!reanchor_flush_timer_may_fire(false));
+  }
+
+  /// Burst of Flushed + Resumed within the window produces zero Cast re-LOADs.
+  #[tokio::test]
+  async fn reanchor_flush_then_resume_within_window_skips_reload() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    insert_playing(
+      &bridge,
+      "dev-reanchor",
+      1,
+      test_playing_session(media, "dev-reanchor", pool, Arc::new(PcmRing::new(2, 64))),
+    );
+
+    // iOS re-anchor path: flush + pause then resume (PCM / rate) inside the window.
+    bridge.handle_flush("dev-reanchor");
+    bridge.handle_pause("dev-reanchor");
+    sleep(Duration::from_millis(50)).await;
+    bridge.handle_resume("dev-reanchor");
+
+    // Wait past the original arm window; cancelled arms must not fire.
+    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(100)).await;
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &devices.get("dev-reanchor").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert!(session.last_flush_reload_at.is_none(), "re-anchor must skip flush re-LOAD");
+      assert!(!session.paused, "resume cleared local pause");
+      assert!(session.pause_debounce_cancel.is_none());
+      assert!(session.flush_debounce_cancel.is_none());
+      assert!(
+        session.inflight_load.lock().is_none(),
+        "no Cast re-LOAD in flight after absorbed re-anchor"
+      );
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-reanchor").await;
+  }
+
+  /// Paused with no resume within the window produces exactly one Cast PAUSE path.
+  #[tokio::test]
+  async fn reanchor_pause_without_resume_issues_cast_pause() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    insert_playing(
+      &bridge,
+      "dev-pause-fire",
+      1,
+      test_playing_session(media, "dev-pause-fire", pool, Arc::new(PcmRing::new(2, 64))),
+    );
+
+    bridge.handle_pause("dev-pause-fire");
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &devices.get("dev-pause-fire").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert!(session.paused);
+      assert!(session.pause_debounce_cancel.is_some());
+      assert_eq!(session.pause_debounce_arm, 1);
+      drop(devices);
+    }
+
+    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(100)).await;
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &devices.get("dev-pause-fire").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert!(session.paused, "local pause remains after Cast PAUSE path");
+      assert!(
+        session.pause_debounce_cancel.is_none(),
+        "debounce consumed when timer fires Cast PAUSE"
+      );
+      assert_eq!(session.pause_debounce_arm, 1, "exactly one pause arm (not re-armed)");
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-pause-fire").await;
+  }
+
+  /// Real flush-then-silence produces one re-LOAD after the window.
+  #[tokio::test]
+  async fn reanchor_flush_then_silence_reloads() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    insert_playing(
+      &bridge,
+      "dev-flush-fire",
+      1,
+      test_playing_session(media, "dev-flush-fire", pool, Arc::new(PcmRing::new(2, 64))),
+    );
+
+    bridge.handle_flush("dev-flush-fire");
+    bridge.handle_flush("dev-flush-fire"); // coalesce arms
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &devices.get("dev-flush-fire").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert!(session.last_flush_reload_at.is_none());
+      assert_eq!(session.flush_debounce_arm, 2);
+      drop(devices);
+    }
+
+    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(150)).await;
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &devices.get("dev-flush-fire").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert!(
+        session.last_flush_reload_at.is_some(),
+        "silence past window must record one flush re-LOAD"
+      );
+      assert!(session.flush_debounce_cancel.is_none());
+      assert_eq!(session.flush_debounce_arm, 2, "coalesced to a single fire arm");
+      drop(devices);
+    }
+    // Allow detached re-LOAD task to observe missing Cast worker and finish.
+    sleep(Duration::from_millis(50)).await;
+    bridge.handle_session_end("dev-flush-fire").await;
   }
 
   #[test]
@@ -2732,6 +3336,39 @@ mod tests {
     assert!(!bridge.has_session("missing-dev"), "failed start path must clear Starting");
   }
 
+  #[test]
+  fn prebuffer_after_timeout_decision() {
+    let target = PREBUFFER_FRAMES;
+    let floor = PREBUFFER_FLOOR_FRAMES;
+    assert!(floor < target, "floor must be below preferred target");
+
+    assert_eq!(prebuffer_after_timeout(0, target, floor), PrebufferTimeoutOutcome::Fail);
+    assert_eq!(
+      prebuffer_after_timeout(floor.saturating_sub(1), target, floor),
+      PrebufferTimeoutOutcome::Fail
+    );
+    assert_eq!(
+      prebuffer_after_timeout(floor, target, floor),
+      PrebufferTimeoutOutcome::StartPartial
+    );
+    assert_eq!(
+      prebuffer_after_timeout(floor + 1, target, floor),
+      PrebufferTimeoutOutcome::StartPartial
+    );
+    assert_eq!(
+      prebuffer_after_timeout(target.saturating_sub(1), target, floor),
+      PrebufferTimeoutOutcome::StartPartial
+    );
+    assert_eq!(
+      prebuffer_after_timeout(target, target, floor),
+      PrebufferTimeoutOutcome::StartFull
+    );
+    assert_eq!(
+      prebuffer_after_timeout(target + 1, target, floor),
+      PrebufferTimeoutOutcome::StartFull
+    );
+  }
+
   #[tokio::test(start_paused = true)]
   async fn session_start_prebuffer_timeout_clears_starting() {
     let registry = Arc::new(DeviceRegistry::new());
@@ -2747,14 +3384,23 @@ mod tests {
       pending_leave_since: None,
     });
     let bridge = Arc::new(Bridge::new(registry, Arc::new(CastPool::new(None))));
-    // Current ring but empty → prebuffer polls until timeout (virtual time advances).
+    // Current ring but empty (below floor) → prebuffer polls until timeout (virtual time advances).
     let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 2));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
     let err = bridge
       .handle_session_start("dev-prebuf", 48_000, ring, rings)
       .await
       .expect_err("empty ring must prebuffer-timeout");
-    assert!(err.to_string().contains("prebuffer timeout"), "unexpected error: {err}");
+    let msg = err.to_string();
+    assert!(msg.contains("prebuffer timeout"), "unexpected error: {msg}");
+    assert!(
+      msg.contains(&PREBUFFER_FLOOR_FRAMES.to_string()),
+      "timeout error should mention floor: {msg}"
+    );
+    assert!(
+      msg.contains(&PREBUFFER_FRAMES.to_string()),
+      "timeout error should mention preferred target: {msg}"
+    );
     assert!(!bridge.has_session("dev-prebuf"), "prebuffer timeout must clear Starting");
   }
 
@@ -2786,7 +3432,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn on_media_recovered_outside_window_keeps_flac() {
+  async fn on_media_recovered_one_late_strike_keeps_flac() {
     let pool = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
@@ -2807,9 +3453,89 @@ mod tests {
         panic!("expected Playing");
       };
       assert_eq!(live.egress, EgressKind::FlacLive);
+      assert!(
+        live.flac_strike.is_some_and(|(_, r)| r == FlacStrikeReason::MediaRecovered),
+        "single late media_recovered must record a MediaRecovered strike"
+      );
       drop(devices);
     }
     bridge.handle_session_end("dev-late").await;
+  }
+
+  #[tokio::test]
+  async fn on_media_recovered_two_late_strikes_switch_to_wav() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, "dev-late2", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    playing.started_at = Instant::now()
+      .checked_sub(FLAC_FALLBACK_WINDOW + Duration::from_secs(5))
+      .unwrap_or_else(Instant::now);
+    insert_playing(&bridge, "dev-late2", 1, playing);
+
+    bridge.on_media_recovered("dev-late2").await;
+    bridge.on_media_recovered("dev-late2").await;
+
+    assert!(
+      bridge.flac_fallback.lock().contains("dev-late2"),
+      "two late media_recovered strikes must remember WAV fallback"
+    );
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session: live, .. } = &devices.get("dev-late2").expect("slot").state else {
+        panic!("expected Playing after two late recoveries");
+      };
+      assert_eq!(live.egress, EgressKind::WavBuffered);
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-late2").await;
+  }
+
+  #[tokio::test]
+  async fn late_media_recovered_then_stall_strike_switches_to_wav() {
+    let pool = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, "dev-mixed", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    playing.started_at = Instant::now()
+      .checked_sub(FLAC_FALLBACK_WINDOW + Duration::from_secs(5))
+      .unwrap_or_else(Instant::now);
+    // Seed a MediaRecovered strike as if the pool already recovered once.
+    playing.flac_strike = Some((Instant::now(), FlacStrikeReason::MediaRecovered));
+    insert_playing(&bridge, "dev-mixed", 1, playing);
+
+    // Second strike via stall-watchdog reason (same pure accounting as handle_stall_reload).
+    {
+      let mut devices = bridge.devices.lock();
+      let DeviceState::Playing { session, .. } = &mut devices.get_mut("dev-mixed").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      let previous = session.flac_strike;
+      let decision = apply_flac_strike(session, Instant::now(), FlacStrikeReason::StallWatchdogReload);
+      assert_eq!(decision, FlacStrikeDecision::FallbackToWav);
+      assert_eq!(
+        previous.map(|(_, r)| r),
+        Some(FlacStrikeReason::MediaRecovered),
+        "pair fallback must retain first strike reason for logging"
+      );
+      drop(devices);
+    }
+    bridge.remember_flac_fallback("dev-mixed");
+    // switch_playing_to_wav returns re-LOAD success; without a Cast worker that is false, but
+    // egress still flips under the lock (same as early media_recovered tests).
+    let _reload_ok = bridge.switch_playing_to_wav("dev-mixed", 1).await;
+    assert!(bridge.flac_fallback.lock().contains("dev-mixed"));
+    {
+      let devices = bridge.devices.lock();
+      let DeviceState::Playing { session: live, .. } = &devices.get("dev-mixed").expect("slot").state else {
+        panic!("expected Playing");
+      };
+      assert_eq!(live.egress, EgressKind::WavBuffered);
+      drop(devices);
+    }
+    bridge.handle_session_end("dev-mixed").await;
   }
 
   // --- B1: late STOP after replace ---
@@ -3095,6 +3821,53 @@ mod tests {
       bridge.devices.lock().get("dev-guard-disarm").map(|s| &s.state),
       Some(DeviceState::Starting { generation: 1 })
     ));
+  }
+
+  // --- FLAC strike accounting (pure) ---
+
+  #[test]
+  fn flac_strike_first_is_record_only() {
+    let t0 = Instant::now();
+    let (decision, previous) =
+      flac_strike_decision(None, t0, FlacStrikeReason::MediaRecovered, FLAC_STRIKE_PAIR_WINDOW);
+    assert_eq!(decision, FlacStrikeDecision::RecordOnly);
+    assert_eq!(previous, Some((t0, FlacStrikeReason::MediaRecovered)));
+  }
+
+  #[test]
+  fn flac_strike_second_within_pair_window_is_fallback() {
+    let t0 = Instant::now();
+    let t1 = t0 + Duration::from_secs(30);
+    let previous = Some((t0, FlacStrikeReason::MediaRecovered));
+    let (decision, updated) =
+      flac_strike_decision(previous, t1, FlacStrikeReason::StallWatchdogReload, FLAC_STRIKE_PAIR_WINDOW);
+    assert_eq!(decision, FlacStrikeDecision::FallbackToWav);
+    assert_eq!(updated, Some((t1, FlacStrikeReason::StallWatchdogReload)));
+  }
+
+  #[test]
+  fn flac_strike_second_after_pair_window_is_record_only() {
+    let t0 = Instant::now();
+    let t1 = t0 + FLAC_STRIKE_PAIR_WINDOW;
+    let previous = Some((t0, FlacStrikeReason::StallWatchdogReload));
+    let (decision, updated) =
+      flac_strike_decision(previous, t1, FlacStrikeReason::MediaRecovered, FLAC_STRIKE_PAIR_WINDOW);
+    assert_eq!(decision, FlacStrikeDecision::RecordOnly);
+    assert_eq!(updated, Some((t1, FlacStrikeReason::MediaRecovered)));
+  }
+
+  #[test]
+  fn flac_strike_exactly_at_pair_window_boundary_resets() {
+    // Pair window is exclusive upper bound: elapsed == window → RecordOnly.
+    let t0 = Instant::now();
+    let t1 = t0 + FLAC_STRIKE_PAIR_WINDOW;
+    let (decision, _) = flac_strike_decision(
+      Some((t0, FlacStrikeReason::MediaRecovered)),
+      t1,
+      FlacStrikeReason::MediaRecovered,
+      FLAC_STRIKE_PAIR_WINDOW,
+    );
+    assert_eq!(decision, FlacStrikeDecision::RecordOnly);
   }
 
   // --- I1: stall watchdog pure decisions ---
