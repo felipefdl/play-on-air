@@ -79,6 +79,8 @@ struct RtpSeqStats {
     reorders: u64,
     /// Duplicate or late (already passed) sequence numbers dropped.
     duplicates: u64,
+    /// In-order ALAC payloads that failed to decode (silence-filled like losses).
+    decode_fails: u64,
 }
 
 /// One ordered frame from the reorder window: ALAC payload or a lost gap.
@@ -117,6 +119,11 @@ impl RealtimeReorderWindow {
 
     fn stats(&self) -> RtpSeqStats {
         self.stats
+    }
+
+    /// Record an in-order ALAC decode failure (silence already substituted by caller).
+    fn note_decode_fail(&mut self) {
+        self.stats.decode_fails = self.stats.decode_fails.saturating_add(1);
     }
 
     /// Whether `seq` still fits in the open window starting at `next_seq`.
@@ -277,12 +284,14 @@ pub(crate) async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn Audio
         let ordered = reorder.push(seq, alac_data);
         for frame in ordered {
             let mut samples = match frame {
-                OrderedFrame::Payload(alac) => {
-                    let Some(decoded) = decoder.as_mut().and_then(|d| d.decode_frame_f32(&alac)) else {
-                        continue;
-                    };
-                    decoded
-                }
+                OrderedFrame::Payload(alac) => match decoder.as_mut().and_then(|d| d.decode_frame_f32(&alac)) {
+                    Some(decoded) => decoded,
+                    // Keep playout clock length: same silence fill as Lost packets.
+                    None => {
+                        reorder.note_decode_fail();
+                        vec![0.0f32; frame_samples]
+                    }
+                },
                 OrderedFrame::Lost => vec![0.0f32; frame_samples],
             };
 
@@ -303,6 +312,7 @@ pub(crate) async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn Audio
                 losses = s.losses,
                 reorders = s.reorders,
                 duplicates = s.duplicates,
+                decode_fails = s.decode_fails,
                 "Realtime RTP sequence stats"
             );
             last_stats_log = Instant::now();
@@ -314,6 +324,7 @@ pub(crate) async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn Audio
         losses = s.losses,
         reorders = s.reorders,
         duplicates = s.duplicates,
+        decode_fails = s.decode_fails,
         "Realtime ALAC receiver ended"
     );
 }
@@ -477,5 +488,22 @@ mod tests {
         assert_eq!(w.push(0, vec![3]), vec![OrderedFrame::Payload(vec![3])]);
         assert_eq!(w.push(1, vec![4]), vec![OrderedFrame::Payload(vec![4])]);
         assert_eq!(w.stats(), RtpSeqStats::default());
+    }
+
+    #[test]
+    fn decode_fail_silence_matches_lost_frame_length() {
+        // Contract for the run loop: decode failure must emit the same number of
+        // zeros as a Lost packet so the PCM clock does not shorten.
+        let frame_samples = 352 * 2;
+        let lost = vec![0.0f32; frame_samples];
+        let decode_fail_silence = vec![0.0f32; frame_samples];
+        assert_eq!(lost.len(), decode_fail_silence.len());
+        assert!(lost.iter().all(|&s| s == 0.0));
+
+        let mut w = RealtimeReorderWindow::new();
+        w.note_decode_fail();
+        w.note_decode_fail();
+        assert_eq!(w.stats().decode_fails, 2);
+        assert_eq!(w.stats().losses, 0);
     }
 }
