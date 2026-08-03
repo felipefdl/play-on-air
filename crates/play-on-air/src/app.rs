@@ -77,8 +77,9 @@ impl App {
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
     let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();
+    let (media_recovered_tx, mut media_recovered_rx) = mpsc::unbounded_channel::<String>();
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
-    let cast_pool = Arc::new(CastPool::new(Some(ownership_tx)));
+    let cast_pool = Arc::new(CastPool::new(Some(ownership_tx)).with_media_recovered(media_recovered_tx));
     let bridge =
       Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)).with_airplay(Arc::clone(&airplay)));
 
@@ -110,6 +111,14 @@ impl App {
       }
     });
 
+    // Pool-internal IDLE/BUFFERING re-LOAD recovery → bridge early FLAC→WAV when in window.
+    let recovered_bridge = Arc::clone(&bridge);
+    let media_recovered_watch = tokio::spawn(async move {
+      while let Some(device_id) = media_recovered_rx.recv().await {
+        recovered_bridge.on_media_recovered(&device_id).await;
+      }
+    });
+
     let maintain = spawn_supervised_maintain(
       Arc::clone(&registry),
       config,
@@ -137,6 +146,8 @@ impl App {
     await_aborted_task(bridge_task, "bridge").await;
     ownership_watch.abort();
     await_aborted_task(ownership_watch, "ownership watch").await;
+    media_recovered_watch.abort();
+    await_aborted_task(media_recovered_watch, "media recovered watch").await;
     shutdown_cast_pool(&cast_pool).await;
     Ok(())
   }

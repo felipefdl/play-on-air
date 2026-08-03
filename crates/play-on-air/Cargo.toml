@@ -44,6 +44,8 @@ mdns-sd = { workspace = true }
 claxon = { workspace = true }
 hound = { workspace = true }
 tempfile = "3"
+# Time control for prebuffer-timeout and similar bridge unit tests.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

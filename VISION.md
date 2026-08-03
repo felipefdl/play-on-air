@@ -76,12 +76,12 @@ Chromecast mDNS discovery
         ▼
   one AP2 advertisement per device
         │
-iOS/macOS ──AirPlay 2──► PlayOnAir ──FLAC HTTP + Cast──► Chromecast
+iOS/macOS ──AirPlay 2──► PlayOnAir ──FLAC LIVE HTTP + Cast──► Chromecast
 ```
 
 - **Ingress:** AirPlay 2 receiver (pairing, FairPlay, encrypted RTSP, buffered and realtime audio).
-- **Core:** session state, prebuffer/drift policy, flush/skip, volume mapping.
-- **Egress:** local HTTP media URL + Cast v2 control (play, pause, stop, volume).
+- **Core:** generation-stamped session state, prebuffer, flush/skip re-LOAD, volume mapping.
+- **Egress:** local HTTP media URL (FLAC chunked LIVE by default; WAV/LPCM BUFFERED fallback) + Cast v2 control (play, pause, stop, volume). ~2 s cushion via silence preroll and maintained lead.
 - **Config (optional):** rename / hide only.
 
 ## Operator promise
