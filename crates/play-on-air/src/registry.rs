@@ -5,6 +5,19 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
+/// How long after a remove event before the device actually leaves the registry.
+pub const DEFAULT_PENDING_LEAVE: Duration = Duration::from_secs(20);
+
+/// Floor for withdrawing an AirPlay receiver after a device is no longer desired
+/// when a bridge session may have been active (gone + session-ended gate).
+pub const SESSION_GUARD_GONE: Duration = Duration::from_secs(60);
+
+/// Default TTL for registry entries without a re-sighting (stale backstop).
+///
+/// Primary removal is debounced mDNS leave (`pending_leave`). This TTL withdraws
+/// AirPlay ads for devices that silently disappear without a remove event.
+pub const DEFAULT_STALE_TTL: Duration = Duration::from_secs(600);
+
 /// A discovered Google Cast device on the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -20,6 +33,92 @@ pub struct Device {
   pub port: u16,
   /// Last time this device was seen via mDNS.
   pub last_seen: Instant,
+  /// mDNS instance name recorded at appear time (exact leave matching).
+  pub instance: String,
+  /// When set, device will leave after this deadline unless cancelled by re-appear.
+  pub pending_leave_deadline: Option<Instant>,
+  /// When pending-leave started (session-guard / observability).
+  pub pending_leave_since: Option<Instant>,
+}
+
+impl Device {
+  /// Build a device with no pending leave (typical appear path).
+  #[must_use]
+  pub fn new(
+    id: impl Into<String>,
+    name: impl Into<String>,
+    host: impl Into<String>,
+    hostname: impl Into<String>,
+    port: u16,
+    instance: impl Into<String>,
+  ) -> Self {
+    Self {
+      id: id.into(),
+      name: name.into(),
+      host: host.into(),
+      hostname: hostname.into(),
+      port,
+      last_seen: Instant::now(),
+      instance: instance.into(),
+      pending_leave_deadline: None,
+      pending_leave_since: None,
+    }
+  }
+}
+
+/// Pure: whether a pending-leave deadline has elapsed.
+#[must_use]
+pub fn pending_leave_is_due(deadline: Instant, now: Instant) -> bool {
+  now.checked_duration_since(deadline).is_some()
+}
+
+/// Decision for withdrawing an AirPlay receiver that may no longer be desired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawDecision {
+  /// Device is still desired — keep advertising.
+  Keep,
+  /// Live bridge session or session-guard floor not met — do not withdraw yet.
+  Defer,
+  /// Safe to withdraw the AirPlay receiver (and warm Cast worker).
+  Withdraw,
+}
+
+/// Pure: whether `maintain_airplay` may withdraw a receiver.
+///
+/// - Still desired → [`WithdrawDecision::Keep`]
+/// - Live bridge session → always [`WithdrawDecision::Defer`]
+/// - Not desired, no session, gone for at least `session_guard` → [`WithdrawDecision::Withdraw`]
+/// - Not desired, no session, gone less than `session_guard` → [`WithdrawDecision::Defer`]
+#[must_use]
+pub fn decide_airplay_withdraw(
+  is_desired: bool,
+  has_session: bool,
+  gone_for: Duration,
+  session_guard: Duration,
+) -> WithdrawDecision {
+  if is_desired {
+    return WithdrawDecision::Keep;
+  }
+  if has_session {
+    return WithdrawDecision::Defer;
+  }
+  if gone_for >= session_guard {
+    WithdrawDecision::Withdraw
+  } else {
+    WithdrawDecision::Defer
+  }
+}
+
+/// Pure: exact match for leave-by-instance (no substring heuristics).
+///
+/// Prefer matching `id == instance` (TXT id often equals browse instance on some
+/// stacks); otherwise match the stored mDNS `instance` field exactly.
+#[must_use]
+pub fn match_device_for_leave<'a>(devices: &'a [Device], instance: &str) -> Option<&'a Device> {
+  devices
+    .iter()
+    .find(|d| d.id == instance)
+    .or_else(|| devices.iter().find(|d| d.instance == instance))
 }
 
 /// Thread-safe map of present Cast devices.
@@ -35,22 +134,108 @@ impl DeviceRegistry {
   }
 
   /// Record or refresh a device (appear / re-appear).
-  pub fn appear(&self, device: Device) {
+  ///
+  /// Re-appearance cancels any pending leave and refreshes `last_seen`.
+  /// Returns `true` if this id was not previously present (first appear).
+  pub fn appear(&self, mut device: Device) -> bool {
     let mut guard = self.inner.write();
     let key = device.id.clone();
+    let is_new = !guard.contains_key(&key);
+    // Appear always clears pending leave (re-sight cancels debounce).
+    device.pending_leave_deadline = None;
+    device.pending_leave_since = None;
+    device.last_seen = Instant::now();
     drop(guard.insert(key, device));
+    is_new
   }
 
-  /// Remove a device that left the network.
+  /// Remove a device that left the network immediately (no debounce).
   pub fn leave(&self, id: &str) -> Option<Device> {
     let mut guard = self.inner.write();
     guard.remove(id)
   }
 
-  /// Snapshot of all currently known devices.
+  /// Mark a device pending leave by stable id. Returns `true` if marked (or already pending).
+  pub fn mark_pending_leave(&self, id: &str, now: Instant, grace: Duration) -> bool {
+    let mut guard = self.inner.write();
+    let Some(dev) = guard.get_mut(id) else {
+      return false;
+    };
+    if dev.pending_leave_deadline.is_some() {
+      return true;
+    }
+    dev.pending_leave_since = Some(now);
+    dev.pending_leave_deadline = Some(now + grace);
+    drop(guard);
+    true
+  }
+
+  /// Mark pending leave by exact instance / id match. Returns the device id when marked.
+  pub fn mark_pending_leave_by_instance(&self, instance: &str, now: Instant, grace: Duration) -> Option<String> {
+    let list: Vec<Device> = {
+      let guard = self.inner.read();
+      guard.values().cloned().collect()
+    };
+    let id = match_device_for_leave(&list, instance)?.id.clone();
+    if self.mark_pending_leave(&id, now, grace) {
+      Some(id)
+    } else {
+      None
+    }
+  }
+
+  /// Cancel pending leave for `id` (e.g. re-appear). Returns `true` if a pending leave was cleared.
+  pub fn cancel_pending_leave(&self, id: &str) -> bool {
+    let mut guard = self.inner.write();
+    let Some(dev) = guard.get_mut(id) else {
+      return false;
+    };
+    let was_pending = dev.pending_leave_deadline.is_some();
+    dev.pending_leave_deadline = None;
+    dev.pending_leave_since = None;
+    drop(guard);
+    was_pending
+  }
+
+  /// Whether the device is in pending-leave state.
+  pub fn is_pending_leave(&self, id: &str) -> bool {
+    let guard = self.inner.read();
+    guard.get(id).is_some_and(|d| d.pending_leave_deadline.is_some())
+  }
+
+  /// Remove devices whose pending-leave deadline has elapsed. Returns the removed devices.
+  pub fn take_due_leaves(&self, now: Instant) -> Vec<Device> {
+    let mut guard = self.inner.write();
+    let due: Vec<String> = guard
+      .iter()
+      .filter_map(|(id, dev)| {
+        let deadline = dev.pending_leave_deadline?;
+        if pending_leave_is_due(deadline, now) {
+          Some(id.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+    let mut removed = Vec::with_capacity(due.len());
+    for id in due {
+      if let Some(dev) = guard.remove(&id) {
+        removed.push(dev);
+      }
+    }
+    removed
+  }
+
+  /// Snapshot of all currently known devices (including pending-leave).
   pub fn list(&self) -> Vec<Device> {
     let guard = self.inner.read();
     guard.values().cloned().collect()
+  }
+
+  /// Snapshot of devices that are not pending leave (still fully present).
+  pub fn list_present(&self) -> Vec<Device> {
+    let guard = self.inner.read();
+    guard.values().filter(|d| d.pending_leave_deadline.is_none()).cloned().collect()
   }
 
   /// Look up one device by id.
@@ -70,12 +255,17 @@ impl DeviceRegistry {
   }
 
   /// Drop devices not seen within `max_age` (stale cleanup helper).
+  ///
+  /// Skips devices with an active pending leave (those are handled by [`take_due_leaves`]).
   pub fn prune_older_than(&self, max_age: Duration) -> Vec<Device> {
     let now = Instant::now();
     let mut guard = self.inner.write();
     let stale: Vec<String> = guard
       .iter()
       .filter_map(|(id, dev)| {
+        if dev.pending_leave_deadline.is_some() {
+          return None;
+        }
         if now.duration_since(dev.last_seen) > max_age {
           Some(id.clone())
         } else {
@@ -94,40 +284,30 @@ impl DeviceRegistry {
 
   /// Expire devices that have not re-appeared within `ttl`.
   ///
-  /// Used when mDNS `ServiceRemoved` is missed so AirPlay ads are withdrawn.
+  /// Backstop when mDNS remove is missed so AirPlay ads are withdrawn.
   pub fn expire_stale(&self, ttl: Duration) -> Vec<Device> {
     self.prune_older_than(ttl)
   }
 }
-
-/// Default TTL for registry entries without a re-sighting.
-///
-/// System DNS-SD often fires `Added` once until `Removed`. A short TTL was
-/// withdrawing live Chromecasts and their AirPlay ads after ~90s. Use a long
-/// safety net; primary removal is still `ServiceRemoved`.
-pub const DEFAULT_STALE_TTL: Duration = Duration::from_secs(86_400);
 
 #[cfg(test)]
 mod tests {
   use super::*;
 
   fn sample(id: &str, name: &str) -> Device {
-    Device {
-      id: id.to_owned(),
-      name: name.to_owned(),
-      host: "192.168.1.10".to_owned(),
-      hostname: "speaker.local".to_owned(),
-      port: 8009,
-      last_seen: Instant::now(),
-    }
+    Device::new(id, name, "192.168.1.10", "speaker.local", 8009, name)
+  }
+
+  fn sample_with_instance(id: &str, name: &str, instance: &str) -> Device {
+    Device::new(id, name, "192.168.1.10", "speaker.local", 8009, instance)
   }
 
   #[test]
   fn appear_list_leave() {
     let reg = DeviceRegistry::new();
     assert!(reg.is_empty());
-    reg.appear(sample("a", "A"));
-    reg.appear(sample("b", "B"));
+    assert!(reg.appear(sample("a", "A")));
+    assert!(reg.appear(sample("b", "B")));
     assert_eq!(reg.len(), 2);
     let list = reg.list();
     assert_eq!(list.len(), 2);
@@ -138,10 +318,14 @@ mod tests {
   }
 
   #[test]
-  fn appear_updates_existing() {
+  fn appear_updates_existing_and_cancels_pending() {
     let reg = DeviceRegistry::new();
-    reg.appear(sample("a", "Old"));
-    reg.appear(sample("a", "New"));
+    assert!(reg.appear(sample("a", "Old")));
+    let now = Instant::now();
+    assert!(reg.mark_pending_leave("a", now, DEFAULT_PENDING_LEAVE));
+    assert!(reg.is_pending_leave("a"));
+    assert!(!reg.appear(sample("a", "New")));
+    assert!(!reg.is_pending_leave("a"));
     assert_eq!(reg.len(), 1);
     assert_eq!(reg.get("a").map(|d| d.name), Some("New".to_owned()));
   }
@@ -149,10 +333,17 @@ mod tests {
   #[test]
   fn expire_stale_removes_old_devices() {
     let reg = DeviceRegistry::new();
-    let mut old = sample("stale", "Stale");
-    old.last_seen = Instant::now().checked_sub(Duration::from_secs(86_400 + 60)).expect("clock");
-    reg.appear(old);
-    reg.appear(sample("fresh", "Fresh"));
+    let _ = reg.appear(sample("stale", "Stale"));
+    let _ = reg.appear(sample("fresh", "Fresh"));
+    // appear() refreshes last_seen; backdate the stale entry in place.
+    {
+      let mut guard = reg.inner.write();
+      if let Some(dev) = guard.get_mut("stale") {
+        dev.last_seen = Instant::now()
+          .checked_sub(DEFAULT_STALE_TTL + Duration::from_secs(60))
+          .expect("clock");
+      }
+    }
 
     let removed = reg.expire_stale(DEFAULT_STALE_TTL);
     assert_eq!(removed.len(), 1);
@@ -165,9 +356,143 @@ mod tests {
   #[test]
   fn expire_stale_keeps_recent() {
     let reg = DeviceRegistry::new();
-    reg.appear(sample("a", "A"));
+    let _ = reg.appear(sample("a", "A"));
     let removed = reg.expire_stale(DEFAULT_STALE_TTL);
     assert!(removed.is_empty());
     assert_eq!(reg.len(), 1);
+  }
+
+  #[test]
+  fn expire_stale_skips_pending_leave() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample("p", "P"));
+    {
+      let mut guard = reg.inner.write();
+      if let Some(dev) = guard.get_mut("p") {
+        dev.last_seen = Instant::now()
+          .checked_sub(DEFAULT_STALE_TTL + Duration::from_secs(60))
+          .expect("clock");
+      }
+    }
+    assert!(reg.mark_pending_leave("p", Instant::now(), DEFAULT_PENDING_LEAVE));
+    let removed = reg.expire_stale(DEFAULT_STALE_TTL);
+    assert!(removed.is_empty());
+    assert!(reg.get("p").is_some());
+  }
+
+  #[test]
+  fn pending_leave_deadline_and_take_due() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample("a", "A"));
+    let now = Instant::now();
+    assert!(reg.mark_pending_leave("a", now, Duration::from_secs(20)));
+    assert!(reg.take_due_leaves(now + Duration::from_secs(10)).is_empty());
+    assert_eq!(reg.len(), 1);
+    let due = reg.take_due_leaves(now + Duration::from_secs(21));
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].id, "a");
+    assert!(reg.is_empty());
+  }
+
+  #[test]
+  fn mark_pending_leave_by_instance_exact() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample_with_instance("abc123", "Gym", "Nest-Audio-abc123"));
+    let now = Instant::now();
+    // Substring must not match.
+    assert!(
+      reg
+        .mark_pending_leave_by_instance("Nest-Audio", now, DEFAULT_PENDING_LEAVE)
+        .is_none()
+    );
+    let id = reg
+      .mark_pending_leave_by_instance("Nest-Audio-abc123", now, DEFAULT_PENDING_LEAVE)
+      .expect("exact instance");
+    assert_eq!(id, "abc123");
+    assert!(reg.is_pending_leave("abc123"));
+  }
+
+  #[test]
+  fn mark_pending_leave_by_id_exact() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample_with_instance("abc123", "Gym", "Nest-Audio-abc123"));
+    let now = Instant::now();
+    let id = reg
+      .mark_pending_leave_by_instance("abc123", now, DEFAULT_PENDING_LEAVE)
+      .expect("id match");
+    assert_eq!(id, "abc123");
+  }
+
+  #[test]
+  fn match_device_for_leave_no_contains() {
+    let devices = vec![
+      sample_with_instance("deadbeef", "A", "Nest-Audio-deadbeef"),
+      sample_with_instance("cafe", "B", "Other"),
+    ];
+    assert!(match_device_for_leave(&devices, "dead").is_none());
+    assert_eq!(
+      match_device_for_leave(&devices, "Nest-Audio-deadbeef").map(|d| d.id.as_str()),
+      Some("deadbeef")
+    );
+    assert_eq!(match_device_for_leave(&devices, "cafe").map(|d| d.id.as_str()), Some("cafe"));
+  }
+
+  #[test]
+  fn decide_airplay_withdraw_matrix() {
+    assert_eq!(
+      decide_airplay_withdraw(true, false, Duration::from_secs(100), SESSION_GUARD_GONE),
+      WithdrawDecision::Keep
+    );
+    assert_eq!(
+      decide_airplay_withdraw(false, true, Duration::from_secs(100), SESSION_GUARD_GONE),
+      WithdrawDecision::Defer
+    );
+    assert_eq!(
+      decide_airplay_withdraw(false, false, Duration::from_secs(30), SESSION_GUARD_GONE),
+      WithdrawDecision::Defer
+    );
+    assert_eq!(
+      decide_airplay_withdraw(false, false, Duration::from_secs(60), SESSION_GUARD_GONE),
+      WithdrawDecision::Withdraw
+    );
+    assert_eq!(
+      decide_airplay_withdraw(false, false, Duration::ZERO, Duration::ZERO),
+      WithdrawDecision::Withdraw
+    );
+  }
+
+  #[test]
+  fn pending_leave_is_due_ordering() {
+    let t0 = Instant::now();
+    let t1 = t0 + Duration::from_secs(20);
+    assert!(!pending_leave_is_due(t1, t0));
+    assert!(pending_leave_is_due(t0, t1));
+    assert!(pending_leave_is_due(t0, t0));
+  }
+
+  #[test]
+  fn cancel_pending_leave() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample("a", "A"));
+    assert!(!reg.cancel_pending_leave("a"));
+    assert!(reg.mark_pending_leave("a", Instant::now(), DEFAULT_PENDING_LEAVE));
+    assert!(reg.cancel_pending_leave("a"));
+    assert!(!reg.is_pending_leave("a"));
+  }
+
+  #[test]
+  fn list_present_excludes_pending() {
+    let reg = DeviceRegistry::new();
+    let _ = reg.appear(sample("a", "A"));
+    let _ = reg.appear(sample("b", "B"));
+    assert!(reg.mark_pending_leave("a", Instant::now(), DEFAULT_PENDING_LEAVE));
+    let present = reg.list_present();
+    assert_eq!(present.len(), 1);
+    assert_eq!(present[0].id, "b");
+  }
+
+  #[test]
+  fn default_stale_ttl_is_ten_minutes() {
+    assert_eq!(DEFAULT_STALE_TTL, Duration::from_secs(600));
   }
 }

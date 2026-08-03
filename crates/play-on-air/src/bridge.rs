@@ -258,6 +258,12 @@ impl Bridge {
     *self.start_barrier.lock() = Some(barrier);
   }
 
+  /// Whether a live bridge session exists for `device_id`.
+  #[must_use]
+  pub fn has_session(&self, device_id: &str) -> bool {
+    self.sessions.lock().contains_key(device_id)
+  }
+
   /// Run until the session event channel closes.
   ///
   /// Events are routed to a small per-`device_id` worker so one device's slow
@@ -1077,13 +1083,16 @@ mod tests {
   #[tokio::test]
   async fn handle_session_end_shuts_media_before_cast_stop_and_does_not_hang() {
     let registry = Arc::new(DeviceRegistry::new());
-    registry.appear(Device {
+    let _appeared = registry.appear(Device {
       id: "dev-1".to_owned(),
       name: "Test".to_owned(),
       host: "127.0.0.1".to_owned(),
       hostname: "test.local".to_owned(),
       port: 9,
       last_seen: Instant::now(),
+      instance: "dev-1".to_owned(),
+      pending_leave_deadline: None,
+      pending_leave_since: None,
     });
     let pool = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(Arc::clone(&registry), Arc::clone(&pool));
@@ -1451,13 +1460,16 @@ mod tests {
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let registry = Arc::new(DeviceRegistry::new());
     for id in ["dev-a", "dev-b"] {
-      registry.appear(Device {
+      let _appeared = registry.appear(Device {
         id: id.to_owned(),
         name: id.to_owned(),
         host: "127.0.0.1".to_owned(),
         hostname: format!("{id}.local"),
         port: 9,
         last_seen: Instant::now(),
+        instance: id.to_owned(),
+        pending_leave_deadline: None,
+        pending_leave_since: None,
       });
     }
 
