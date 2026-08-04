@@ -321,7 +321,23 @@ async fn maintain_airplay(
       let _ = guards.volume_attempts.lock().remove(&device.id);
     }
 
+    // Keep Cast worker desired so terminal state is retained; AirPlay may still be hidden.
     let _inserted = desired.insert(device.id.clone());
+    // Warm Cast first so terminal TLS can be latched before we advertise.
+    cast_pool.ensure(device);
+    if cast_pool.is_terminal_failed(&device.id) {
+      // B4: hide broken Cast sinks — withdraw any existing AirPlay ad.
+      if previously_advertised.contains(&device.id) || airplay.active_ids().iter().any(|id| id == &device.id) {
+        tracing::info!(
+          id = %device.id,
+          name = %device.name,
+          "withdrawing AirPlay receiver (Cast control terminal failure)"
+        );
+        airplay.remove(&device.id);
+      }
+      continue;
+    }
+
     let name = airplay_name_with_id(&device.name, &device.id, config);
     if let Err(err) = airplay.ensure(&device.id, &name).await {
       tracing::error!(
@@ -331,8 +347,6 @@ async fn maintain_airplay(
         "failed to advertise AirPlay 2 receiver"
       );
     }
-    // Warm Cast TCP while idle so LOAD during AirPlay does not dial fresh.
-    cast_pool.ensure(device);
   }
   *guards.known_ids.lock() = present_ids;
 
@@ -461,6 +475,17 @@ const fn should_start_volume_seed(needs_seed: bool, attempts: u32, inflight: boo
   needs_seed && !inflight && attempts < VOLUME_SEED_MAX_ATTEMPTS
 }
 
+/// Volume seed must not hammer devices with process-lifetime Cast terminal failures (B4).
+#[must_use]
+const fn should_start_volume_seed_for_cast(
+  needs_seed: bool,
+  attempts: u32,
+  inflight: bool,
+  cast_terminal: bool,
+) -> bool {
+  !cast_terminal && should_start_volume_seed(needs_seed, attempts, inflight)
+}
+
 /// Withdraw receivers that are no longer desired.
 ///
 /// Idle leave: withdraw immediately when `!has_session`.
@@ -564,8 +589,11 @@ fn sync_volume_seeds(
     }
     let attempts = guards.volume_attempts.lock().get(&device.id).copied().unwrap_or(0);
     let inflight = guards.volume_seed_inflight.lock().contains(&device.id);
-    if !should_start_volume_seed(true, attempts, inflight) {
-      if attempts >= VOLUME_SEED_MAX_ATTEMPTS {
+    let cast_terminal = cast_pool.is_terminal_failed(&device.id);
+    if !should_start_volume_seed_for_cast(true, attempts, inflight, cast_terminal) {
+      if cast_terminal {
+        tracing::debug!(id = %device.id, "volume seed skipped: Cast control terminal failure");
+      } else if attempts >= VOLUME_SEED_MAX_ATTEMPTS {
         tracing::debug!(
           id = %device.id,
           attempts,
@@ -713,6 +741,12 @@ mod tests {
     assert!(!should_start_volume_seed(true, 0, true));
     assert!(!should_start_volume_seed(true, VOLUME_SEED_MAX_ATTEMPTS, false));
     assert!(!should_start_volume_seed(false, 0, false));
+  }
+
+  #[test]
+  fn volume_seed_skips_terminal_cast_failure() {
+    assert!(!should_start_volume_seed_for_cast(true, 0, false, true));
+    assert!(should_start_volume_seed_for_cast(true, 0, false, false));
   }
 
   #[test]

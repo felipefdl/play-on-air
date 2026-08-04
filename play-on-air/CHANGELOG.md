@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3
+
+- Fix: Cast LOAD no longer leaves an active media session after the caller times out (late success is abandoned and stopped).
+- Fix: AirPlay pause cancels in-flight Cast re-LOAD recovery; resume no longer fires PLAY while a re-LOAD is in flight.
+- Fix: buffered AirPlay map flush/re-anchor no longer drops thousands of packets on RTP timeline jumps.
+- Fix: devices with permanent Cast TLS failures (for example some TVs reporting UnsupportedCertVersion) are not advertised as AirPlay sinks and are not reconnect-hammered.
+- Logging: quieter false PTP bind warnings; clearer first-time Cast reachability wording.
+
 ## 0.2.2
 
 - AirPlay devices advertise a neutral `PlayOnAir1,1` model, so the iOS picker shows a speaker icon instead of an Apple TV.

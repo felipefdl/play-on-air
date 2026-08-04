@@ -162,6 +162,31 @@ const fn late_load_should_stop(alive: bool, late_stop_allowed: bool) -> bool {
   !alive && late_stop_allowed
 }
 
+/// Whether discarding a wire-successful re-LOAD requires Cast STOP (B1-shaped orphan).
+///
+/// True when the client paused (session still alive but bridge will not accept media) or when
+/// full end allows late STOP. False on replace (`!late_stop_allowed`) so we never STOP the
+/// superseding session.
+#[must_use]
+const fn discard_successful_reload_should_stop(paused: bool, alive: bool, late_stop_allowed: bool) -> bool {
+  paused || late_load_should_stop(alive, late_stop_allowed)
+}
+
+/// Whether a detached re-LOAD may still run for this Playing generation.
+///
+/// Abort when generation moved on, the session died, or the client paused (B2:
+/// `resume_play_failed` re-LOAD must not complete after a later pause).
+#[must_use]
+const fn reload_still_valid(live_gen: u64, expected_gen: u64, alive: bool, paused: bool) -> bool {
+  live_gen == expected_gen && alive && !paused
+}
+
+/// Whether resume should skip Cast PLAY because a re-LOAD already owns the worker (D3).
+#[must_use]
+const fn resume_should_skip_play_for_reload(reload_in_flight: bool) -> bool {
+  reload_in_flight
+}
+
 /// Whether a detached PAUSE/PLAY from `expected_gen` may still touch Cast for `device_id`.
 ///
 /// Requires both session liveness and a matching live generation so a command from a replaced
@@ -410,6 +435,8 @@ struct PlayingSession {
   ///
   /// Cast PAUSE is deferred by [`REANCHOR_DEBOUNCE`] so iOS re-anchors can cancel.
   paused: bool,
+  /// Cross-thread mirror of [`Self::paused`] for in-flight re-LOAD abort checks (B2).
+  playback_paused: Arc<AtomicBool>,
   /// When the current pause began (for long-pause re-LOAD).
   paused_at: Option<Instant>,
   /// Last flush-driven re-LOAD (set when the debounce timer actually fires).
@@ -954,6 +981,7 @@ impl Bridge {
       sample_rate: fmt.sample_rate,
       egress,
       paused: false,
+      playback_paused: Arc::new(AtomicBool::new(false)),
       paused_at: None,
       last_flush_reload_at: None,
       last_stall_reload_at: None,
@@ -1199,6 +1227,7 @@ impl Bridge {
         return;
       }
       session.paused = true;
+      session.playback_paused.store(true, Ordering::Release);
       session.paused_at = Some(Instant::now());
       let arm = session.pause_debounce_arm.wrapping_add(1);
       session.pause_debounce_arm = arm;
@@ -1234,6 +1263,10 @@ impl Bridge {
   /// Cancels pending pause/flush re-anchor timers first. Cast PLAY only if Cast was
   /// actually paused (debounce already fired). Detached PLAY re-checks generation +
   /// `session_alive` so a replaced generation cannot PLAY the new session.
+  #[expect(
+    clippy::too_many_lines,
+    reason = "resume decision + detached PLAY/re-LOAD paths stay co-located for generation safety"
+  )]
   fn handle_resume(self: &Arc<Self>, device_id: &str) {
     let action = {
       let mut devices = self.devices.lock();
@@ -1249,6 +1282,8 @@ impl Bridge {
       let flush_pending = session.flush_debounce_cancel.is_some();
       let long_pause = session.paused_at.is_some_and(|at| at.elapsed() >= LONG_PAUSE_RELOAD);
       let decision = reanchor_on_resumed(pause_pending, flush_pending, session.paused, long_pause);
+      // D3: flush/resume re-LOAD already on the Cast worker — PLAY would congest and time out.
+      let reload_in_flight = session.inflight_load.lock().is_some() || session.reload_flight.try_lock().is_err();
 
       if pause_pending {
         session.pause_debounce_arm = session.pause_debounce_arm.wrapping_add(1);
@@ -1266,12 +1301,25 @@ impl Bridge {
       let action = match decision {
         ReanchorResumeDecision::Absorb => {
           session.paused = false;
+          session.playback_paused.store(false, Ordering::Release);
           session.paused_at = None;
           tracing::debug!(%device_id, generation = *generation, "re-anchor absorbed");
           ResumeAction::Absorb
         },
+        ReanchorResumeDecision::Play if resume_should_skip_play_for_reload(reload_in_flight) => {
+          session.paused = false;
+          session.playback_paused.store(false, Ordering::Release);
+          session.paused_at = None;
+          tracing::debug!(
+            %device_id,
+            generation = *generation,
+            "skip Cast PLAY; re-LOAD already in flight"
+          );
+          ResumeAction::Absorb
+        },
         ReanchorResumeDecision::Play => {
           session.paused = false;
+          session.playback_paused.store(false, Ordering::Release);
           session.paused_at = None;
           ResumeAction::Play {
             generation: *generation,
@@ -1281,11 +1329,13 @@ impl Bridge {
         },
         ReanchorResumeDecision::Reload => {
           session.paused = false;
+          session.playback_paused.store(false, Ordering::Release);
           session.paused_at = None;
           ResumeAction::Reload { generation: *generation }
         },
         ReanchorResumeDecision::None => {
           session.paused = false;
+          session.playback_paused.store(false, Ordering::Release);
           session.paused_at = None;
           ResumeAction::Absorb
         },
@@ -1612,6 +1662,10 @@ impl Bridge {
   }
 
   /// Re-LOAD the current Playing media URL. Returns whether LOAD succeeded while still live.
+  #[expect(
+    clippy::too_many_lines,
+    reason = "flight serialize + multi-stage pause/gen validity gates must stay ordered (B2)"
+  )]
   async fn reload_playing_media(&self, device_id: &str, generation: u64, reason: &str) -> bool {
     let load_plan = {
       let devices = self.devices.lock();
@@ -1621,7 +1675,12 @@ impl Bridge {
       let DeviceState::Playing { generation: live_gen, session } = &slot.state else {
         return false;
       };
-      if *live_gen != generation || !session.session_alive.load(Ordering::Acquire) {
+      if !reload_still_valid(
+        *live_gen,
+        generation,
+        session.session_alive.load(Ordering::Acquire),
+        session.paused,
+      ) {
         return false;
       }
       let request = match session.egress {
@@ -1638,11 +1697,14 @@ impl Bridge {
         Arc::clone(&session.late_stop_allowed),
         Arc::clone(&session.inflight_load),
         Arc::clone(&session.reload_flight),
+        Arc::clone(&session.playback_paused),
       );
       drop(devices);
       Some(plan)
     };
-    let Some((pool, request, volume, alive, late_stop_allowed, inflight_load, reload_flight)) = load_plan else {
+    let Some((pool, request, volume, alive, late_stop_allowed, inflight_load, reload_flight, playback_paused)) =
+      load_plan
+    else {
       return false;
     };
 
@@ -1651,18 +1713,47 @@ impl Bridge {
     // join_prior and both publish — second overwrite would detach a LOAD.
     let _flight = reload_flight.lock().await;
 
+    // Re-check after acquiring the flight lock (pause/end can race while waiting).
+    if !self.reload_session_still_valid(device_id, generation) {
+      tracing::debug!(%device_id, generation, reason, "re-LOAD aborted after flight lock (paused or stale)");
+      return false;
+    }
+
     // Single-flight: finish any prior LOAD before publishing a new one (no detached race).
     join_prior_inflight_load(&inflight_load, device_id).await;
 
+    // State can change while joining the prior load (B2: pause during wait).
+    if !self.reload_session_still_valid(device_id, generation) {
+      tracing::debug!(%device_id, generation, reason, "re-LOAD aborted after prior join (paused or stale)");
+      return false;
+    }
+
     let id = device_id.to_owned();
+    // Kept for post-LOAD discard STOP (pause after Ok is B1-shaped orphan without this).
+    let pool_for_discard = Arc::clone(&pool);
+    let alive_for_discard = Arc::clone(&alive);
+    let late_stop_for_discard = Arc::clone(&late_stop_allowed);
+    let paused_for_discard = Arc::clone(&playback_paused);
     let (result_tx, result_rx) = oneshot::channel();
     {
       let mut slot = inflight_load.lock();
-      if !alive.load(Ordering::Acquire) {
+      if !alive.load(Ordering::Acquire) || playback_paused.load(Ordering::Acquire) {
         return false;
       }
+      let paused_flag = Arc::clone(&playback_paused);
       let load_task = tokio::task::spawn_blocking(move || {
+        // Last check immediately before the blocking pool LOAD (B2).
+        if paused_flag.load(Ordering::Acquire) || !alive.load(Ordering::Acquire) {
+          let _sent = result_tx.send(Err(Error::Bridge("re-LOAD aborted: paused or session ended".to_owned())));
+          return;
+        }
         let result = cast_load_media(&pool, &id, request, volume);
+        // If pause landed during LOAD, treat success as late and STOP (B1/B2).
+        if paused_flag.load(Ordering::Acquire) {
+          pool.stop_best_effort(&id, Duration::from_secs(2));
+          let _sent = result_tx.send(Err(Error::Bridge("re-LOAD aborted: paused during LOAD".to_owned())));
+          return;
+        }
         // SkipStopForReplace means a replacement start owns the device; late STOP after old
         // LOAD would kill the new session on the serialized pool.
         if late_load_should_stop(alive.load(Ordering::Acquire), late_stop_allowed.load(Ordering::Acquire)) {
@@ -1687,15 +1778,50 @@ impl Bridge {
 
     match load_result {
       Ok(Ok(session)) => {
-        tracing::info!(
-          %device_id,
-          generation,
-          reason,
-          transport_id = %session.transport_id,
-          media_session_id = session.media_session_id,
-          "Cast re-LOAD ok"
-        );
-        true
+        // Final gate: do not accept success if pause/gen/alive won the race after LOAD returned.
+        if self.reload_session_still_valid(device_id, generation) {
+          tracing::info!(
+            %device_id,
+            generation,
+            reason,
+            transport_id = %session.transport_id,
+            media_session_id = session.media_session_id,
+            "Cast re-LOAD ok"
+          );
+          return true;
+        }
+        // Wire success was not accepted — STOP unless replace forbids it (B1 orphan otherwise).
+        let paused = paused_for_discard.load(Ordering::Acquire);
+        let alive_now = alive_for_discard.load(Ordering::Acquire);
+        let late_stop = late_stop_for_discard.load(Ordering::Acquire);
+        if discard_successful_reload_should_stop(paused, alive_now, late_stop) {
+          tracing::debug!(
+            %device_id,
+            generation,
+            reason,
+            paused,
+            "Cast re-LOAD ok but discarded; stopping unacknowledged session"
+          );
+          let stop_id = device_id.to_owned();
+          match tokio::task::spawn_blocking(move || {
+            pool_for_discard.stop_best_effort(&stop_id, Duration::from_secs(2));
+          })
+          .await
+          {
+            Ok(()) => {},
+            Err(err) => {
+              tracing::warn!(%device_id, generation, error = %err, "discard STOP task join failed");
+            },
+          }
+        } else {
+          tracing::debug!(
+            %device_id,
+            generation,
+            reason,
+            "Cast re-LOAD ok but session stale (replace); discarding without STOP"
+          );
+        }
+        false
       },
       Ok(Err(err)) => {
         tracing::warn!(%device_id, generation, reason, error = %err, "Cast re-LOAD failed");
@@ -1706,6 +1832,22 @@ impl Bridge {
         false
       },
     }
+  }
+
+  /// True when Playing generation still matches and is alive and not paused.
+  fn reload_session_still_valid(&self, device_id: &str, generation: u64) -> bool {
+    let devices = self.devices.lock();
+    let valid = devices.get(device_id).is_some_and(|slot| match &slot.state {
+      DeviceState::Playing { generation: live_gen, session } => reload_still_valid(
+        *live_gen,
+        generation,
+        session.session_alive.load(Ordering::Acquire),
+        session.paused,
+      ),
+      DeviceState::Idle | DeviceState::Starting { .. } => false,
+    });
+    drop(devices);
+    valid
   }
 
   /// Pool re-LOAD recovered media (IDLE ERROR recovery path).
@@ -2434,6 +2576,7 @@ mod tests {
       sample_rate: 48_000,
       egress: EgressKind::FlacLive,
       paused: false,
+      playback_paused: Arc::new(AtomicBool::new(false)),
       paused_at: None,
       last_flush_reload_at: None,
       last_stall_reload_at: None,
@@ -3546,6 +3689,68 @@ mod tests {
     assert!(!late_load_should_stop(true, false));
     assert!(late_load_should_stop(false, true));
     assert!(!late_load_should_stop(false, false));
+  }
+
+  // --- B2: pause invalidates re-LOAD ---
+
+  #[test]
+  fn reload_still_valid_requires_gen_alive_and_not_paused() {
+    assert!(reload_still_valid(1, 1, true, false));
+    assert!(!reload_still_valid(1, 1, true, true), "paused must abort re-LOAD");
+    assert!(!reload_still_valid(1, 1, false, false), "dead session must abort");
+    assert!(!reload_still_valid(2, 1, true, false), "generation mismatch must abort");
+  }
+
+  /// Post-Ok discard of a successful re-LOAD must STOP on pause / full end, never on replace.
+  #[test]
+  fn discard_successful_reload_stop_policy() {
+    // Pause after LOAD returned Ok while session still alive → STOP (B1 orphan otherwise).
+    assert!(discard_successful_reload_should_stop(true, true, true));
+    assert!(discard_successful_reload_should_stop(true, true, false));
+    // Full end: dead + late_stop_allowed → STOP.
+    assert!(discard_successful_reload_should_stop(false, false, true));
+    // Replace: dead + !late_stop_allowed → do not STOP the superseding session.
+    assert!(!discard_successful_reload_should_stop(false, false, false));
+    // Accepted path would not discard; still no STOP when valid-shaped flags.
+    assert!(!discard_successful_reload_should_stop(false, true, true));
+  }
+
+  #[tokio::test]
+  async fn pause_invalidates_in_flight_reload_plan() {
+    let pool = Arc::new(CastPool::new(None));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let ring = Arc::new(PcmRing::new(2, 4_096));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let session = test_playing_session(media, "dev-b2", Arc::clone(&pool), ring);
+    let playback_paused = Arc::clone(&session.playback_paused);
+    insert_playing(&bridge, "dev-b2", 1, session);
+
+    assert!(bridge.reload_session_still_valid("dev-b2", 1));
+
+    // Simulate handle_pause marking paused without awaiting Cast.
+    {
+      let mut devices = bridge.devices.lock();
+      let DeviceState::Playing { session: playing, .. } = &mut devices.get_mut("dev-b2").unwrap().state else {
+        panic!("expected Playing");
+      };
+      playing.paused = true;
+      playing.playback_paused.store(true, Ordering::Release);
+      drop(devices);
+    }
+    assert!(playback_paused.load(Ordering::Acquire));
+    assert!(
+      !bridge.reload_session_still_valid("dev-b2", 1),
+      "re-LOAD must abort once paused"
+    );
+    assert!(!bridge.reload_playing_media("dev-b2", 1, "resume_play_failed").await);
+  }
+
+  // --- D3: PLAY vs re-LOAD congestion ---
+
+  #[test]
+  fn resume_skips_play_when_reload_in_flight() {
+    assert!(resume_should_skip_play_for_reload(true));
+    assert!(!resume_should_skip_play_for_reload(false));
   }
 
   /// Old LOAD finishes after replace cleared `late_stop_allowed` → STOP must not be issued.

@@ -204,9 +204,39 @@ fn wait_for_map_space(lock: &Mutex<PlayoutState>, cvar: &Condvar) {
     }
 }
 
+/// Wrap-aware signed RTP delta: `ts - reference` as `i32` (circular half-plane).
+#[inline]
+fn rtp_signed_delta(ts: u32, reference: u32) -> i32 {
+    ts.wrapping_sub(reference) as i32
+}
+
+/// Drop map entries farther than `max_span` (source samples) from `reference_ts`.
+///
+/// After FLUSH / re-anchor, clients often jump the RTP epoch by billions of ticks while
+/// old-epoch keys remain. Raw BTree span then looks &gt;180s and the old backstop dropped
+/// **newest** (new epoch) while keeping obsolete head. Keeping only the epoch around the
+/// reference (typically the newest insert) fixes that without raising the 180s cap.
+fn retain_near_rtp_epoch(buffer: &mut BTreeMap<u32, Vec<f32>>, reference_ts: u32, max_span: u32) -> usize {
+    if buffer.is_empty() || max_span == 0 {
+        return 0;
+    }
+    let keys: Vec<u32> = buffer
+        .keys()
+        .copied()
+        .filter(|&ts| rtp_signed_delta(ts, reference_ts).unsigned_abs() > max_span)
+        .collect();
+    let n = keys.len();
+    for k in keys {
+        buffer.remove(&k);
+    }
+    n
+}
+
 /// Pathological backstop: drop **newest** entries until under 3× target depth.
 ///
-/// Never removes the head of the map (frames about to be delivered). Returns count dropped.
+/// Within a single epoch, never removes the head of the map (packets about to be
+/// delivered). Callers should run [`retain_near_rtp_epoch`] first so multi-epoch
+/// spans from FLUSH re-anchor do not look "pathologically deep". Returns count dropped.
 fn enforce_newest_backstop(buffer: &mut BTreeMap<u32, Vec<f32>>, source_sample_rate: u32) -> usize {
     if buffer.is_empty() || source_sample_rate == 0 {
         return 0;
@@ -227,7 +257,8 @@ fn enforce_newest_backstop(buffer: &mut BTreeMap<u32, Vec<f32>>, source_sample_r
         if (span as i32) >= 0 && span <= max_span {
             break;
         }
-        if buffer.pop_last().is_some() {
+        // Remaining multi-epoch / wrap span: drop oldest (obsolete epoch), not newest.
+        if buffer.pop_first().is_some() {
             dropped += 1;
         } else {
             break;
@@ -349,8 +380,12 @@ impl BufferedAudioProcessor {
                         for k in &keys {
                             s.buffer.remove(k);
                         }
+                        // FLUSH is an RTP epoch boundary: drop orphans far from the flush end
+                        // so a later multi-billion-tick re-anchor cannot trip the backstop.
+                        let max_span = s.source_sample_rate.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+                        let epoch_purged = retain_near_rtp_epoch(&mut s.buffer, until_seq, max_span);
                         s.pending_flush = true;
-                        debug!(flushed = keys.len(), "Flushed");
+                        debug!(flushed = keys.len(), epoch_purged, map_len = s.buffer.len(), "Flushed");
                         cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
@@ -529,17 +564,31 @@ async fn receive_loop(
             let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
             s.buffer.insert(timestamp, samples);
             let source_sr = s.source_sample_rate;
-            // Pathological only: refuse newest if somehow past 3× target (paced reads
-            // should keep depth near target). Never drop the playhead (oldest) side.
-            let dropped = enforce_newest_backstop(&mut s.buffer, source_sr);
+            let max_span = source_sr.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+            // Epoch purge first (FLUSH re-anchor), then single-epoch packet-count backstop.
+            let epoch_dropped = retain_near_rtp_epoch(&mut s.buffer, timestamp, max_span);
+            let backstop_dropped = enforce_newest_backstop(&mut s.buffer, source_sr);
+            let dropped = epoch_dropped.saturating_add(backstop_dropped);
             if dropped > 0 {
                 s.backstop_newest_drops = s.backstop_newest_drops.saturating_add(dropped as u64);
                 let now = mono_now_ns();
                 if now.saturating_sub(s.last_backstop_warn_ns) >= BACKSTOP_WARN_INTERVAL_NS {
+                    let first_rtp = s.buffer.keys().next().copied();
+                    let last_rtp = s.buffer.keys().next_back().copied();
+                    let span = match (first_rtp, last_rtp) {
+                        (Some(f), Some(l)) => Some(l.wrapping_sub(f)),
+                        _ => None,
+                    };
                     warn!(
                         dropped_now = dropped,
                         dropped_total = s.backstop_newest_drops,
-                        "Buffered audio map exceeded backstop; dropped newest frames"
+                        epoch_dropped,
+                        backstop_dropped,
+                        map_len = s.buffer.len(),
+                        first_rtp,
+                        last_rtp,
+                        span_rtp = span,
+                        "Buffered audio map exceeded backstop; dropped packets"
                     );
                     s.last_backstop_warn_ns = now;
                 }
@@ -1284,5 +1333,108 @@ mod tests {
         // Must not block.
         wait_for_map_space(lock, cvar);
         assert!(!state.0.lock().unwrap_or_else(PoisonError::into_inner).stopped);
+    }
+
+    // --- B3: FLUSH / RTP epoch discontinuity ---
+
+    /// Forward multi-billion-tick jump must purge old epoch, not drop thousands of new packets.
+    #[test]
+    fn flush_forward_epoch_jump_keeps_new_epoch() {
+        let source_sr = 44_100u32;
+        let max_span = source_sr.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+        let mut buffer = BTreeMap::new();
+        // Old epoch: ~1400 packets (~32s) of keys near zero.
+        fill_map_packets(&mut buffer, 1400);
+        assert_eq!(buffer.len(), 1400);
+
+        // New epoch after FLUSH re-anchor (multi-billion tick jump).
+        let new_base: u32 = 3_000_000_000;
+        for i in 0..32u32 {
+            buffer.insert(new_base.wrapping_add(i.wrapping_mul(AAC_FRAME_SAMPLES)), vec![i as f32]);
+        }
+        // Pre-fix span backstop would pop_last thousands of times and kill the new epoch.
+        let epoch_dropped = retain_near_rtp_epoch(&mut buffer, new_base, max_span);
+        assert!(
+            epoch_dropped >= 1400,
+            "old epoch must be purged; dropped={epoch_dropped}"
+        );
+        let backstop_dropped = enforce_newest_backstop(&mut buffer, source_sr);
+        assert_eq!(
+            backstop_dropped, 0,
+            "single new-epoch cluster must not trip count/span backstop"
+        );
+        assert!(
+            buffer.len() <= 32,
+            "only new-epoch packets remain; len={}",
+            buffer.len()
+        );
+        assert!(
+            buffer
+                .keys()
+                .all(|&k| rtp_signed_delta(k, new_base).unsigned_abs() <= max_span),
+            "all remaining keys must be near new epoch"
+        );
+    }
+
+    /// Backward multi-billion-tick jump must purge the obsolete high keys.
+    #[test]
+    fn flush_backward_epoch_jump_keeps_new_epoch() {
+        let source_sr = 44_100u32;
+        let max_span = source_sr.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+        let mut buffer = BTreeMap::new();
+        let old_base: u32 = 3_000_000_000;
+        for i in 0..1400u32 {
+            buffer.insert(old_base.wrapping_add(i.wrapping_mul(AAC_FRAME_SAMPLES)), vec![1.0]);
+        }
+        let new_base: u32 = 100_000;
+        for i in 0..16u32 {
+            buffer.insert(new_base.wrapping_add(i.wrapping_mul(AAC_FRAME_SAMPLES)), vec![2.0]);
+        }
+
+        let epoch_dropped = retain_near_rtp_epoch(&mut buffer, new_base, max_span);
+        assert!(epoch_dropped >= 1400, "old high epoch purged; dropped={epoch_dropped}");
+        assert_eq!(enforce_newest_backstop(&mut buffer, source_sr), 0);
+        assert!(
+            buffer
+                .keys()
+                .all(|&k| rtp_signed_delta(k, new_base).unsigned_abs() <= max_span)
+        );
+        assert!(buffer.contains_key(&new_base));
+    }
+
+    /// FLUSH range removal + epoch retain must not leave a multi-epoch span.
+    #[test]
+    fn flush_command_epoch_boundary_no_bulk_backstop() {
+        let source_sr = 44_100u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            // Old keys outside a partial flush range + keys inside range.
+            for i in 0..200u32 {
+                s.buffer.insert(i.wrapping_mul(AAC_FRAME_SAMPLES), vec![i as f32]);
+            }
+            // Simulate command-handler flush of the low range, then epoch retain on until.
+            let from_seq = 0u32;
+            let until_seq = 150u32 * AAC_FRAME_SAMPLES;
+            let keys: Vec<u32> = s
+                .buffer
+                .keys()
+                .filter(|&&ts| rtp_in_flush_range(ts, from_seq, until_seq))
+                .copied()
+                .collect();
+            for k in &keys {
+                s.buffer.remove(k);
+            }
+            let max_span = source_sr.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+            let purged = retain_near_rtp_epoch(&mut s.buffer, until_seq, max_span);
+            // Remaining should be near until_seq (or empty if all far).
+            let dropped = enforce_newest_backstop(&mut s.buffer, source_sr);
+            assert_eq!(dropped, 0, "no multi-thousand backstop after flush epoch retain");
+            assert!(
+                s.buffer.len() < 100,
+                "map must not retain multi-epoch bulk; len={} purged={purged}",
+                s.buffer.len()
+            );
+        }
     }
 }

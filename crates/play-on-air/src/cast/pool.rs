@@ -118,6 +118,61 @@ pub(crate) fn classify_cast_probe_error(err: &rust_cast::errors::Error) -> Probe
   }
 }
 
+/// Process-lifetime class of a Cast control-plane error for a given device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CastFailureClass {
+  /// Retry with backoff; device may recover.
+  Transient,
+  /// Permanent for this process (e.g. peer cert version webpki rejects).
+  Terminal,
+}
+
+/// Classify a pool-level Cast error string for terminal vs transient handling.
+///
+/// Terminal failures hide the AirPlay advertisement and stop reconnect hammering.
+/// Do not switch TLS stacks here (architecture fork).
+#[must_use]
+pub(crate) fn classify_cast_control_error(err: &Error) -> CastFailureClass {
+  classify_cast_control_message(&err.to_string())
+}
+
+/// Pure message classifier (unit-testable without building full [`Error`] variants).
+#[must_use]
+pub(crate) fn classify_cast_control_message(message: &str) -> CastFailureClass {
+  let lower = message.to_ascii_lowercase();
+  // rustls/webpki: `invalid peer certificate: Other(OtherError(UnsupportedCertVersion))`
+  if lower.contains("unsupportedcertversion")
+    || lower.contains("unsupported cert version")
+    || (lower.contains("invalid peer certificate") && lower.contains("certversion"))
+  {
+    CastFailureClass::Terminal
+  } else {
+    CastFailureClass::Transient
+  }
+}
+
+/// After a successful wire LOAD, whether to install `active` or stop the late session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadCommitDecision {
+  /// Caller still waiting; publish session as active.
+  InstallActive,
+  /// Caller timed out / abandoned; stop media and do not keep `active`.
+  AbandonAndStop,
+}
+
+/// Pure decision: late LOAD success must not install worker state if abandoned.
+#[must_use]
+pub(crate) const fn load_commit_decision(abandoned: bool) -> LoadCommitDecision {
+  if abandoned {
+    LoadCommitDecision::AbandonAndStop
+  } else {
+    LoadCommitDecision::InstallActive
+  }
+}
+
+/// Far-future backoff so terminal devices do not reconnect every idle tick.
+const TERMINAL_RECONNECT_HOLD: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Result of one ownership / IDLE policy evaluation (pure; unit-tested).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnershipAction {
@@ -258,9 +313,13 @@ enum CastWorkerCmd {
     port: u16,
   },
   /// Launch Default Media Receiver if needed, LOAD media, return session ids.
+  ///
+  /// `abandoned` is set by the caller when [`COMMAND_TIMEOUT`] elapses so a late
+  /// success cannot install `active` (and must STOP the orphaned media session).
   Load {
     request: MediaLoadRequest,
     reply: SyncSender<Result<ActiveCastSession>>,
+    abandoned: Arc<AtomicBool>,
   },
   /// Set receiver volume on the warm connection.
   SetVolume {
@@ -299,6 +358,8 @@ struct CastWorkerHandle {
   exiting: bool,
   /// Shared with the worker thread: last known Cast control-plane reachability.
   reachable: Arc<AtomicBool>,
+  /// Process-lifetime terminal Cast failure (e.g. `UnsupportedCertVersion`).
+  terminal_failed: Arc<AtomicBool>,
   /// Bridge-initiated end: probes stand down even before the worker drains cmds.
   ownership_stand_down: Arc<AtomicBool>,
 }
@@ -392,6 +453,8 @@ impl CastPool {
     let relay_slot_worker = Arc::clone(&relay_slot);
     let reachable = Arc::new(AtomicBool::new(false));
     let reachable_worker = Arc::clone(&reachable);
+    let terminal_failed = Arc::new(AtomicBool::new(false));
+    let terminal_failed_worker = Arc::clone(&terminal_failed);
     let ownership_stand_down = Arc::new(AtomicBool::new(false));
     let ownership_stand_down_worker = Arc::clone(&ownership_stand_down);
     let thread_name = format!("cast-warm-{}", short_id(&device_id));
@@ -408,6 +471,7 @@ impl CastPool {
           media_recovered,
           relay_slot_worker,
           reachable_worker,
+          terminal_failed_worker,
           ownership_stand_down_worker,
         );
       })
@@ -430,6 +494,7 @@ impl CastPool {
         relay_slot,
         exiting: false,
         reachable,
+        terminal_failed,
         ownership_stand_down,
       },
     ));
@@ -447,6 +512,16 @@ impl CastPool {
     guard
       .get(device_id)
       .is_some_and(|h| !h.exiting && h.reachable.load(Ordering::Relaxed))
+  }
+
+  /// Whether Cast control for `device_id` hit a process-lifetime terminal failure.
+  ///
+  /// Terminal devices must not be advertised as AirPlay sinks and must not be
+  /// hammered by volume-seed / reconnect loops.
+  #[must_use]
+  pub fn is_terminal_failed(&self, device_id: &str) -> bool {
+    let guard = self.workers.lock();
+    guard.get(device_id).is_some_and(|h| h.terminal_failed.load(Ordering::Relaxed))
   }
 
   /// Shut down and remove the worker for `device_id` (device left the network).
@@ -505,18 +580,32 @@ impl CastPool {
   ///
   /// Blocks up to [`COMMAND_TIMEOUT`]. If the warm TCP is dead, the worker tries
   /// reconnect with backoff before failing the command.
+  ///
+  /// On timeout the caller marks the op abandoned: a late worker success must STOP
+  /// the session and must not leave `active` installed (B1).
   pub fn load(&self, device_id: &str, request: MediaLoadRequest) -> Result<ActiveCastSession> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(CastWorkerCmd::Load { request, reply: reply_tx })
-      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    let abandoned = Arc::new(AtomicBool::new(false));
+    tx.send(CastWorkerCmd::Load {
+      request,
+      reply: reply_tx,
+      abandoned: Arc::clone(&abandoned),
+    })
+    .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
     match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
       Ok(result) => result,
-      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!(
-        "warm Cast load timed out after {}s for {device_id}",
-        COMMAND_TIMEOUT.as_secs()
-      ))),
-      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast load reply dropped for {device_id}"))),
+      Err(RecvTimeoutError::Timeout) => {
+        abandoned.store(true, Ordering::Release);
+        Err(Error::Cast(format!(
+          "warm Cast load timed out after {}s for {device_id}",
+          COMMAND_TIMEOUT.as_secs()
+        )))
+      },
+      Err(RecvTimeoutError::Disconnected) => {
+        abandoned.store(true, Ordering::Release);
+        Err(Error::Cast(format!("warm Cast load reply dropped for {device_id}")))
+      },
     }
   }
 
@@ -647,6 +736,10 @@ impl CastPool {
 }
 
 /// Mutable state owned exclusively by the worker thread.
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "worker flags are independent latch bits (reachable/terminal/reload/source-ip log), not a mode machine"
+)]
 struct WorkerState {
   device_id: String,
   host: String,
@@ -684,6 +777,10 @@ struct WorkerState {
   reachable: bool,
   /// Shared with the pool handle for cheap cross-thread reachability probes.
   reachable_flag: Arc<AtomicBool>,
+  /// Process-lifetime terminal failure (shared with pool handle).
+  terminal_flag: Arc<AtomicBool>,
+  /// Local mirror of [`Self::terminal_flag`] for the worker loop.
+  terminal_failed: bool,
   /// Bridge-initiated end: stand ownership probes down before STOP drains.
   ownership_stand_down: Arc<AtomicBool>,
   /// Earliest time to try another reconnect.
@@ -716,6 +813,7 @@ fn worker_main(
   media_recovered: Option<UnboundedSender<String>>,
   relay_slot: SharedRelaySlot,
   reachable_flag: Arc<AtomicBool>,
+  terminal_flag: Arc<AtomicBool>,
   ownership_stand_down: Arc<AtomicBool>,
 ) {
   let now = Instant::now();
@@ -740,6 +838,8 @@ fn worker_main(
     unreachable_since: None,
     reachable: false,
     reachable_flag,
+    terminal_flag,
+    terminal_failed: false,
     ownership_stand_down,
     next_reconnect_at: now,
     last_parse_warn: None,
@@ -815,9 +915,26 @@ fn worker_main(
           }
         }
       },
-      CastWorkerCmd::Load { request, reply } => {
-        let result = state.with_hard_deadline(|s| s.handle_load(&request));
-        drop(reply.send(result));
+      CastWorkerCmd::Load { request, reply, abandoned } => {
+        let load_result = state.with_hard_deadline(|s| s.handle_load(&request, &abandoned));
+        // If the caller already abandoned, never deliver Ok (and ensure no active).
+        let deliver = if abandoned.load(Ordering::Acquire) {
+          if state.active.is_some() {
+            drop(state.with_hard_deadline(WorkerState::handle_stop));
+          }
+          Err(Error::Cast(format!(
+            "warm Cast load abandoned after caller timeout for {}",
+            state.device_id
+          )))
+        } else {
+          load_result
+        };
+        if reply.send(deliver).is_err() {
+          // Reply channel gone: late success must not leave an unacknowledged session.
+          if state.active.is_some() {
+            drop(state.with_hard_deadline(WorkerState::handle_stop));
+          }
+        }
       },
       CastWorkerCmd::SetVolume { level, reply } => {
         let (final_level, replies, next_pending) = coalesce_set_volume(level, reply, &cmd_rx);
@@ -909,6 +1026,9 @@ impl WorkerState {
 
   fn on_idle_tick(&mut self) {
     if self.device.is_none() {
+      if self.terminal_failed {
+        return;
+      }
       if Instant::now() >= self.next_reconnect_at
         && let Err(err) = self.ensure_connected(false)
       {
@@ -1006,6 +1126,12 @@ impl WorkerState {
     if self.device.is_some() {
       return Ok(());
     }
+    if self.terminal_failed {
+      return Err(Error::Cast(format!(
+        "terminal Cast failure for {} (not reconnecting)",
+        self.device_id
+      )));
+    }
     let now = Instant::now();
     if !force && now < self.next_reconnect_at {
       return Err(Error::Cast(format!("reconnect backoff active for {}", self.device_id)));
@@ -1075,23 +1201,36 @@ impl WorkerState {
     let was_unreachable = !self.reachable;
     let attempts = self.reconnect_attempt;
     let downtime = self.unreachable_since.map(|t| t.elapsed());
+    let recovering = downtime.is_some() || attempts > 0;
     self.reachable = true;
     self.reachable_flag.store(true, Ordering::Relaxed);
     self.reconnect_attempt = 0;
     self.unreachable_since = None;
     self.next_reconnect_at = Instant::now();
     if was_unreachable {
-      tracing::info!(
-        device_id = %self.device_id,
-        host = %self.host,
-        attempts,
-        downtime_ms = downtime.map(|d| d.as_millis()),
-        "Cast control plane reachable again"
-      );
+      if recovering {
+        tracing::info!(
+          device_id = %self.device_id,
+          host = %self.host,
+          attempts,
+          downtime_ms = downtime.map(|d| d.as_millis()),
+          "Cast control plane reachable again"
+        );
+      } else {
+        tracing::info!(
+          device_id = %self.device_id,
+          host = %self.host,
+          "Cast control plane reachable"
+        );
+      }
     }
   }
 
   fn note_unreachable(&mut self, err: &Error) {
+    if classify_cast_control_error(err) == CastFailureClass::Terminal {
+      self.mark_terminal_failed(err);
+      return;
+    }
     if self.reachable || self.unreachable_since.is_none() {
       tracing::info!(
         device_id = %self.device_id,
@@ -1116,6 +1255,27 @@ impl WorkerState {
       backoff_ms = delay.as_millis(),
       error = %err,
       "Cast reconnect scheduled"
+    );
+  }
+
+  /// Latch a process-lifetime terminal Cast failure (once) and stop reconnects.
+  fn mark_terminal_failed(&mut self, err: &Error) {
+    self.reachable = false;
+    self.reachable_flag.store(false, Ordering::Relaxed);
+    self.next_reconnect_at = Instant::now() + TERMINAL_RECONNECT_HOLD;
+    if self.terminal_failed {
+      return;
+    }
+    self.terminal_failed = true;
+    self.terminal_flag.store(true, Ordering::Release);
+    if self.unreachable_since.is_none() {
+      self.unreachable_since = Some(Instant::now());
+    }
+    tracing::warn!(
+      device_id = %self.device_id,
+      host = %self.host,
+      error = %err,
+      "Cast control plane terminal failure; will not advertise AirPlay or reconnect"
     );
   }
 
@@ -1360,7 +1520,8 @@ impl WorkerState {
       url = %request.content_url,
       "Cast recoverable IDLE/buffering; attempting internal re-LOAD"
     );
-    match self.handle_load(&request) {
+    let not_abandoned = AtomicBool::new(false);
+    match self.handle_load(&request, &not_abandoned) {
       Ok(_session) => {
         tracing::info!(device_id = %self.device_id, "Cast media recovered via internal re-LOAD");
         if let Some(tx) = &self.media_recovered
@@ -1518,24 +1679,19 @@ impl WorkerState {
     }
   }
 
-  fn handle_load(&mut self, request: &MediaLoadRequest) -> Result<ActiveCastSession> {
+  fn handle_load(&mut self, request: &MediaLoadRequest, abandoned: &AtomicBool) -> Result<ActiveCastSession> {
     self.last_load = Some(request.clone());
     self.last_load_at = Some(Instant::now());
     let media = request.to_media();
     match self.load_once(&media) {
-      Ok(session) => {
-        self.set_active_session(session.clone());
-        tracing::info!(
-          host = %self.host,
-          device_id = %self.device_id,
-          transport_id = %session.transport_id,
-          media_session_id = session.media_session_id,
-          url = %media.content_id,
-          "warm Cast load"
-        );
-        Ok(session)
-      },
+      Ok(session) => self.commit_load_session(session, &media.content_id, abandoned),
       Err(err) => {
+        if abandoned.load(Ordering::Acquire) {
+          return Err(Error::Cast(format!(
+            "warm Cast load abandoned after caller timeout for {}",
+            self.device_id
+          )));
+        }
         tracing::warn!(
           device_id = %self.device_id,
           host = %self.host,
@@ -1556,6 +1712,12 @@ impl WorkerState {
           );
           return Err(err);
         }
+        if abandoned.load(Ordering::Acquire) {
+          return Err(Error::Cast(format!(
+            "warm Cast load abandoned after caller timeout for {}",
+            self.device_id
+          )));
+        }
         let session = self.load_once(&media).map_err(|retry_err| {
           tracing::warn!(
             device_id = %self.device_id,
@@ -1564,17 +1726,71 @@ impl WorkerState {
           );
           retry_err
         })?;
+        self.commit_load_session(session, &media.content_id, abandoned)
+      },
+    }
+  }
+
+  /// Install `active` only when the caller has not abandoned; otherwise STOP late media.
+  fn commit_load_session(
+    &mut self,
+    session: ActiveCastSession,
+    content_url: &str,
+    abandoned: &AtomicBool,
+  ) -> Result<ActiveCastSession> {
+    match load_commit_decision(abandoned.load(Ordering::Acquire)) {
+      LoadCommitDecision::AbandonAndStop => {
+        self.stop_late_load_session(&session);
+        Err(Error::Cast(format!(
+          "warm Cast load abandoned after caller timeout for {}",
+          self.device_id
+        )))
+      },
+      LoadCommitDecision::InstallActive => {
         self.set_active_session(session.clone());
+        // TOCTOU: caller may have timed out between the check and install.
+        if abandoned.load(Ordering::Acquire) {
+          tracing::info!(
+            device_id = %self.device_id,
+            transport_id = %session.transport_id,
+            media_session_id = session.media_session_id,
+            "warm Cast load abandoned after install; stopping late session"
+          );
+          drop(self.handle_stop());
+          return Err(Error::Cast(format!(
+            "warm Cast load abandoned after caller timeout for {}",
+            self.device_id
+          )));
+        }
         tracing::info!(
           host = %self.host,
           device_id = %self.device_id,
           transport_id = %session.transport_id,
           media_session_id = session.media_session_id,
-          url = %media.content_id,
+          url = %content_url,
           "warm Cast load"
         );
         Ok(session)
       },
+    }
+  }
+
+  /// Best-effort STOP for a session that never became acknowledged `active`.
+  fn stop_late_load_session(&mut self, session: &ActiveCastSession) {
+    tracing::info!(
+      device_id = %self.device_id,
+      transport_id = %session.transport_id,
+      media_session_id = session.media_session_id,
+      "warm Cast load abandoned after caller timeout; stopping late session"
+    );
+    // Route through handle_stop so ownership state stays consistent.
+    self.active = Some(session.clone());
+    if let Err(err) = self.handle_stop() {
+      tracing::debug!(
+        device_id = %self.device_id,
+        error = %err,
+        "late abandoned LOAD STOP failed"
+      );
     }
   }
 
@@ -2164,6 +2380,7 @@ mod tests {
           relay_slot: Arc::new(StdMutex::new(None)),
           exiting: true,
           reachable: Arc::new(AtomicBool::new(true)),
+          terminal_failed: Arc::new(AtomicBool::new(false)),
           ownership_stand_down: Arc::new(AtomicBool::new(false)),
         },
       ));
@@ -2303,6 +2520,7 @@ mod tests {
           relay_slot: Arc::new(StdMutex::new(None)),
           exiting: true,
           reachable: Arc::new(AtomicBool::new(false)),
+          terminal_failed: Arc::new(AtomicBool::new(false)),
           ownership_stand_down: Arc::new(AtomicBool::new(false)),
         },
       ));
@@ -2508,5 +2726,62 @@ mod tests {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let pool = CastPool::new(None).with_media_recovered(tx);
     assert!(format!("{pool:?}").contains("media_recovered_watch: true"));
+  }
+
+  // --- B1: late LOAD abandon must not install active ---
+
+  #[test]
+  fn load_commit_installs_when_not_abandoned() {
+    assert_eq!(load_commit_decision(false), LoadCommitDecision::InstallActive);
+  }
+
+  #[test]
+  fn load_commit_abandons_and_stops_when_caller_timed_out() {
+    assert_eq!(load_commit_decision(true), LoadCommitDecision::AbandonAndStop);
+  }
+
+  #[test]
+  fn late_success_after_abandon_must_not_keep_active() {
+    // Models the worker post-load check: abandoned means stop, never treat as success.
+    let abandoned = true;
+    assert!(matches!(load_commit_decision(abandoned), LoadCommitDecision::AbandonAndStop));
+    // Caller timeout sets the flag; a late wire success must take the abandon path.
+    let flag = AtomicBool::new(false);
+    flag.store(true, Ordering::Release);
+    assert_eq!(
+      load_commit_decision(flag.load(Ordering::Acquire)),
+      LoadCommitDecision::AbandonAndStop
+    );
+  }
+
+  // --- B4: terminal Cast cert failures ---
+
+  #[test]
+  fn unsupported_cert_version_is_terminal() {
+    let msg = "connect 192.168.1.206:8009 (via local relay 127.0.0.1:9): \
+      invalid peer certificate: Other(OtherError(UnsupportedCertVersion))";
+    assert_eq!(classify_cast_control_message(msg), CastFailureClass::Terminal);
+    assert_eq!(
+      classify_cast_control_error(&Error::Cast(msg.to_owned())),
+      CastFailureClass::Terminal
+    );
+  }
+
+  #[test]
+  fn transport_timeout_is_transient() {
+    assert_eq!(
+      classify_cast_control_message("warm Cast load timed out after 6s for abc"),
+      CastFailureClass::Transient
+    );
+    assert_eq!(
+      classify_cast_control_message("connect 192.168.1.1:8009: connection refused"),
+      CastFailureClass::Transient
+    );
+  }
+
+  #[test]
+  fn is_terminal_failed_false_without_worker() {
+    let pool = CastPool::new(None);
+    assert!(!pool.is_terminal_failed("no-such-device"));
   }
 }

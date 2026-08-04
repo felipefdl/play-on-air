@@ -38,7 +38,7 @@ Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/felipefdl/play-on-air:0.2.2` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:0.2.3` | Version tag (matches app `config.yaml` / Cargo package version) |
 | `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
 | `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
 
@@ -50,7 +50,7 @@ Standalone run (host network required for mDNS):
 docker run --rm --network host \
   -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
   -v "$PWD/config:/config" \
-  ghcr.io/felipefdl/play-on-air:0.2.2
+  ghcr.io/felipefdl/play-on-air:0.2.3
 ```
 
 Without Home Assistant options (`/data/options.json`), the entrypoint starts the binary with product defaults (and any existing file at `PLAY_ON_AIR_CONFIG`).

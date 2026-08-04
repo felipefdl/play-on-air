@@ -176,11 +176,23 @@ pub(crate) async fn spawn_ptp_sink() -> Vec<tokio::task::AbortHandle> {
                 });
                 handles.push(join.abort_handle());
             }
-            Err(e) => tracing::warn!(
-                port,
-                error = %e,
-                "PTP sink: cannot bind (ports <1024 may need sudo / setcap CAP_NET_BIND_SERVICE)"
-            ),
+            Err(e) => {
+                // Another RAOP receiver (or a global PTP sink) already owns 319/320 —
+                // expected when multiple devices are advertised; not a sudo issue.
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    tracing::debug!(
+                        port,
+                        error = %e,
+                        "PTP sink already bound (another sink or global PTP active)"
+                    );
+                } else {
+                    tracing::warn!(
+                        port,
+                        error = %e,
+                        "PTP sink: cannot bind (ports <1024 may need sudo / setcap CAP_NET_BIND_SERVICE)"
+                    );
+                }
+            }
         }
     }
     if !handles.is_empty() {
