@@ -30,19 +30,17 @@ In the app UI you can set:
 - **Log level:** `info` by default (`trace` / `debug` / `info` / `warn` / `error`)
 - **Devices:** optional list to **rename** or **hide** Chromecasts in the AirPlay picker
 
-**Optional rename / hide** list stays empty for normal use (Chromecasts are discovered automatically — you do not register devices there). Configuration regenerates in-container TOML on each start. Full field reference: [play-on-air/DOCS.md](play-on-air/DOCS.md).
-
-Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.png`. Specs: [play-on-air/ASSETS.md](play-on-air/ASSETS.md).
+**Optional rename / hide** list stays empty for normal use (Chromecasts are discovered automatically — you do not register devices there). Full field reference: [play-on-air/DOCS.md](play-on-air/DOCS.md).
 
 ## Container image
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/felipefdl/play-on-air:0.2.3` | Version tag (matches app `config.yaml` / Cargo package version) |
+| `ghcr.io/felipefdl/play-on-air:0.2.3` | Version tag |
 | `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
 | `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
 
-Architectures: `linux/amd64`, `linux/arm64` (HA arch names `amd64`, `aarch64`).
+Architectures: `linux/amd64`, `linux/arm64`.
 
 Standalone run (host network required for mDNS):
 
@@ -52,8 +50,6 @@ docker run --rm --network host \
   -v "$PWD/config:/config" \
   ghcr.io/felipefdl/play-on-air:0.2.3
 ```
-
-Without Home Assistant options (`/data/options.json`), the entrypoint starts the binary with product defaults (and any existing file at `PLAY_ON_AIR_CONFIG`).
 
 ---
 
