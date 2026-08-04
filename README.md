@@ -9,8 +9,6 @@ Chromecast devices as AirPlay 2 speakers on the local network.
 
 PlayOnAir discovers Google Cast devices, exposes each as an **AirPlay 2** receiver, and bridges audio from iPhone, iPad, or Mac to the matching Chromecast. One process on your LAN. No accounts, no cloud, no telemetry.
 
-See [VISION.md](VISION.md) for product intent and non-goals. License: [LICENSE.md](LICENSE.md) (project MIT; vendored AirPlay stack LGPL-3.0-or-later).
-
 ---
 
 ## Home Assistant OS
