@@ -13,7 +13,7 @@ See [VISION.md](VISION.md) for product intent and non-goals. License: [LICENSE.m
 
 ---
 
-## Home Assistant OS (recommended)
+## Home Assistant OS
 
 1. **Settings → Add-ons → Add-on store → ⋮ → Repositories**
 2. Add `https://github.com/felipefdl/play-on-air`
@@ -34,7 +34,7 @@ In the app UI you can set:
 
 Store icon/logo files (when present): `play-on-air/icon.png`, `play-on-air/logo.png`. Specs: [play-on-air/ASSETS.md](play-on-air/ASSETS.md).
 
-### Container image
+## Container image
 
 | Image | Notes |
 |-------|--------|
