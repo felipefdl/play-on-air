@@ -6,62 +6,32 @@
 use crate::error::NetworkError;
 use crate::util;
 
-// --- AP1 mDNS TXT record constants ---
+// --- `_raop._tcp` TXT record constants ---
 
-/// TXT record version.
-pub(crate) const RAOP_TXTVERS: &str = "1";
-/// Audio channels.
-pub(crate) const RAOP_CH: &str = "2";
 /// Codecs: 0=PCM, 1=ALAC.
 pub(crate) const RAOP_CN: &str = "0,1";
-/// Encryption types: 0=none, 1=RSA.
-pub(crate) const RAOP_ET: &str = "0,1";
-/// Server version flag.
-pub(crate) const RAOP_SV: &str = "false";
 /// Digest auth supported.
 pub(crate) const RAOP_DA: &str = "true";
-/// Sample rate.
-pub(crate) const RAOP_SR: &str = "44100";
-/// Sample size (bits).
-pub(crate) const RAOP_SS: &str = "16";
-/// Protocol version.
-pub(crate) const RAOP_VN: &str = "3";
 /// Transport protocols.
 pub(crate) const RAOP_TP: &str = "TCP,UDP";
 /// Metadata types: 0=text, 1=artwork, 2=progress.
 pub(crate) const RAOP_MD: &str = "0,1,2";
-/// System managed.
-pub(crate) const RAOP_SM: &str = "false";
-/// Encryption key type.
-pub(crate) const RAOP_EK: &str = "1";
-/// AP2 encryption types advertised in `_raop` TXT (0=none, 3/5=FairPlay).
-#[cfg(feature = "ap2")]
-pub(crate) const RAOP_AP2_ET: &str = "0,3,5";
-/// AP2 `_raop` protocol version (65537 = 0x10001).
-#[cfg(feature = "ap2")]
-pub(crate) const RAOP_AP2_VN: &str = "65537";
+/// Encryption types advertised in `_raop` TXT (0=none, 3/5=FairPlay).
+pub(crate) const RAOP_ET: &str = "0,3,5";
+/// `_raop` protocol version (65537 = 0x10001).
+pub(crate) const RAOP_VN: &str = "65537";
 
-/// Global feature bitmask for AP1 discovery.
-pub(crate) const GLOBAL_FEATURES: u32 = 0x7;
-/// Device model identifier.
+// --- Shared AirPlay 2 TXT record constants ---
+
 /// Device model identifier.
 pub(crate) const GLOBAL_MODEL: &str = crate::raop::config::GLOBAL_MODEL;
-/// Software version string.
-pub(crate) const GLOBAL_VERSION: &str = "130.14";
-
-// --- AP2 mDNS TXT record constants ---
-
 /// Source version string.
-#[cfg(feature = "ap2")]
 pub(crate) const AP2_SRCVERS: &str = crate::raop::config::AP2_SRCVERS;
 /// OS version string.
-#[cfg(feature = "ap2")]
 pub(crate) const AP2_OSVERS: &str = "15.6";
 /// Firmware version string.
-#[cfg(feature = "ap2")]
 pub(crate) const AP2_FW_VERSION: &str = "77.40.00";
 /// Protocol version string.
-#[cfg(feature = "ap2")]
 pub(crate) const AP2_PROTOVERS: &str = crate::raop::config::AP2_PROTOVERS;
 
 /// mDNS service information for AirPlay network discovery.
@@ -80,50 +50,10 @@ pub struct AirPlayServiceInfo {
 }
 
 impl AirPlayServiceInfo {
-    /// Create AP1 service info for mDNS registration.
-    pub fn new(name: &str, port: u16, hwaddr: &[u8], password: bool) -> Self {
-        let hw_raop = util::hwaddr_raop(hwaddr);
-        let hw_airplay = util::hwaddr_airplay(hwaddr);
-        let raop_name = format!("{hw_raop}@{name}");
-
-        let raop_txt = vec![
-            ("txtvers".into(), RAOP_TXTVERS.into()),
-            ("ch".into(), RAOP_CH.into()),
-            ("cn".into(), RAOP_CN.into()),
-            ("et".into(), RAOP_ET.into()),
-            ("sv".into(), RAOP_SV.into()),
-            ("da".into(), RAOP_DA.into()),
-            ("sr".into(), RAOP_SR.into()),
-            ("ss".into(), RAOP_SS.into()),
-            ("pw".into(), (if password { "true" } else { "false" }).into()),
-            ("vn".into(), RAOP_VN.into()),
-            ("tp".into(), RAOP_TP.into()),
-            ("md".into(), RAOP_MD.into()),
-            ("vs".into(), GLOBAL_VERSION.into()),
-            ("sm".into(), RAOP_SM.into()),
-            ("ek".into(), RAOP_EK.into()),
-        ];
-
-        let airplay_txt = vec![
-            ("deviceid".into(), hw_airplay),
-            ("features".into(), format!("0x{GLOBAL_FEATURES:x}")),
-            ("model".into(), GLOBAL_MODEL.into()),
-        ];
-
-        Self {
-            raop_name,
-            airplay_name: name.to_string(),
-            port,
-            raop_txt,
-            airplay_txt,
-        }
-    }
-
-    /// Create AP2 service info with full AirPlay 2 feature flags.
+    /// Create AirPlay 2 service info (`_raop._tcp` + `_airplay._tcp` TXT records).
     /// `pk_hex` is the hex-encoded Ed25519 public key, `pi` is the pairing identifier (UUID).
-    #[cfg(feature = "ap2")]
     #[allow(clippy::too_many_arguments)]
-    pub fn new_airplay2(
+    pub fn new(
         name: &str,
         port: u16,
         hwaddr: &[u8],
@@ -144,10 +74,10 @@ impl AirPlayServiceInfo {
         let status_flags = crate::raop::config::ap2_status_flags(requires_pin_pairing, already_paired);
 
         let raop_txt = vec![
-            // AP1 compatibility fields (allows classic AirPlay fallback)
+            // Base RAOP fields AirPlay 2 receivers still publish (shairport-sync parity)
             ("cn".into(), RAOP_CN.into()),
             ("da".into(), RAOP_DA.into()),
-            ("et".into(), RAOP_AP2_ET.into()),
+            ("et".into(), RAOP_ET.into()),
             ("pw".into(), (if password { "true" } else { "false" }).into()),
             // AP2 fields
             ("ft".into(), ft.clone()),
@@ -156,8 +86,8 @@ impl AirPlayServiceInfo {
             ("md".into(), RAOP_MD.into()),
             ("am".into(), GLOBAL_MODEL.into()),
             ("pk".into(), pk_hex.into()),
-            ("tp".into(), RAOP_TP.into()), // TCP for AP1 fallback, UDP for AP2
-            ("vn".into(), RAOP_AP2_VN.into()),
+            ("tp".into(), RAOP_TP.into()),
+            ("vn".into(), RAOP_VN.into()),
             ("vs".into(), AP2_SRCVERS.into()),
             ("ov".into(), AP2_OSVERS.into()),
         ];
@@ -231,7 +161,6 @@ impl MdnsService {
     }
 
     /// Register the _airplay._tcp mDNS service.
-    #[cfg(feature = "ap2")]
     pub(crate) fn register_airplay(&mut self, info: &AirPlayServiceInfo) -> Result<(), NetworkError> {
         let reg = astro_dnssd::DNSServiceBuilder::new("_airplay._tcp", info.port)
             .with_name(&info.airplay_name)
@@ -304,7 +233,6 @@ impl MdnsService {
     }
 
     /// Register the _airplay._tcp mDNS service.
-    #[cfg(feature = "ap2")]
     pub(crate) fn register_airplay(&mut self, info: &AirPlayServiceInfo) -> Result<(), NetworkError> {
         let svc = mdns_sd::ServiceInfo::new(
             "_airplay._tcp.local.",
@@ -348,13 +276,13 @@ impl Drop for MdnsService {
     }
 }
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn ap2_raop_txt_has_required_fields() {
-        let info = AirPlayServiceInfo::new_airplay2(
+        let info = AirPlayServiceInfo::new(
             "Test Speaker",
             7000,
             &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -368,8 +296,8 @@ mod tests {
         let find = |key: &str| info.raop_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
 
         // AP2 _raop._tcp must have these fields (matching shairport-sync)
-        assert_eq!(find("vn"), Some("65537")); // AP2 version, not "3"
-        assert_eq!(find("tp"), Some("TCP,UDP")); // TCP for AP1 fallback, UDP for AP2
+        assert_eq!(find("vn"), Some("65537"));
+        assert_eq!(find("tp"), Some("TCP,UDP"));
         assert!(find("ft").unwrap().contains(",")); // features has hi,lo
         assert!(find("pk").is_some()); // Ed25519 public key
         assert!(find("sf").is_some()); // status flags
@@ -380,7 +308,7 @@ mod tests {
 
     #[test]
     fn ap2_airplay_txt_has_required_fields() {
-        let info = AirPlayServiceInfo::new_airplay2(
+        let info = AirPlayServiceInfo::new(
             "Test Speaker",
             7000,
             &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -408,7 +336,7 @@ mod tests {
 
     #[test]
     fn ap2_raop_name_format() {
-        let info = AirPlayServiceInfo::new_airplay2(
+        let info = AirPlayServiceInfo::new(
             "My Speaker",
             5000,
             &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
@@ -425,7 +353,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "video"))]
     fn ap2_pin_pairing_txt_changes_features_and_flags() {
-        let info = AirPlayServiceInfo::new_airplay2(
+        let info = AirPlayServiceInfo::new(
             "Test Speaker",
             7000,
             &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -447,7 +375,7 @@ mod tests {
     #[test]
     #[cfg(feature = "video")]
     fn ap2_pin_pairing_txt_changes_flags_with_video_features() {
-        let info = AirPlayServiceInfo::new_airplay2(
+        let info = AirPlayServiceInfo::new(
             "Test Speaker",
             7000,
             &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],

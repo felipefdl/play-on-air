@@ -1,20 +1,13 @@
 //! Per-connection state and RTSP request handling.
 
-use super::MAX_NONCE_LEN;
-use super::handlers_ap1 as handlers;
+use super::handlers;
 use super::rtsp;
 use super::types::*;
-use crate::crypto::fairplay::FairPlay;
-use crate::crypto::pairing::Pairing;
-use crate::crypto::rsa::RsaKey;
 use crate::net::server::{ConnectionHandler, HttpdCallbacks};
-use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
-#[cfg(feature = "ap2")]
 use std::sync::PoisonError;
-#[cfg(feature = "ap2")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimum AirPlay volume in dB (`GET_PARAMETER` / `SET_PARAMETER`). Mute floor.
@@ -22,23 +15,17 @@ pub(crate) const AIRPLAY_VOLUME_DB_MIN: f32 = -144.0;
 
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
-    pub(crate) rsakey: Arc<RsaKey>,
-    pub(crate) pairing: Arc<Pairing>,
     pub(crate) hwaddr: Vec<u8>,
     pub(crate) password: String,
     pub(crate) handler: Arc<dyn AudioHandler>,
-    #[cfg(feature = "ap2")]
     pub(crate) pairing_store: Arc<dyn PairingStore>,
     /// Accessory's long-term Ed25519 identity seed (random, persisted via the store).
-    #[cfg(feature = "ap2")]
     pub(crate) identity_seed: [u8; 32],
     pub(crate) output_sample_rate: Option<u32>,
-    /// Only consulted by the AP2 mixdown path; dead in AP1-only builds.
-    #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+    /// Channel cap for the mixdown path (`None` = pass through).
     pub(crate) output_max_channels: Option<u8>,
     /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
     pub(crate) audio_latency_samples: u32,
-    #[cfg(feature = "ap2")]
     pub(crate) pin: Option<String>,
     #[cfg(feature = "video")]
     pub(crate) video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
@@ -47,12 +34,9 @@ pub(crate) struct RaopShared {
     pub(crate) video_ekey: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
     #[cfg(feature = "video")]
     pub(crate) video_eiv: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
-    #[cfg(feature = "ap2")]
     pub(crate) pairing_id: String,
     /// Accessory device id (`hwaddr_airplay(hwaddr)`), computed once at build.
-    #[cfg(feature = "ap2")]
     pub(crate) device_id: String,
-    #[cfg(feature = "ap2")]
     pub(crate) airplay_name: String,
     /// Stop-handle for the currently-active audio session, owned by a connection
     /// id. iOS opens parallel connections (Happy Eyeballs) and switches between
@@ -61,15 +45,12 @@ pub(crate) struct RaopShared {
     ///
     /// TEARDOWN of a non-owner connection must not clear this slot (see
     /// [`Self::stop_connection_sessions`]).
-    #[cfg(feature = "ap2")]
     pub(crate) active_audio: std::sync::Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>>,
     /// Detached AP2 tasks (event channel, buffered audio accept, RC data, …).
     /// Dual-tracked with per-connection lists; aborted globally on
     /// [`Self::hard_stop_sessions`] (server stop / Cast-steal kick).
-    #[cfg(feature = "ap2")]
     pub(crate) session_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     /// Monotonic connection ids assigned at [`HttpdCallbacks::conn_init`].
-    #[cfg(feature = "ap2")]
     pub(crate) next_connection_id: AtomicU64,
     #[cfg(feature = "hls")]
     pub(crate) hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
@@ -80,7 +61,6 @@ pub(crate) struct RaopShared {
     pub(crate) reported_volume_db: std::sync::Mutex<f32>,
 }
 
-#[cfg(feature = "ap2")]
 impl RaopShared {
     /// Register a newly-started audio session owned by `owner_id`, stopping the
     /// previous one so only the latest connection's playout feeds the output.
@@ -148,61 +128,15 @@ impl RaopShared {
 
 impl HttpdCallbacks for RaopShared {
     fn conn_init(self: Arc<Self>, local: SocketAddr, remote: SocketAddr) -> Option<Box<dyn ConnectionHandler>> {
-        let local_bytes = match local.ip() {
-            std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
-            std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
-        };
-        let remote_bytes = match remote.ip() {
-            std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
-            std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
-        };
-
-        #[cfg(feature = "ap2")]
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
-
-        let conn = handlers::RaopConnection {
-            raop_rtp: None,
-            fairplay: FairPlay::new(),
-            pairing: self.pairing.create_session(),
-            local_addr: local_bytes,
-            remote_addr: remote_bytes,
-            remote_socket: remote,
-            nonce: digest::generate_nonce(MAX_NONCE_LEN),
-            #[cfg(feature = "ap2")]
-            connection_id,
-            #[cfg(feature = "ap2")]
-            session_tasks: Vec::new(),
-            #[cfg(feature = "ap2")]
-            srp_server: None,
-            #[cfg(feature = "ap2")]
-            pair_verify: None,
-            #[cfg(feature = "ap2")]
-            ap2_shared_secret: None,
-            #[cfg(feature = "ap2")]
-            pair_verify_secret: None,
-            #[cfg(feature = "ap2")]
-            is_ap2: false,
-            #[cfg(feature = "ap2")]
-            playout_cmd: None,
-            #[cfg(feature = "ap2")]
-            event_sender: None,
-            #[cfg(feature = "video")]
-            ekey: None,
-            #[cfg(feature = "video")]
-            eiv: None,
-            #[cfg(feature = "hls")]
-            hls_state: crate::raop::hls::HlsState::new(),
-            shared: self.clone(),
-        };
+        let conn = handlers::RaopConnection::new(self, connection_id, local, remote);
         let remote_str = remote.ip().to_string();
         conn.shared.handler.on_client_connected(&remote_str);
         Some(Box::new(RaopConnectionHandler {
             conn,
             remote_addr: remote_str,
             connected_at: std::time::Instant::now(),
-            #[cfg(feature = "ap2")]
             cipher: None,
-            #[cfg(feature = "ap2")]
             pending_secret: None,
         }))
     }
@@ -212,11 +146,9 @@ struct RaopConnectionHandler {
     conn: handlers::RaopConnection,
     remote_addr: String,
     /// Connection-start instant, used to log per-request elapsed time for
-    /// connect-latency diagnostics (AP2 PTP-sync wait vs AP1 fast path).
+    /// connect-latency diagnostics (AP2 PTP-sync wait).
     connected_at: std::time::Instant,
-    #[cfg(feature = "ap2")]
     cipher: Option<crate::crypto::chacha_transport::EncryptedChannel>,
-    #[cfg(feature = "ap2")]
     pending_secret: Option<Vec<u8>>,
 }
 
@@ -242,7 +174,6 @@ impl ConnectionHandler for RaopConnectionHandler {
         let resp = rtsp::dispatch(&mut self.conn, request);
 
         // Queue encryption activation for AFTER this response is sent
-        #[cfg(feature = "ap2")]
         if self.cipher.is_none()
             && let Some(secret) = &self.conn.ap2_shared_secret
         {
@@ -253,18 +184,10 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 
     fn is_encrypted(&self) -> bool {
-        #[cfg(feature = "ap2")]
-        {
-            self.cipher.is_some()
-        }
-        #[cfg(not(feature = "ap2"))]
-        {
-            false
-        }
+        self.cipher.is_some()
     }
 
     fn after_response(&mut self) {
-        #[cfg(feature = "ap2")]
         if self.cipher.is_none()
             && let Some(secret) = self.pending_secret.take()
         {
@@ -280,7 +203,6 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 
     fn decrypt_incoming(&mut self, data: &[u8]) -> Option<(Vec<u8>, usize)> {
-        #[cfg(feature = "ap2")]
         if let Some(ch) = &mut self.cipher {
             return ch.decrypt_ctx.decrypt(data).ok();
         }
@@ -288,7 +210,6 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 
     fn encrypt_outgoing(&mut self, data: &[u8]) -> Vec<u8> {
-        #[cfg(feature = "ap2")]
         if let Some(ch) = &mut self.cipher {
             // Once the channel is encrypted the peer expects ciphertext; never
             // fall back to emitting plaintext (which would leak the response and
@@ -303,13 +224,40 @@ impl ConnectionHandler for RaopConnectionHandler {
     }
 }
 
-// On drop, RTP session is cleaned up automatically (RaopRtp dropped → shutdown sent)
+/// Minimal [`RaopShared`] for unit tests (in-memory pairing store, no PIN).
+#[cfg(test)]
+pub(crate) fn test_shared(handler: Arc<dyn AudioHandler>) -> Arc<RaopShared> {
+    Arc::new(RaopShared {
+        hwaddr: vec![0u8; 6],
+        password: String::new(),
+        handler,
+        pairing_store: Arc::new(crate::raop::types::MemoryPairingStore::default()),
+        identity_seed: [0u8; 32],
+        output_sample_rate: None,
+        output_max_channels: None,
+        audio_latency_samples: crate::raop::server::DEFAULT_AUDIO_LATENCY_SAMPLES,
+        pin: None,
+        #[cfg(feature = "video")]
+        video_handler: None,
+        #[cfg(feature = "video")]
+        video_ekey: Arc::new(std::sync::RwLock::new(None)),
+        #[cfg(feature = "video")]
+        video_eiv: Arc::new(std::sync::RwLock::new(None)),
+        pairing_id: String::new(),
+        device_id: String::new(),
+        airplay_name: String::new(),
+        active_audio: std::sync::Mutex::new(None),
+        session_tasks: std::sync::Mutex::new(Vec::new()),
+        next_connection_id: AtomicU64::new(1),
+        #[cfg(feature = "hls")]
+        hls_handler: None,
+        reported_volume_db: std::sync::Mutex::new(0.0),
+    })
+}
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::pairing::Pairing;
-    use crate::crypto::rsa::RsaKey;
     use crate::raop::{AudioFormat, AudioHandler, AudioSession};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -328,26 +276,7 @@ mod tests {
     }
 
     fn test_shared() -> Arc<RaopShared> {
-        Arc::new(RaopShared {
-            rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
-            pairing: Arc::new(Pairing::generate().unwrap()),
-            hwaddr: vec![0u8; 6],
-            password: String::new(),
-            handler: Arc::new(NoopHandler),
-            pairing_store: Arc::new(crate::raop::types::MemoryPairingStore::default()),
-            identity_seed: [0u8; 32],
-            output_sample_rate: None,
-            output_max_channels: None,
-            audio_latency_samples: crate::raop::server::DEFAULT_AUDIO_LATENCY_SAMPLES,
-            pin: None,
-            pairing_id: String::new(),
-            device_id: String::new(),
-            airplay_name: String::new(),
-            active_audio: std::sync::Mutex::new(None),
-            session_tasks: std::sync::Mutex::new(Vec::new()),
-            next_connection_id: AtomicU64::new(1),
-            reported_volume_db: std::sync::Mutex::new(0.0),
-        })
+        super::test_shared(Arc::new(NoopHandler))
     }
 
     /// TEARDOWN of connection A must not stop audio owned by connection B.

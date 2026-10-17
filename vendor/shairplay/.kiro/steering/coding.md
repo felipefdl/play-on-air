@@ -33,7 +33,7 @@
 
 ## Testing
 
-- All feature combos must pass: `default`, `ap2`, `video`, `hls`
+- All feature combos must pass: `default`, `video`, `hls`
 - C-verified test vectors for crypto (pair_ap, shairplay C source)
 - DMAP parser has fuzz-style tests (empty, truncated, corrupt length)
 - Integration tests skip mDNS when `CI` env var is set

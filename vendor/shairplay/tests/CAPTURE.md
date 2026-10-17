@@ -34,40 +34,15 @@ exactly where a byte mismatch breaks interop. This file lists, per gap, *what* t
 
 ## Priority gaps
 
-### 1. `RsaKey::sign_challenge` — AP1 Apple-Response 🟢 (reproducible)
-Signs `challenge ‖ ip ‖ hwaddr` (zero-padded to 32 B) with PKCS#1 v1.5, **no** hash-OID prefix —
-deterministic for a fixed key, so OpenSSL is an independent oracle.
-
-```sh
-# data = challenge_bytes || ip || hwaddr, zero-padded to 32 bytes (see sign_challenge)
-printf '<32 raw bytes>' > data.bin
-openssl pkeyutl -sign -inkey airport.key -pkeyopt rsa_padding_mode:pkcs1 -in data.bin \
-  | base64 -w0       # -> expected Apple-Response (unpadded base64)
-```
-Test: `sign_challenge(b64_challenge, ip, hwaddr)` == that base64. Pin one vector with a fixed
-challenge/ip/hwaddr.
-
-### 2. `RsaKey::decrypt` — rsaaeskey OAEP-SHA1 🟢 (reproducible)
-RSA-OAEP(SHA-1) decrypt that recovers the AP1 audio AES key. Build the input by encrypting a known
-16-byte key with the airport **public** key:
-
-```sh
-openssl rsa -in airport.key -pubout -out airport.pub
-printf '<16 known AES key bytes>' > aeskey.bin
-openssl pkeyutl -encrypt -pubin -inkey airport.pub \
-  -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha1 -in aeskey.bin | base64 -w0  # -> rsaaeskey
-```
-Test: `decrypt(rsaaeskey_b64)` == the 16 known bytes.
-
-### 3. FairPlay key recovery — `FairPlay::decrypt` / `playfair_decrypt` 📱 / 🔧 (highest value)
+### 3. FairPlay key recovery — `FairPlay::decrypt` / `playfair_decrypt` 📱 / 🔧 (`video` only)
 The whole DRM is currently pinned only to the port's own output on **fabricated** inputs. One real
 `(keymsg_164B, ekey_72B) → aes_key_16B` triple anchors the entire pipeline (modified_md5, garble,
 cycle, session-key, S-box tables).
 
 - **📱 easiest, given your setup:** add `trace!` of the M2 `keymsg` (in `FairPlay::handshake`), the
-  ANNOUNCE `ekey` (the 72-byte FairPlay-encrypted key), and the recovered `aes_key` (out of
-  `FairPlay::decrypt`). Play audio from a real iPhone; if it **plays correctly**, the recovered key
-  is provably right (the audio is AES-encrypted under it). Save the three hex blobs to
+  screen-mirroring SETUP `ekey` (the 72-byte FairPlay-encrypted key), and the recovered `aes_key`
+  (out of `FairPlay::decrypt`, `video` feature). Mirror from a real iPhone; if the legacy audio
+  **plays correctly**, the recovered key is provably right (the audio is AES-encrypted under it). Save the three hex blobs to
   `tests/data/fairplay/ios_session.txt`.
 - **🔧 most faithful:** instrument C `shairplay` `playfair_decrypt()` (`src/lib/playfair/`) to printf
   `message3`, `cipher_text`, and the output `key`, then run any fp-setup.
@@ -111,6 +86,6 @@ Test each direction's derived key == expected; guards against a swapped read/wri
 
 ## Suggested order
 
-1–2 and 6 are **🟢 do-now** (OpenSSL, no device). 3 and 5 are the **highest-value 📱 captures** and
-cheap given a working iPhone — one fp-setup + one pairing session covers both. The rest are
+6 is **🟢 do-now** (no device). 5 is the **highest-value 📱 capture** for the AirPlay 2 audio path;
+3 matters only with the `video` feature. The rest are
 nice-to-have per feature in use.

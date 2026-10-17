@@ -184,7 +184,7 @@ mod tests {
 
 // --- Channel mixdown tests ---
 
-#[cfg(all(test, feature = "ap2"))]
+#[cfg(test)]
 mod mixdown_tests {
     use super::mixdown;
 

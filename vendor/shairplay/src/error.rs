@@ -42,17 +42,9 @@ pub enum ServerError {
     InvalidPassword(usize),
 }
 
-/// Errors from cryptographic operations (RSA, pairing, FairPlay, AES).
+/// Errors from cryptographic operations (pairing, FairPlay, AES).
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    /// RSA key loading or parsing failed.
-    #[error("RSA key error: {0}")]
-    RsaKey(String),
-
-    /// RSA decryption failed (wrong key or corrupted data).
-    #[error("RSA decryption failed")]
-    RsaDecrypt,
-
     /// Pairing handshake failed (Ed25519/Curve25519 or SRP-6a).
     #[error("pairing handshake failed: {0}")]
     PairingHandshake(String),
@@ -86,16 +78,12 @@ pub enum NetworkError {
     Bind(u16),
 }
 
-/// Errors from protocol parsing (RTSP, SDP, plist, HTTP Digest).
+/// Errors from protocol parsing (RTSP, plist, HTTP Digest).
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     /// Malformed or unsupported RTSP request.
     #[error("invalid RTSP request: {0}")]
     InvalidRtsp(String),
-
-    /// SDP session description parsing failed.
-    #[error("SDP parse error: {0}")]
-    Sdp(String),
 
     /// Binary plist parsing failed.
     #[error("plist parse error: {0}")]

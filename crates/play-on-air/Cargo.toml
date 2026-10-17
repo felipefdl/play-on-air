@@ -26,8 +26,8 @@ if-addrs = "0.13"
 parking_lot = { workspace = true }
 rust_cast = { workspace = true }
 rustls = { workspace = true }
+rustls-webpki = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 shairplay = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
@@ -36,6 +36,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-log = { workspace = true }
 tracing-subscriber = { workspace = true }
+x509-parser = { workspace = true }
 
 # Linux discovery uses in-process mDNS (no avahi-daemon / D-Bus required in containers).
 [target.'cfg(target_os = "linux")'.dependencies]

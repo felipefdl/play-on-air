@@ -1,19 +1,17 @@
 //! RTSP request dispatch — routes incoming requests to handlers.
 //!
 //! Uses a compile-time route table for clean, extensible routing.
-//! Auth, Apple-Challenge, and logging are handled as middleware
-//! before dispatch.
+//! Digest auth and logging are handled as middleware before dispatch.
 
 use crate::proto::digest;
 use crate::proto::http::{HttpRequest, HttpResponse};
-use crate::raop::handlers_ap1::{self as handlers, RaopConnection};
-
-/// HTTP Digest authentication realm advertised and validated for RTSP auth.
-const DIGEST_REALM: &str = "airplay";
-#[cfg(feature = "ap2")]
+use crate::raop::handlers::{self, RaopConnection};
 use crate::raop::handlers_ap2;
 #[cfg(feature = "hls")]
 use crate::raop::handlers_hls;
+
+/// HTTP Digest authentication realm advertised and validated for RTSP auth.
+const DIGEST_REALM: &str = "airplay";
 
 /// Handler function signature — all RTSP handlers share this type.
 type Handler = fn(&mut RaopConnection, &HttpRequest, &mut HttpResponse) -> Option<Vec<u8>>;
@@ -37,35 +35,20 @@ struct Route {
 /// Feature-gated routes are included/excluded at compile time.
 const ROUTES: &[Route] = &[
     // --- Authentication & DRM ---
-    #[cfg(feature = "ap2")]
     Route {
         method: "POST",
         path: "/pair-setup",
         handler: handlers_ap2::handle_pair_setup,
     },
-    #[cfg(not(feature = "ap2"))]
-    Route {
-        method: "POST",
-        path: "/pair-setup",
-        handler: handlers::handle_pair_setup,
-    },
-    #[cfg(feature = "ap2")]
     Route {
         method: "POST",
         path: "/pair-verify",
         handler: handlers_ap2::handle_pair_verify,
     },
-    #[cfg(feature = "ap2")]
     Route {
         method: "POST",
         path: "/pair-pin-start",
         handler: handlers_ap2::handle_pair_pin_start,
-    },
-    #[cfg(not(feature = "ap2"))]
-    Route {
-        method: "POST",
-        path: "/pair-verify",
-        handler: handlers::handle_pair_verify,
     },
     Route {
         method: "POST",
@@ -73,19 +56,16 @@ const ROUTES: &[Route] = &[
         handler: handlers::handle_fp_setup,
     },
     // --- AP2 POST endpoints ---
-    #[cfg(feature = "ap2")]
     Route {
         method: "POST",
         path: "/feedback",
         handler: handlers_ap2::handle_feedback,
     },
-    #[cfg(feature = "ap2")]
     Route {
         method: "POST",
         path: "/command",
         handler: handlers_ap2::handle_command,
     },
-    #[cfg(feature = "ap2")]
     Route {
         method: "POST",
         path: "/audioMode",
@@ -98,11 +78,6 @@ const ROUTES: &[Route] = &[
         handler: handlers::handle_options,
     },
     Route {
-        method: "ANNOUNCE",
-        path: "*",
-        handler: handlers::handle_announce,
-    },
-    Route {
         method: "GET_PARAMETER",
         path: "*",
         handler: handlers::handle_get_parameter,
@@ -113,32 +88,27 @@ const ROUTES: &[Route] = &[
         handler: handlers::handle_set_parameter,
     },
     // --- AP2 RTSP methods ---
-    #[cfg(feature = "ap2")]
     Route {
         method: "SETRATEANCHORTIME",
         path: "*",
         handler: handlers_ap2::handle_set_rate_anchor_time,
     },
-    #[cfg(feature = "ap2")]
     Route {
         method: "SETPEERS",
         path: "*",
         handler: handlers_ap2::handle_set_peers,
     },
-    #[cfg(feature = "ap2")]
     Route {
         method: "SETPEERSX",
         path: "*",
         handler: handlers_ap2::handle_set_peers,
     },
-    #[cfg(feature = "ap2")]
     Route {
         method: "FLUSHBUFFERED",
         path: "*",
         handler: handlers_ap2::handle_flush_buffered,
     },
     // --- Info ---
-    #[cfg(feature = "ap2")]
     Route {
         method: "GET",
         path: "/info",
@@ -213,16 +183,6 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
         }
     }
 
-    // --- Middleware: Apple-Challenge ---
-    if let Some(challenge) = request.header("Apple-Challenge")
-        && let Ok(sig) = conn
-            .shared
-            .rsakey
-            .sign_challenge(challenge, &conn.local_addr, &conn.shared.hwaddr)
-    {
-        response.add_header("Apple-Response", &sig);
-    }
-
     // --- Route resolution ---
     let response_data = match resolve_handler(conn, request, method, url) {
         Some(RouteResolution::Handler(handler)) => handler(conn, request, &mut response),
@@ -261,8 +221,11 @@ fn resolve_handler(
     // 2. Special-case methods with custom routing logic
     match method {
         "SETUP" => resolve_setup(conn, request).map(RouteResolution::Handler),
-        "RECORD" => resolve_record(conn).map(RouteResolution::Handler),
+        "RECORD" => Some(RouteResolution::Handler(handlers_ap2::handle_record as Handler)),
+        // AP2 buffered audio flushes via FLUSHBUFFERED; plain FLUSH is acknowledged
+        // and only flushes the legacy video RTP session.
         "FLUSH" => {
+            #[cfg(feature = "video")]
             handle_flush_inline(conn, request);
             Some(RouteResolution::NoBody)
         }
@@ -271,30 +234,17 @@ fn resolve_handler(
     }
 }
 
-/// SETUP routing: AP1 (Transport header) vs AP2 (binary plist body).
+/// SETUP routing: AirPlay 2 SETUP carries a binary plist body. A paired
+/// connection always uses the AP2 handler; an unpaired one only when the body is
+/// a plist (UxPlay-style legacy screen mirroring). AirPlay 1 SETUP (RTSP
+/// `Transport` header, no plist) is unsupported and falls through to 404.
 fn resolve_setup(conn: &RaopConnection, request: &HttpRequest) -> Option<Handler> {
-    #[cfg(feature = "ap2")]
-    {
-        let is_plist = request.data().map(|d| d.starts_with(b"bplist")).unwrap_or(false);
-        if conn.is_ap2 || is_plist {
-            return Some(handlers_ap2::handle_setup);
-        }
-    }
-    let _ = (conn, request); // suppress unused warnings without ap2
-    Some(handlers::handle_setup)
+    let is_plist = request.data().is_some_and(|d| d.starts_with(b"bplist"));
+    (conn.is_ap2 || is_plist).then_some(handlers_ap2::handle_setup as Handler)
 }
 
-/// RECORD routing: AP2 has its own handler.
-fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
-    #[cfg(feature = "ap2")]
-    if conn.is_ap2 {
-        return Some(handlers_ap2::handle_record);
-    }
-    let _ = conn;
-    Some(handlers::handle_record)
-}
-
-/// FLUSH: parse RTP-Info header and flush the buffer inline.
+/// FLUSH (legacy video RTP): parse the RTP-Info header and flush the buffer.
+#[cfg(feature = "video")]
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     if let Some(rtp_info) = request.header("RTP-Info")
         && let Some(seq_str) = rtp_info.strip_prefix("seq=")
@@ -305,23 +255,21 @@ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     }
 }
 
-/// TEARDOWN: stop RTP / AP2 sessions owned by **this** connection, then close.
+/// TEARDOWN: stop sessions owned by **this** connection, then close.
 ///
-/// AP2 path uses connection-scoped stop (sync active-audio stop only when this
-/// connection owns it, then abort this connection's dual-tracked tasks). A
-/// parallel RC-only TEARDOWN must not murder another connection's live audio.
+/// Connection-scoped stop (sync active-audio stop only when this connection
+/// owns it, then abort this connection's dual-tracked tasks). A parallel
+/// RC-only TEARDOWN must not murder another connection's live audio.
 /// Server-wide stop remains [`crate::raop::connection::RaopShared::hard_stop_sessions`].
 /// Clearing `playout_cmd` drops the async command channel handle on this connection.
 fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: &mut HttpResponse) -> Option<Vec<u8>> {
     response.add_header("Connection", "close");
     response.set_disconnect(true);
+    #[cfg(feature = "video")]
     if let Some(mut rtp) = conn.raop_rtp.take() {
         rtp.stop();
     }
-    #[cfg(feature = "ap2")]
-    {
-        conn.stop_connection_sessions();
-        let _ = conn.playout_cmd.take();
-    }
+    conn.stop_connection_sessions();
+    let _ = conn.playout_cmd.take();
     None
 }

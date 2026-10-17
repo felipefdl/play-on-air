@@ -27,14 +27,15 @@ log = "0.4"
 mdns-sd = "0.20"
 parking_lot = "0.12"
 rust_cast = "0.21"
-# Direct dep for custom Cast TLS connect (SO_RCVTIMEO on the real client socket).
-# Already in the graph via rust_cast 0.21; pin matches that path.
+# Direct dep for custom Cast TLS connect (SO_RCVTIMEO on the real client socket and the
+# Cast certificate verifier). Already in the graph via rust_cast 0.21; pin matches that path.
 rustls = "0.23"
+# Cast verifier: raw-SPKI handshake signature checks (rustls' own webpki, same version).
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 # Vendored fork (LGPL-3.0-or-later): hard-stop aborts live RTSP/AP2 session tasks.
 # See vendor/shairplay/PLAYONAIR.md. Version pins lockfile/deny (path alone is `*`).
-shairplay = { path = "vendor/shairplay", version = "0.7.0", features = ["ap2"] }
+shairplay = { path = "vendor/shairplay", version = "0.7.0" }
 socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = [
@@ -54,6 +55,8 @@ tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+# Cast verifier: SPKI from device certificates, including X.509 v1 that webpki rejects.
+x509-parser = "0.18"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

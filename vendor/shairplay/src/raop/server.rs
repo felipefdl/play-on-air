@@ -1,22 +1,11 @@
-//! AirPlay server builder and lifecycle.
+//! AirPlay 2 server builder and lifecycle.
 
 use super::connection::RaopShared;
 use super::types::*;
-use crate::crypto::pairing::Pairing;
-use crate::crypto::rsa::RsaKey;
 use crate::error::{ServerError, ShairplayError};
 use crate::net::mdns::{AirPlayServiceInfo, MdnsService};
 use crate::net::server::{BindConfig, HttpServer};
 use std::sync::Arc;
-
-const AIRPORT_KEY: &str = include_str!("../../airport.key");
-
-fn airport_rsakey() -> Arc<RsaKey> {
-    use std::sync::OnceLock;
-    static KEY: OnceLock<Arc<RsaKey>> = OnceLock::new();
-    KEY.get_or_init(|| Arc::new(RsaKey::from_pem(AIRPORT_KEY).expect("built-in airport.key is invalid")))
-        .clone()
-}
 
 fn random_hwaddr() -> Vec<u8> {
     use rand::RngCore;
@@ -28,7 +17,6 @@ fn random_hwaddr() -> Vec<u8> {
     hwaddr.to_vec()
 }
 
-#[cfg(feature = "ap2")]
 fn derive_pi_from_hwaddr(hwaddr: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -57,7 +45,7 @@ fn derive_pi_from_hwaddr(hwaddr: &[u8]) -> String {
 
 /// Default `Audio-Latency` RECORD header value in samples (2 s at 48 kHz).
 ///
-/// Classic RAOP / AirPlay 2 clients treat this as the receiver buffer depth in
+/// AirPlay 2 senders treat this as the receiver buffer depth in
 /// stream-rate samples. Sample rate is not always known at server build time
 /// (passthrough hosts), so this fixed default is honest for 48 kHz media and
 /// still a reasonable ~2 s lead at 44.1 kHz. Hosts that know the rate can set
@@ -71,15 +59,11 @@ pub struct RaopServerBuilder {
     password: Option<String>,
     name: String,
     bind: BindConfig,
-    #[cfg(feature = "ap2")]
     pairing_store: Option<Arc<dyn PairingStore>>,
-    #[cfg(feature = "ap2")]
-    mode: AirPlayMode,
     output_sample_rate: Option<u32>,
     output_max_channels: Option<u8>,
     /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
     audio_latency_samples: u32,
-    #[cfg(feature = "ap2")]
     pin: Option<String>,
     #[cfg(feature = "video")]
     video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
@@ -102,14 +86,10 @@ impl RaopServerBuilder {
             password: None,
             name: "Shairplay".to_string(),
             bind: BindConfig::default(),
-            #[cfg(feature = "ap2")]
             pairing_store: None,
-            #[cfg(feature = "ap2")]
-            mode: AirPlayMode::default(),
             output_sample_rate: None,
             output_max_channels: None,
             audio_latency_samples: DEFAULT_AUDIO_LATENCY_SAMPLES,
-            #[cfg(feature = "ap2")]
             pin: None,
             #[cfg(feature = "video")]
             video_handler: None,
@@ -151,19 +131,8 @@ impl RaopServerBuilder {
 
     /// Set a pairing store for persisting device keys across restarts.
     /// Without this, iPhones must re-pair on every server restart.
-    #[cfg(feature = "ap2")]
     pub fn pairing_store(mut self, store: Arc<dyn PairingStore>) -> Self {
         self.pairing_store = Some(store);
-        self
-    }
-
-    /// Set the AirPlay protocol mode. Default: [`AirPlayMode::AirPlay2`].
-    ///
-    /// Use [`AirPlayMode::AirPlay1`] to advertise as a classic receiver even
-    /// when the `ap2` feature is compiled in.
-    #[cfg(feature = "ap2")]
-    pub fn mode(mut self, mode: AirPlayMode) -> Self {
-        self.mode = mode;
         self
     }
 
@@ -191,7 +160,6 @@ impl RaopServerBuilder {
         self
     }
 
-    #[cfg(feature = "ap2")]
     /// Require normal HomeKit pair-setup with this one-time PIN.
     ///
     /// Without a PIN, AP2 uses the shairport-sync-style transient pairing
@@ -226,22 +194,16 @@ impl RaopServerBuilder {
         {
             return Err(ServerError::InvalidPassword(password.len()).into());
         }
-        let rsakey = airport_rsakey();
-        let pairing = Arc::new(Pairing::generate()?);
         let hwaddr = match self.hwaddr {
             Some(addr) if addr.len() == super::MAX_HWADDR_LEN => addr,
             Some(addr) => return Err(ServerError::InvalidHwAddr(addr.len()).into()),
             None => random_hwaddr(),
         };
 
-        #[cfg(feature = "ap2")]
         let pairing_id = derive_pi_from_hwaddr(&hwaddr);
-        #[cfg(feature = "ap2")]
         let device_id = crate::util::hwaddr_airplay(&hwaddr);
-        #[cfg(feature = "ap2")]
         let airplay_name = self.name.clone();
 
-        #[cfg(feature = "ap2")]
         let pairing_store: Arc<dyn PairingStore> = self
             .pairing_store
             .unwrap_or_else(|| Arc::new(MemoryPairingStore::default()));
@@ -250,7 +212,6 @@ impl RaopServerBuilder {
         // for persistence. (A store with no identity persistence — e.g. the default
         // in-memory one — yields a fresh identity each start; persist it via
         // `PairingStore::load_identity`/`save_identity` to avoid re-pairing.)
-        #[cfg(feature = "ap2")]
         let identity_seed = pairing_store.load_identity().unwrap_or_else(|| {
             let seed = crate::crypto::pairing_homekit::generate_identity_seed();
             pairing_store.save_identity(seed);
@@ -258,19 +219,14 @@ impl RaopServerBuilder {
         });
 
         let shared = Arc::new(RaopShared {
-            rsakey,
-            pairing,
             hwaddr: hwaddr.clone(),
             password: self.password.unwrap_or_default(),
             handler,
-            #[cfg(feature = "ap2")]
             pairing_store,
-            #[cfg(feature = "ap2")]
             identity_seed,
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
             audio_latency_samples: self.audio_latency_samples,
-            #[cfg(feature = "ap2")]
             pin: self.pin,
             #[cfg(feature = "video")]
             video_handler: self.video_handler,
@@ -278,17 +234,11 @@ impl RaopServerBuilder {
             video_ekey: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "video")]
             video_eiv: Arc::new(std::sync::RwLock::new(None)),
-            #[cfg(feature = "ap2")]
             pairing_id,
-            #[cfg(feature = "ap2")]
             device_id,
-            #[cfg(feature = "ap2")]
             airplay_name,
-            #[cfg(feature = "ap2")]
             active_audio: std::sync::Mutex::new(None),
-            #[cfg(feature = "ap2")]
             session_tasks: std::sync::Mutex::new(Vec::new()),
-            #[cfg(feature = "ap2")]
             next_connection_id: std::sync::atomic::AtomicU64::new(1),
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
@@ -305,9 +255,6 @@ impl RaopServerBuilder {
             bind: self.bind,
             name: self.name,
             hwaddr,
-            #[cfg(feature = "ap2")]
-            mode: self.mode,
-            #[cfg(feature = "ap2")]
             ptp_aborts: Vec::new(),
         })
     }
@@ -333,10 +280,7 @@ pub struct RaopServer {
     bind: BindConfig,
     name: String,
     hwaddr: Vec<u8>,
-    #[cfg(feature = "ap2")]
-    mode: AirPlayMode,
     /// PTP drain tasks on UDP 319/320 — aborted in [`Self::stop`] so ports free.
-    #[cfg(feature = "ap2")]
     ptp_aborts: Vec<tokio::task::AbortHandle>,
 }
 
@@ -371,23 +315,17 @@ impl RaopServer {
 
         // AirPlay 2 PTP sink: accept the sender's clock on 319/320 so it doesn't
         // stall the buffered-audio start. No-op if the ports can't be bound.
-        #[cfg(feature = "ap2")]
-        if self.mode == AirPlayMode::AirPlay2 {
-            // Drop any prior sink first so restart does not fight ghost sockets.
-            for h in self.ptp_aborts.drain(..) {
-                h.abort();
-            }
-            self.ptp_aborts = crate::net::ptp::spawn_ptp_sink().await;
+        // Drop any prior sink first so restart does not fight ghost sockets.
+        for h in self.ptp_aborts.drain(..) {
+            h.abort();
         }
+        self.ptp_aborts = crate::net::ptp::spawn_ptp_sink().await;
 
         if std::env::var("CI").is_err() {
             let info = self.service_info();
             let mut mdns = MdnsService::new()?;
             mdns.register_raop(&info)?;
-            #[cfg(feature = "ap2")]
-            if self.mode == AirPlayMode::AirPlay2 {
-                mdns.register_airplay(&info)?;
-            }
+            mdns.register_airplay(&info)?;
             self.mdns = Some(mdns);
         }
 
@@ -404,16 +342,12 @@ impl RaopServer {
     /// PlayOnAir needs this after Cast steal so iOS leaves Now Playing. A plain
     /// accept-loop stop leaves accepted RTSP/event/audio TCP streams open.
     pub async fn stop(&mut self) {
-        #[cfg(feature = "ap2")]
         self.shared.hard_stop_sessions();
-        #[cfg(feature = "ap2")]
-        {
-            for h in self.ptp_aborts.drain(..) {
-                h.abort();
-            }
-            // Let aborted UDP tasks drop sockets before a following start rebinds.
-            tokio::task::yield_now().await;
+        for h in self.ptp_aborts.drain(..) {
+            h.abort();
         }
+        // Let aborted UDP tasks drop sockets before a following start rebinds.
+        tokio::task::yield_now().await;
         if let Some(mut mdns) = self.mdns.take() {
             mdns.unregister_raop();
             mdns.unregister_airplay();
@@ -423,29 +357,17 @@ impl RaopServer {
 
     /// Get the mDNS service info for this server.
     pub fn service_info(&self) -> AirPlayServiceInfo {
-        #[cfg(feature = "ap2")]
-        {
-            if self.mode == AirPlayMode::AirPlay2 {
-                let (_, vk) = crate::crypto::pairing_homekit::identity_keypair(&self.shared.identity_seed);
-                let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-                let pi = self.shared.pairing_id.clone();
-                return AirPlayServiceInfo::new_airplay2(
-                    &self.name,
-                    self.httpd.port(),
-                    &self.hwaddr,
-                    !self.shared.password.is_empty(),
-                    &pk_hex,
-                    &pi,
-                    self.shared.pin.is_some(),
-                    self.shared.pairing_store.has_any_pairing(),
-                );
-            }
-        }
+        let (_, vk) = crate::crypto::pairing_homekit::identity_keypair(&self.shared.identity_seed);
+        let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         AirPlayServiceInfo::new(
             &self.name,
             self.httpd.port(),
             &self.hwaddr,
             !self.shared.password.is_empty(),
+            &pk_hex,
+            &self.shared.pairing_id,
+            self.shared.pin.is_some(),
+            self.shared.pairing_store.has_any_pairing(),
         )
     }
 }

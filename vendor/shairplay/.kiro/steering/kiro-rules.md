@@ -20,7 +20,7 @@
 - Use `str_replace` for edits, not Python scripts
 - Run `cargo build` and `cargo test` after changes before reporting success
 - Run `cargo fmt --all` before committing
-- Test all affected feature combos (default, ap2, video, hls)
+- Test all affected feature combos (default, video, hls)
 
 ## Communication
 

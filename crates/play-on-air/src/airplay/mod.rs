@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use shairplay::{AirPlayMode, AudioFormat, AudioHandler, AudioSession, RaopServer};
+use shairplay::{AudioFormat, AudioHandler, AudioSession, RaopServer};
 use tokio::sync::mpsc;
 
 use crate::audio::PcmRing;
@@ -339,7 +339,6 @@ impl AirPlayReceiver {
 
     let server = RaopServer::builder()
       .name(name_owned.clone())
-      .mode(AirPlayMode::AirPlay2)
       .hwaddr(hwaddr.to_vec())
       .port(port)
       .output_max_channels(OUTPUT_MAX_CHANNELS)

@@ -1,27 +1,9 @@
-//! Public types and traits for the AirPlay server.
-
-use std::sync::Arc;
-
-/// Runtime protocol mode selection.
-///
-/// When the `ap2` feature is enabled, this controls whether the server
-/// advertises itself as an AirPlay 1 (classic) or AirPlay 2 receiver.
-/// Both modes share the same RTSP listener — the difference is in mDNS
-/// advertisement and feature negotiation.
-#[cfg(feature = "ap2")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AirPlayMode {
-    /// Classic AirPlay 1: ALAC/AAC over RTP, RSA encryption, NTP timing.
-    AirPlay1,
-    /// AirPlay 2: buffered audio, ChaCha20 encryption, SRP pairing, PTP timing.
-    #[default]
-    AirPlay2,
-}
+//! Public types and traits for the AirPlay 2 server.
 
 /// Audio codec type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioCodec {
-    /// Decoded PCM (f32 interleaved). Always delivered regardless of AP1/AP2.
+    /// Decoded PCM (f32 interleaved). Always delivered regardless of the stream type.
     Pcm,
 }
 
@@ -60,8 +42,6 @@ pub trait AudioHandler: Send + Sync + 'static {
     fn on_coverart(&self, _coverart: &[u8]) {}
     /// Playback progress (start, current, end in RTP timestamps at 44100 Hz).
     fn on_progress(&self, _start: u32, _current: u32, _end: u32) {}
-    /// A remote control interface is available (AP1 DACP).
-    fn on_remote_control(&self, _remote: Arc<dyn RemoteControl>) {}
 
     // --- Connection lifecycle ---
 
@@ -82,7 +62,6 @@ pub trait AudioHandler: Send + Sync + 'static {
 ///
 /// Without persistence, iPhones that previously paired will send encrypted data
 /// on connect and fail because the server has no cached keys.
-#[cfg(feature = "ap2")]
 pub trait PairingStore: Send + Sync + 'static {
     /// Look up a paired device's Ed25519 public key by device ID.
     fn get(&self, device_id: &str) -> Option<[u8; 32]>;
@@ -126,13 +105,11 @@ pub trait PairingStore: Send + Sync + 'static {
 }
 
 /// In-memory pairing store (lost on restart). Use for testing or wrap with file I/O.
-#[cfg(feature = "ap2")]
 #[derive(Default)]
 pub struct MemoryPairingStore {
     keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
 }
 
-#[cfg(feature = "ap2")]
 impl PairingStore for MemoryPairingStore {
     fn get(&self, device_id: &str) -> Option<[u8; 32]> {
         self.keys.lock().ok()?.get(device_id).copied()
@@ -160,7 +137,9 @@ impl PairingStore for MemoryPairingStore {
 pub trait AudioSession: Send + Sync {
     /// Receive decoded f32 interleaved PCM audio samples.
     fn audio_process(&mut self, samples: &[f32]);
-    /// Flush the audio buffer (e.g. on seek). Used by the AP1 RTP path.
+    /// Flush the audio buffer (RTSP `FLUSH`). Only the legacy RTP audio of
+    /// `video`-feature screen mirroring calls this; AirPlay 2 audio uses
+    /// [`on_flush`](Self::on_flush).
     fn audio_flush(&mut self) {}
     /// AP2 buffered playout rate change (`rate == 0` = pause, nonzero = play).
     ///
@@ -169,35 +148,6 @@ pub trait AudioSession: Send + Sync {
     /// AP2 buffered `FLUSHBUFFERED` / playout flush. Default is a no-op.
     ///
     /// Distinct from [`audio_flush`](Self::audio_flush) so the buffered delivery
-    /// thread can notify without sharing the AP1 RTP session object.
+    /// thread can notify without sharing the legacy RTP session object.
     fn on_flush(&mut self) {}
-}
-
-/// Playback command to send to the source device.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RemoteCommand {
-    /// Start playback.
-    Play,
-    /// Pause playback.
-    Pause,
-    /// Skip to next track.
-    NextTrack,
-    /// Skip to previous track.
-    PreviousTrack,
-    /// Set volume (0-100).
-    SetVolume(u8),
-    /// Toggle shuffle mode.
-    ToggleShuffle,
-    /// Toggle repeat mode.
-    ToggleRepeat,
-    /// Stop playback.
-    Stop,
-}
-
-/// Unified remote control interface for AP1 (DACP) and AP2 (MediaRemote).
-pub trait RemoteControl: Send + Sync {
-    /// Send a playback command to the source device.
-    fn send_command(&self, cmd: RemoteCommand) -> Result<(), crate::error::ShairplayError>;
-    /// Commands the source device supports. AP1 returns all; AP2 returns advertised set.
-    fn available_commands(&self) -> Vec<RemoteCommand>;
 }

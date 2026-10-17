@@ -24,10 +24,9 @@ cargo test --features video
 
 | Flag | Description |
 |------|-------------|
-| (default) | AP1 only |
-| `resample` | Adds rubato for sample rate conversion |
-| `ap2` | AirPlay 2 (implies `resample`) |
-| `video` | Screen mirroring (implies `ap2`) |
+| (default) | AirPlay 2 audio (no AirPlay 1 stack) |
+| `video` | Screen mirroring + its legacy RTP audio |
+| `hls` | HLS video playback (implies `video`) |
 
 ## Release Process
 

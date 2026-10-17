@@ -59,16 +59,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Build (default)
         run: cargo build
-      - name: Build (ap2)
-        run: cargo build --features ap2
       - name: Build (video)
         run: cargo build --features video
       - name: Build (hls)
         run: cargo build --features hls
       - name: Test (default)
         run: cargo test
-      - name: Test (ap2)
-        run: cargo test --features ap2
       - name: Test (video)
         run: cargo test --features video
       - name: Test (hls)

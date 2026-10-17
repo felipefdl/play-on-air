@@ -8,11 +8,12 @@
 // Quiet upstream-style noise only — do not weaken play-on-air workspace lints.
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
-#![doc = "Pure Rust AirPlay server library.
+#![doc = "Pure Rust AirPlay 2 receiver library (PlayOnAir fork).
 
-`shairplay` is a complete reimplementation of the [shairplay](https://github.com/juhovh/shairplay)
-C library in safe Rust. It provides an AirPlay (RAOP) server that can receive audio streams
-from Apple devices on the local network.
+`shairplay` provides an AirPlay 2 server that receives audio streams from Apple
+devices on the local network: HomeKit/SRP pairing, encrypted RTSP, buffered AAC
+and realtime ALAC, decoded to f32 PCM. The AirPlay 1 stack (RSA, legacy pairing,
+ANNOUNCE/SDP, DACP) is not part of this fork.
 
 # Quick Start
 
@@ -30,7 +31,7 @@ impl AudioHandler for MyHandler {
 struct MySession;
 impl AudioSession for MySession {
     fn audio_process(&mut self, samples: &[f32]) {
-        // F32 interleaved PCM — same format for AP1 and AP2
+        // F32 interleaved PCM — same format for buffered and realtime streams
     }
 }
 
@@ -50,24 +51,23 @@ server.start().await?;
 
 # Architecture
 
-- [`raop`] — RAOP/AirPlay server, RTSP handlers, RTP streaming, audio buffering
-- [`crypto`] — RSA, Ed25519/Curve25519 pairing, AES-CTR, FairPlay DRM, ChaCha20-Poly1305
-- `codec` — Audio decoders (ALAC, AAC) and resampling (internal)
-- [`proto`] — SDP, HTTP/RTSP, binary plist, HTTP Digest auth
+- [`raop`] — AirPlay 2 server, RTSP handlers, buffered/realtime audio
+- [`crypto`] — HomeKit pairing (SRP-6a, Ed25519/Curve25519), FairPlay, ChaCha20-Poly1305
+- `codec` — Audio decoders (ALAC, AAC), resampling and mixdown (internal)
+- [`proto`] — HTTP/RTSP, DMAP metadata, HTTP Digest auth
 - [`net`] — Async TCP server (tokio), mDNS service registration, PTP timing
 - [`error`] — Error types
 
 # Feature Flags
 
-- `ap2` — AirPlay 2 support (SRP-6a pairing, buffered AAC, encrypted transport)
-- `video` — Experimental screen mirroring (implies `ap2`)
+- `video` — Experimental screen mirroring (UxPlay legacy feature set; carries the
+  legacy RTP audio receiver it needs)
+- `hls` — HLS video URL playback (implies `video`)
 "]
 
 pub(crate) mod codec;
 #[doc(hidden)]
 pub mod crypto;
-#[doc(hidden)]
-pub mod dacp;
 pub mod error;
 #[doc(hidden)]
 pub mod net;
@@ -84,9 +84,7 @@ pub use net::server::BindConfig;
 pub use raop::hls::{HlsHandler, HlsSession};
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
-#[cfg(feature = "ap2")]
-pub use raop::{AirPlayMode, MemoryPairingStore, PairingStore};
 pub use raop::{
-    AudioCodec, AudioFormat, AudioHandler, AudioSession, RaopServer, RaopServerBuilder, RemoteCommand, RemoteControl,
-    TrackMetadata,
+    AudioCodec, AudioFormat, AudioHandler, AudioSession, MemoryPairingStore, PairingStore, RaopServer,
+    RaopServerBuilder, TrackMetadata,
 };

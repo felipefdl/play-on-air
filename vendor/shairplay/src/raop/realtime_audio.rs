@@ -12,12 +12,10 @@ use tracing::{debug, info, warn};
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
+use crate::codec::resample::StreamResampler;
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
-
-#[cfg(feature = "resample")]
-use crate::codec::resample::StreamResampler;
 
 /// Reorder window depth in packets (~128 ms at 352 samples/packet, 44.1 kHz).
 ///
@@ -94,7 +92,7 @@ enum OrderedFrame {
 
 /// Small circular reorder window for realtime type-96 RTP.
 ///
-/// Concepts mirror AP1 [`crate::raop::buffer::RaopBuffer`]: insert by sequence
+/// Concepts mirror the legacy RTP `RaopBuffer` (`video` feature): insert by sequence
 /// number, deliver strictly in order, drop duplicates, substitute silence for
 /// gaps that age out of the window. No retransmit requests (out of scope).
 struct RealtimeReorderWindow {
@@ -214,7 +212,6 @@ pub(crate) async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn Audio
     let cipher = ChaCha20Poly1305::new((&shk).into());
     let mut buf = vec![0u8; 4096];
     let mut decoder: Option<crate::codec::alac::AlacDecoder> = None;
-    #[cfg(feature = "resample")]
     let mut resampler: Option<StreamResampler> = None;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
     #[allow(unused_assignments)]
@@ -259,7 +256,6 @@ pub(crate) async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn Audio
             let decoder_info = alac_decoder_info(&output_config);
             alac.set_info(&decoder_info);
             decoder = Some(alac);
-            #[cfg(feature = "resample")]
             if target_sr != src_sr {
                 resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize);
             }
@@ -296,10 +292,7 @@ pub(crate) async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn Audio
             };
 
             // Mix down + resample to the output format.
-            #[cfg(feature = "resample")]
-            {
-                samples = crate::codec::resample::mixdown_and_resample(samples, src_ch, out_ch, &mut resampler);
-            }
+            samples = crate::codec::resample::mixdown_and_resample(samples, src_ch, out_ch, &mut resampler);
 
             if let Some(ref mut sess) = session {
                 sess.audio_process(&samples);

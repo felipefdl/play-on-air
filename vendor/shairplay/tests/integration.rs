@@ -169,7 +169,7 @@ async fn unknown_rtsp_method_returns_404() {
 
 #[tokio::test]
 #[serial]
-async fn ap1_record_returns_200() {
+async fn record_returns_audio_latency() {
     let (mut server, port, _) = start_server().await;
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
@@ -201,26 +201,36 @@ async fn oversized_header_returns_400_and_closes_connection() {
     server.stop().await;
 }
 
+/// AirPlay 2 only: AirPlay 1 entry points (legacy 32-byte pair-setup, SDP
+/// ANNOUNCE, `Transport`-header SETUP) must not be served.
 #[tokio::test]
 #[serial]
-async fn pair_setup_returns_public_key() {
+async fn airplay1_requests_are_not_served() {
     let (mut server, port, _) = start_server().await;
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-
-    // Send 32 bytes of dummy pair-setup data
     let body = [0x42u8; 32];
     let req =
         "POST /pair-setup HTTP/1.0\r\nCSeq: 1\r\nContent-Length: 32\r\nContent-Type: application/octet-stream\r\n\r\n";
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.write_all(&body).await.unwrap();
-
     let mut buf = vec![0u8; 4096];
     let n = stream.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        !resp.contains("Content-Length: 32"),
+        "legacy pair-setup must not return an Ed25519 key, got: {resp}"
+    );
 
-    assert!(resp.contains("200 OK"), "got: {resp}");
-    assert!(resp.contains("Content-Length: 32")); // Ed25519 public key = 32 bytes
+    let resp = send_rtsp(&mut stream, "ANNOUNCE /1 RTSP/1.0\r\nCSeq: 2\r\n\r\n").await;
+    assert!(resp.contains("RTSP/1.0 404 Not Found"), "got: {resp}");
+
+    let resp = send_rtsp(
+        &mut stream,
+        "SETUP /1 RTSP/1.0\r\nCSeq: 3\r\nTransport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\r\n",
+    )
+    .await;
+    assert!(resp.contains("RTSP/1.0 404 Not Found"), "got: {resp}");
 
     server.stop().await;
 }
@@ -264,8 +274,8 @@ async fn unauthorized_without_password_header() {
     let port = server.service_info().port;
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-    // ANNOUNCE without Authorization header should get 401
-    let resp = send_rtsp(&mut stream, "ANNOUNCE /test HTTP/1.0\r\nCSeq: 1\r\n\r\n").await;
+    // RECORD without Authorization header should get 401
+    let resp = send_rtsp(&mut stream, "RECORD /test HTTP/1.0\r\nCSeq: 1\r\n\r\n").await;
 
     assert!(resp.contains("401 Unauthorized"), "got: {resp}");
     assert!(resp.contains("WWW-Authenticate: Digest"));
@@ -316,7 +326,6 @@ async fn teardown_closes_connection() {
 
 // --- AirPlay 2 integration tests ---
 
-#[cfg(feature = "ap2")]
 mod ap2_tests {
     use super::*;
     use shairplay::crypto::tlv::{TlvType, TlvValues};

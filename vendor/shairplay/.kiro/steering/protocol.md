@@ -2,17 +2,15 @@
 
 ## Feature Bitmask
 
-- AP1/AP2 audio: `0x0001C340405D4A00` (bits 9,11,14,16,18-22,30,38,40,41,46-48)
+- AP2 audio: `0x0001C340405D4A00` (bits 9,11,14,16,18-22,30,38,40,41,46-48)
 - Video/HLS (UxPlay legacy): `0x5A7FFEE6` (bits 1-7,9-22,25,27,28,30)
 - Video adds NO AP2 bits — pure legacy protocol
 - Bit 27 (legacy pairing) must be OFF when using FairPlay ekey without ECDH hash
 
 ## Connection Flows
 
-### AP1 (Classic)
-```
-OPTIONS → ANNOUNCE (SDP) → SETUP (Transport header) → RECORD → audio RTP
-```
+### AP1 (Classic) — removed in the PlayOnAir fork
+ANNOUNCE (SDP) and `Transport`-header SETUP return 404; legacy pair-setup/verify bodies get no reply.
 
 ### AP2 (AirPlay 2)
 ```

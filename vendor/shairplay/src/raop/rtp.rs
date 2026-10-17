@@ -1,6 +1,9 @@
-//! AP1 RTP audio streaming — UDP and TCP receiver with ALAC decode.
+//! Legacy RTP audio receiver (AES-CBC ALAC over RTP/UDP or RTP/TCP).
 //!
-//! Manages the full AP1 audio receive pipeline:
+//! Compiled only with the `video` feature: UxPlay-style screen mirroring sends
+//! its type-96 audio as legacy RTP. The AirPlay 2 audio path never uses it.
+//!
+//! Pipeline:
 //!
 //! ```text
 //! iPhone → RTP/UDP or RTP/TCP → RaopRtp → RaopBuffer (decrypt+decode) → AudioSession
@@ -59,35 +62,14 @@ fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, ShairplayError> {
         .map_err(Into::into)
 }
 
-/// Parse the SDP `c=` remote address to raw IP bytes for DACP callbacks.
-/// Handles "IP6 ::1" prefix and IPv4-mapped IPv6 addresses.
-pub(crate) fn remote_addr_bytes(remote: &str) -> Vec<u8> {
-    let addr_str = remote.strip_prefix("IP6 ").unwrap_or(remote);
-    if let Ok(ip) = addr_str.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => v4.octets().to_vec(),
-            IpAddr::V6(v6) => v6.octets().to_vec(),
-        }
-    } else {
-        vec![]
-    }
-}
-
 /// Mutable state shared between the RTP receive loop and the RTSP handler thread.
 /// Updated via async message passing (tokio Mutex), consumed in the receive loop.
 struct RtpState {
-    /// Current volume in dB (0.0 = max, -144.0 = mute).
-    /// Set to true when volume changes; cleared after delivery.
-    /// Pending DMAP track metadata (binary).
-    /// Pending album artwork (JPEG/PNG).
-    /// DACP ID for remote control discovery.
-    /// Active-Remote token for DACP authentication.
-    /// Pending playback progress (start, current, end in RTP timestamps).
     /// Sequence number to flush to, or [`NO_FLUSH`] if no flush pending.
     flush: i32,
 }
 
-/// Configuration for creating an AP1 RTP session, parsed from SDP.
+/// Configuration for creating a legacy RTP session.
 pub(crate) struct RtpConfig {
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
     pub(crate) remote: String,
@@ -107,11 +89,11 @@ pub(crate) struct RtpConfig {
     pub(crate) remote_socket: std::net::SocketAddr,
 }
 
-/// AP1 RTP streaming session.
+/// Legacy RTP streaming session.
 ///
 /// Owns the UDP/TCP sockets, the packet buffer, and the ALAC decoder.
-/// Created when the iPhone sends the SDP ANNOUNCE. Started during RTSP SETUP,
-/// which binds ports and spawns the receive task.
+/// Created by the type-96 stream SETUP in legacy (unpaired) screen-mirroring
+/// mode, which also starts it (binds ports and spawns the receive task).
 ///
 /// Dropped when the RTSP connection closes, which sends a shutdown signal
 /// to the receive task via the [`watch`] channel.
@@ -143,10 +125,9 @@ pub(crate) struct RaopRtp {
     remote_socket: std::net::SocketAddr,
 }
 
-/// Build a resampler for the AP1 RTP path: `Some` when an explicit output rate
+/// Build a resampler for the legacy RTP path: `Some` when an explicit output rate
 /// differs from the source rate, otherwise `None` (native-rate passthrough).
 /// Shared by the UDP and TCP receive arms of [`RaopRtp::start`].
-#[cfg(feature = "resample")]
 fn make_resampler(
     output_sample_rate: Option<u32>,
     src_sample_rate: u32,
@@ -203,7 +184,7 @@ impl RaopRtp {
         timing_rport: u16,
     ) -> Result<(u16, u16, u16), ShairplayError> {
         self.control_rport = control_rport;
-        info!(use_udp, control_rport, timing_rport, remote = %self.remote, "AP1 RTP starting");
+        info!(use_udp, control_rport, timing_rport, remote = %self.remote, "Legacy RTP starting");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -230,7 +211,6 @@ impl RaopRtp {
                 sample_rate: config.sample_rate,
             });
 
-            #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
                 self.output_sample_rate,
                 config.sample_rate,
@@ -266,15 +246,10 @@ impl RaopRtp {
                                     let mut buf = buffer.lock().await;
                                     buf.queue(&data_packet[..len], true);
                                     while let Some(samples) = buf.dequeue(no_resend) {
-                                        {
-                                            #[cfg(feature = "resample")]
-                                            if let Some(ref mut rs) = resampler {
-                                                let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
-                                            } else {
-                                                session.audio_process(samples);
-                                            }
-                                            #[cfg(not(feature = "resample"))]
+                                        if let Some(rs) = &mut resampler {
+                                            let resampled = rs.process(samples);
+                                            session.audio_process(&resampled);
+                                        } else {
                                             session.audio_process(samples);
                                         }
                                     }
@@ -307,7 +282,6 @@ impl RaopRtp {
                 sample_rate: self.output_sample_rate.unwrap_or(config.sample_rate),
             });
 
-            #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
                 self.output_sample_rate,
                 config.sample_rate,
@@ -372,17 +346,12 @@ impl RaopRtp {
                                 let mut buf = buffer.lock().await;
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
                                 if let Some(samples) = buf.dequeue(true) {
-                                    {
-                                            #[cfg(feature = "resample")]
-                                            if let Some(ref mut rs) = resampler {
-                                                let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
-                                            } else {
-                                                session.audio_process(samples);
-                                            }
-                                            #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
-                                        }
+                                    if let Some(rs) = &mut resampler {
+                                        let resampled = rs.process(samples);
+                                        session.audio_process(&resampled);
+                                    } else {
+                                        session.audio_process(samples);
+                                    }
                                 }
                                 drop(buf);
                                 packet_buf.drain(..4 + rtp_len);

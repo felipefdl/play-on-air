@@ -17,21 +17,20 @@ src/
 │   ├── server.rs       RaopServer builder + lifecycle
 │   ├── connection.rs   Per-connection state + dispatch
 │   ├── rtsp.rs         Route-table RTSP dispatch
-│   ├── handlers_ap1.rs AP1 RTSP handlers
+│   ├── handlers.rs     Connection state + shared RTSP handlers (fp-setup, OPTIONS, GET/SET_PARAMETER)
 │   ├── handlers_ap2.rs AP2 RTSP handlers
-│   ├── rtp.rs          AP1 RTP streaming
-│   ├── ntp.rs          NTP timing responder
-│   ├── buffer.rs       RTP packet buffer + AES-CBC decrypt + ALAC decode
+│   ├── rtp.rs          Legacy RTP audio (`video` only)
+│   ├── ntp.rs          NTP timing responder (`video` only)
+│   ├── buffer.rs       Legacy RTP buffer + AES-CBC decrypt + ALAC decode (`video` only)
 │   ├── buffered_audio  AP2 timed playout buffer
 │   ├── realtime_audio  AP2 realtime ALAC
 │   └── event_channel   AP2 encrypted event channel
 ├── video/          Screen mirroring (experimental)
 ├── hls/            HLS video playback (YouTube)
-├── crypto/         RSA, Ed25519, AES, FairPlay, SRP-6a, ChaCha20
+├── crypto/         Ed25519, FairPlay, SRP-6a, ChaCha20
 ├── codec/          ALAC decoder, AAC decoder, resampler
-├── proto/          SDP, HTTP/RTSP, DMAP, binary plist, HTTP Digest
+├── proto/          HTTP/RTSP, DMAP, HTTP Digest
 ├── net/            Async TCP server, mDNS, PTP timing, feature flags
-├── dacp/           DACP remote control (AP1)
 └── error/          Error types (thiserror)
 ```
 
@@ -39,10 +38,8 @@ src/
 
 | Flag | Implies | Description |
 |------|---------|-------------|
-| *(default)* | — | AP1 only |
-| `resample` | — | Sample rate conversion + channel mixdown (optional) |
-| `ap2` | — | Full AirPlay 2 audio |
-| `video` | `ap2` | Legacy audio for screen mirroring |
+| *(default)* | — | AirPlay 2 audio (no AirPlay 1 stack) |
+| `video` | — | Screen mirroring + its legacy RTP audio |
 | `hls` | `video` | HLS video playback |
 
 ## Public API

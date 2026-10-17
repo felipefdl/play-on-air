@@ -1,42 +1,9 @@
 //! Unit tests with test vectors generated from the original C implementation.
 
-use shairplay::crypto::aes::AesCtr;
 use shairplay::crypto::fairplay::FairPlay;
-use shairplay::crypto::pairing::Pairing;
 use shairplay::net::mdns::AirPlayServiceInfo;
 use shairplay::proto::digest;
 use shairplay::proto::http::{HttpRequest, HttpResponse};
-use shairplay::proto::sdp::Sdp;
-use shairplay::raop::buffer::RaopBuffer;
-
-// ============================================================
-// Base64 — vectors from C base64_encode/base64_decode
-// ============================================================
-
-// ============================================================
-// SDP — vectors from C sdp_init/sdp_get_*
-// ============================================================
-#[test]
-fn sdp_parse_airplay_session() {
-    let data = "v=0\r\no=iTunes 123 0 IN IP4 192.168.1.1\r\ns=iTunes\r\nc=IN IP4 192.168.1.1\r\nt=0 0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\na=rsaaeskey:AQID\r\na=aesiv:BAUG\r\na=min-latency:11025\r\n";
-    let sdp = Sdp::parse(data);
-    assert_eq!(sdp.version(), Some("0"));
-    assert_eq!(sdp.connection(), Some("IN IP4 192.168.1.1"));
-    assert_eq!(sdp.rtpmap(), Some("96 AppleLossless"));
-    assert_eq!(sdp.fmtp(), Some("96 352 0 16 40 10 14 2 255 0 0 44100"));
-    assert_eq!(sdp.rsaaeskey(), Some("AQID"));
-    assert_eq!(sdp.aesiv(), Some("BAUG"));
-    assert_eq!(sdp.min_latency(), Some("11025"));
-    assert_eq!(sdp.fpaeskey(), None);
-}
-
-#[test]
-fn sdp_missing_fields() {
-    let sdp = Sdp::parse("v=0\r\n");
-    assert_eq!(sdp.version(), Some("0"));
-    assert_eq!(sdp.connection(), None);
-    assert_eq!(sdp.rtpmap(), None);
-}
 
 // ============================================================
 // HTTP — request parsing and response serialization
@@ -147,110 +114,6 @@ fn digest_nonce_length() {
 }
 
 // ============================================================
-// AES-CTR — vectors from C AES_ctr_encrypt
-// ============================================================
-#[test]
-fn aes_ctr_48_bytes() {
-    let key = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    ];
-    let nonce = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-    ];
-    let mut data: Vec<u8> = (0..48).collect();
-    let mut aes = AesCtr::new(&key, &nonce);
-    aes.encrypt(&mut data);
-    assert_eq!(
-        hex::encode(&data),
-        "9a7b041aaec7986b1722564c5fd886fc043d43dabb39e7ce36902ddfe7dc93659233f84a755459b2712ee0fd90d32645"
-    );
-}
-
-#[test]
-fn aes_ctr_streaming_matches_oneshot() {
-    let key = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    ];
-    let nonce = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-    ];
-    let plain: Vec<u8> = (0..48).collect();
-
-    // One-shot
-    let mut d1 = plain.clone();
-    AesCtr::new(&key, &nonce).encrypt(&mut d1);
-
-    // Streaming in 3 chunks
-    let mut d2 = plain.clone();
-    let mut aes = AesCtr::new(&key, &nonce);
-    aes.encrypt(&mut d2[0..16]);
-    aes.encrypt(&mut d2[16..32]);
-    aes.encrypt(&mut d2[32..48]);
-
-    assert_eq!(d1, d2);
-}
-
-#[test]
-fn aes_ctr_7_bytes() {
-    let key = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    ];
-    let nonce = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-    ];
-    let mut data: Vec<u8> = (0..7).collect();
-    AesCtr::new(&key, &nonce).encrypt(&mut data);
-    assert_eq!(hex::encode(&data), "9a7b041aaec798");
-}
-
-#[test]
-fn aes_ctr_symmetric() {
-    let key = [0xaa; 16];
-    let nonce = [0xbb; 16];
-    let original = b"AirPlay test data for symmetry check!".to_vec();
-    let mut encrypted = original.clone();
-    AesCtr::new(&key, &nonce).encrypt(&mut encrypted);
-    assert_ne!(encrypted, original);
-    AesCtr::new(&key, &nonce).encrypt(&mut encrypted);
-    assert_eq!(encrypted, original);
-}
-
-// ============================================================
-// Pairing — full handshake roundtrip
-// ============================================================
-#[test]
-fn pairing_handshake_roundtrip() {
-    let server = Pairing::generate().unwrap();
-    let client = Pairing::generate().unwrap();
-
-    let mut server_session = server.create_session();
-
-    // Client sends ECDH + Ed25519 public keys to server
-    {
-        // Client generates ephemeral ECDH, but we simulate by doing handshake from client side
-        // For a real test, we need both sides to exchange. Let's test server-side only.
-        let fake_ecdh = [0x42u8; 32];
-        let client_ed = client.public_key();
-        server_session.handshake(&fake_ecdh, &client_ed).unwrap();
-        server_session.get_public_key().unwrap()
-    };
-    // Server can produce a signature
-    let sig = server_session.get_signature().unwrap();
-    assert_eq!(sig.len(), 64);
-}
-
-#[test]
-fn pairing_derive_key_deterministic() {
-    let p = Pairing::from_seed(&[0xAA; 32]);
-    let mut s = p.create_session();
-    s.handshake(&[0x11; 32], &[0x22; 32]).unwrap();
-    let k1 = s.derive_key(b"test-salt", 16).unwrap();
-    let k2 = s.derive_key(b"test-salt", 16).unwrap();
-    assert_eq!(k1, k2);
-    assert_eq!(k1.len(), 16);
-}
-
-// ============================================================
 // FairPlay — setup/handshake protocol
 // ============================================================
 #[test]
@@ -288,101 +151,71 @@ fn fairplay_reject_bad_version() {
 }
 
 // ============================================================
-// RTP Buffer — queue/dequeue/flush
+// Legacy RTP buffer (`video` screen mirroring) — queue/dequeue/flush
 // ============================================================
-#[test]
-fn rtp_buffer_queue_dequeue() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).expect("valid fmtp");
-    // Queue returns >= 0 for valid-length packets (ALAC decode may fail on dummy data)
-    let mut pkt = vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    pkt.extend_from_slice(&[0u8; 256]);
-    // Just verify it doesn't reject the packet header
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        buf.queue(&pkt, true);
-    }));
-    // Packet was accepted (seqnum tracking works regardless of decode)
-}
+#[cfg(feature = "video")]
+mod rtp_buffer_tests {
+    use shairplay::raop::buffer::RaopBuffer;
 
-#[test]
-fn rtp_buffer_flush() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).expect("valid fmtp");
-    buf.flush(100);
-    assert!(buf.dequeue(true).is_none());
-}
+    #[test]
+    fn rtp_buffer_queue_dequeue() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).expect("valid fmtp");
+        // Queue returns >= 0 for valid-length packets (ALAC decode may fail on dummy data)
+        let mut pkt = vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        pkt.extend_from_slice(&[0u8; 256]);
+        // Just verify it doesn't reject the packet header
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buf.queue(&pkt, true);
+        }));
+        // Packet was accepted (seqnum tracking works regardless of decode)
+    }
 
-#[test]
-fn rtp_buffer_reject_short_packet() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).expect("valid fmtp");
-    assert_eq!(buf.queue(&[0u8; 4], true), -1); // too short
-}
+    #[test]
+    fn rtp_buffer_flush() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).expect("valid fmtp");
+        buf.flush(100);
+        assert!(buf.dequeue(true).is_none());
+    }
 
-#[test]
-fn rtp_buffer_rejects_malformed_fmtp() {
-    let key = [0u8; 16];
-    let iv = [0u8; 16];
-    // Too few fields — previously panicked via `.expect("invalid fmtp")`.
-    assert!(RaopBuffer::new("96 352", "96 352", &key, &iv).is_none());
-    // Non-numeric field — previously silently coerced to 0.
-    assert!(RaopBuffer::new("96 352", "96 abc 0 16 40 10 14 2 255 0 0 44100", &key, &iv).is_none());
-    // Zero channels — would build a 0-channel decoder / zero-size buffers.
-    assert!(RaopBuffer::new("96 352", "96 352 0 16 40 10 14 0 255 0 0 44100", &key, &iv).is_none());
-    // Well-formed input still succeeds.
-    assert!(RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).is_some());
+    #[test]
+    fn rtp_buffer_reject_short_packet() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).expect("valid fmtp");
+        assert_eq!(buf.queue(&[0u8; 4], true), -1); // too short
+    }
+
+    #[test]
+    fn rtp_buffer_rejects_malformed_fmtp() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        // Too few fields — previously panicked via `.expect("invalid fmtp")`.
+        assert!(RaopBuffer::new("96 352", "96 352", &key, &iv).is_none());
+        // Non-numeric field — previously silently coerced to 0.
+        assert!(RaopBuffer::new("96 352", "96 abc 0 16 40 10 14 2 255 0 0 44100", &key, &iv).is_none());
+        // Zero channels — would build a 0-channel decoder / zero-size buffers.
+        assert!(RaopBuffer::new("96 352", "96 352 0 16 40 10 14 0 255 0 0 44100", &key, &iv).is_none());
+        // Well-formed input still succeeds.
+        assert!(RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).is_some());
+    }
 }
 
 // ============================================================
 // mDNS service info
 // ============================================================
 #[test]
-fn service_info_txt_records() {
-    let info = AirPlayServiceInfo::new("TestSpeaker", 5000, &[0x48, 0x5d, 0x60, 0x7c, 0xee, 0x22], false);
-    assert_eq!(info.raop_name, "485D607CEE22@TestSpeaker");
-    assert_eq!(
-        info.raop_txt.iter().find(|(k, _)| k == "ch").map(|(_, v)| v.as_str()),
-        Some("2")
-    );
-    assert_eq!(
-        info.raop_txt.iter().find(|(k, _)| k == "sr").map(|(_, v)| v.as_str()),
-        Some("44100")
-    );
-    assert_eq!(
-        info.raop_txt.iter().find(|(k, _)| k == "pw").map(|(_, v)| v.as_str()),
-        Some("false")
-    );
-    assert_eq!(
-        info.airplay_txt
-            .iter()
-            .find(|(k, _)| k == "model")
-            .map(|(_, v)| v.as_str()),
-        Some("PlayOnAir1,1")
-    );
-}
-
-#[test]
 fn service_info_with_password() {
-    let info = AirPlayServiceInfo::new("Test", 5000, &[0; 6], true);
+    let info = AirPlayServiceInfo::new("Test", 5000, &[0; 6], true, "pk", "pi", false, false);
     assert_eq!(
         info.raop_txt.iter().find(|(k, _)| k == "pw").map(|(_, v)| v.as_str()),
         Some("true")
     );
 }
 
-// ============================================================
-// hex helper for AES tests
-// ============================================================
-mod hex {
-    pub fn encode(data: &[u8]) -> String {
-        data.iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
-
-#[cfg(all(test, feature = "ap2"))]
 mod ap2_tests {
     // --- C-verified: per-packet audio decryption ---
     // Generated from libsodium crypto_aead_chacha20poly1305_ietf_encrypt
@@ -568,7 +401,6 @@ mod ap2_tests {
 
 // --- NetworkTimeFrac edge cases ---
 
-#[cfg(all(test, feature = "ap2"))]
 mod frac_edge_tests {
     #[test]
     fn frac_zero() {
@@ -596,7 +428,6 @@ mod frac_edge_tests {
 
 // --- Playout buffer logic ---
 
-#[cfg(all(test, feature = "ap2"))]
 mod playout_tests {
     use shairplay::raop::buffered_audio::PlayoutCommand;
 
@@ -611,6 +442,14 @@ mod playout_tests {
         let _ = PlayoutCommand::Flush {
             from_seq: 0,
             until_seq: 100,
+            from_ts: None,
+            until_ts: None,
+        };
+        let _ = PlayoutCommand::Flush {
+            from_seq: 0,
+            until_seq: 100,
+            from_ts: Some(1_000),
+            until_ts: Some(50_000),
         };
         let _ = PlayoutCommand::Stop;
     }
@@ -620,7 +459,6 @@ mod playout_tests {
 // Q1: accessory identity key — random, persisted, not device-derived
 // ============================================================
 
-#[cfg(feature = "ap2")]
 #[test]
 fn identity_key_has_entropy_and_is_not_device_derived() {
     use shairplay::crypto::pairing_homekit::{generate_identity_seed, identity_keypair, server_keypair};
@@ -633,7 +471,6 @@ fn identity_key_has_entropy_and_is_not_device_derived() {
     assert_ne!(vk_random.as_bytes(), vk_derived.as_bytes());
 }
 
-#[cfg(feature = "ap2")]
 #[test]
 fn pairing_store_identity_methods_default_and_roundtrip() {
     use shairplay::{MemoryPairingStore, PairingStore};
@@ -665,7 +502,6 @@ fn pairing_store_identity_methods_default_and_roundtrip() {
     assert_eq!(s.load_identity(), Some([7u8; 32]));
 }
 
-#[cfg(feature = "ap2")]
 #[test]
 fn server_build_generates_and_persists_random_identity() {
     use shairplay::{AudioFormat, AudioHandler, AudioSession, PairingStore, RaopServer};

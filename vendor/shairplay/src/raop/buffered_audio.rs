@@ -47,11 +47,24 @@ const RESUME_BUFFER_DURATION_SECS: u32 = 50;
 /// Should be unreachable with paced reads. Never drops the head (playhead) side.
 const BACKSTOP_BUFFER_DURATION_SECS: u32 = 180;
 
+/// On SetRate (rate != 0), purge buffered frames more than this many seconds of source
+/// samples behind the wire RTP anchor before the earliest-frame lead nudge.
+///
+/// Prevents one stray pre-seek packet from dragging the playhead arbitrarily far into
+/// the past when the nudge used earliest-in-map.
+const ANCHOR_BACKWARD_TOLERANCE_SECS: u32 = 2;
+
 /// Typical AAC frame length in source samples (ADTS / AirPlay buffered path).
 const AAC_FRAME_SAMPLES: u32 = 1024;
 
 /// Minimum interval between backstop warning logs (1 s of mono time).
 const BACKSTOP_WARN_INTERVAL_NS: u64 = 1_000_000_000;
+
+/// 100 ms of source samples — lead used by SetRate nudge and post-flush re-anchor.
+#[inline]
+fn reanchor_lead_frames(source_sample_rate: u32) -> u32 {
+    source_sample_rate / 10
+}
 
 #[derive(Debug, Clone)]
 /// Output configuration passed from the server builder.
@@ -74,12 +87,16 @@ pub enum PlayoutCommand {
         /// Playback rate (1 = playing, 0 = paused).
         rate: u32,
     },
-    /// Flush buffered frames in the given RTP timestamp range.
+    /// Flush buffered frames (FLUSHBUFFERED). Prefer RTP timestamp fields when present.
     Flush {
-        /// First timestamp to flush.
+        /// First packet sequence number (`flushFromSeq`).
         from_seq: u32,
-        /// Last timestamp to flush.
+        /// Last packet sequence number (`flushUntilSeq`).
         until_seq: u32,
+        /// First RTP timestamp to flush (`flushFromTS`), when the plist carries it.
+        from_ts: Option<u32>,
+        /// Last RTP timestamp to flush (`flushUntilTS`), when the plist carries it.
+        until_ts: Option<u32>,
     },
     /// Stop playback and tear down.
     Stop,
@@ -102,6 +119,13 @@ struct PlayoutState {
     pending_rate: Option<u32>,
     /// Set by the command task on FLUSHBUFFERED; drained by `delivery_loop`.
     pending_flush: bool,
+    /// Armed by playing FLUSHBUFFERED; resolved on first post-flush packet that survives epoch purge.
+    ///
+    /// Apple may re-key the RTP epoch on track skip. Anchoring immediately to `flushUntilTS`
+    /// would leave the playhead in the old epoch so wrap-safe comparisons mark the whole new
+    /// prebuffer already-due (firehose into the host ring). Defer re-anchor until a real packet
+    /// arrives and claims the new epoch.
+    pending_reanchor: bool,
     /// Cumulative map entries refused by the newest-drop pathological backstop.
     backstop_newest_drops: u64,
     /// Mono time of last rate-limited backstop warning.
@@ -232,6 +256,198 @@ fn retain_near_rtp_epoch(buffer: &mut BTreeMap<u32, Vec<f32>>, reference_ts: u32
     n
 }
 
+/// Apply SETRATEANCHORTIME to playout state: rate, wire anchor, optional nudge/purge.
+///
+/// On rate != 0: purge frames more than [`ANCHOR_BACKWARD_TOLERANCE_SECS`] behind the
+/// wire anchor, then nudge `anchor_rtp` to earliest remaining minus 100 ms lead (or keep
+/// the wire anchor if the map is empty). Frames still behind the nudged anchor are
+/// discarded. On rate == 0: wire assignment only (pause) — no purge, no nudge.
+///
+/// Always clears [`PlayoutState::pending_reanchor`]: a wire SetRate is authoritative and
+/// supersedes any deferred flush re-anchor.
+fn apply_set_rate(s: &mut PlayoutState, wire_anchor: u32, rate: u32) {
+    let was_paused = s.rate == 0;
+    s.pending_reanchor = false;
+    s.anchor_rtp = wire_anchor;
+    s.rate = rate;
+    s.pending_rate = Some(rate);
+
+    if rate == 0 {
+        info!("Playout paused");
+        return;
+    }
+
+    // Drop pre-seek strays far behind the wire so earliest-in-map cannot drag the playhead.
+    let tolerance_frames = s.source_sample_rate.saturating_mul(ANCHOR_BACKWARD_TOLERANCE_SECS);
+    let tolerance_i32 = tolerance_frames as i32;
+    let stray: Vec<u32> = s
+        .buffer
+        .keys()
+        .filter(|&&ts| rtp_signed_delta(ts, wire_anchor) < -tolerance_i32)
+        .copied()
+        .collect();
+    if !stray.is_empty() {
+        debug!(purged = stray.len(), "Purged stray frames behind wire anchor");
+    }
+    for k in stray {
+        s.buffer.remove(&k);
+    }
+
+    // Nudge so the earliest remaining frame is due with a small lead (smooth start / skip dead air).
+    if let Some(&first_ts) = s.buffer.keys().next() {
+        let lead_frames = reanchor_lead_frames(s.source_sample_rate);
+        s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
+    }
+    s.anchor_local_ns = mono_now_ns();
+
+    // Frames within tolerance behind wire can still sit behind the nudged anchor
+    // (e.g. earliest ahead of wire → nudge jumps past them).
+    let stale: Vec<u32> = s
+        .buffer
+        .keys()
+        .filter(|&&ts| (s.anchor_rtp.wrapping_sub(ts) as i32) > 0)
+        .copied()
+        .collect();
+    if !stale.is_empty() {
+        debug!(discarded = stale.len(), "Discarded stale frames");
+    }
+    for k in stale {
+        s.buffer.remove(&k);
+    }
+
+    if was_paused {
+        // Log the wire value from the command, not the post-nudge anchor.
+        info!(anchor_rtp = wire_anchor, "Playout started");
+    }
+}
+
+/// Apply FLUSHBUFFERED to playout state: trim map, epoch purge, arm pending re-anchor.
+///
+/// When both `from_ts` / `until_ts` are present, range and epoch use RTP timestamps (map
+/// key units). Otherwise seq numbers are used (legacy path). While playing (`rate != 0`)
+/// with `until_ts`, arm [`PlayoutState::pending_reanchor`] instead of anchoring to
+/// `flushUntilTS` immediately — Apple may re-key the RTP epoch on the next packets.
+/// Resolution happens on the receive insert path (see [`insert_decoded_frame`]: pending
+/// resolve plus epoch-collapse correction if a straggler claimed pending first).
+fn apply_flush(s: &mut PlayoutState, from_seq: u32, until_seq: u32, from_ts: Option<u32>, until_ts: Option<u32>) {
+    // Prefer RTP timestamp fields when both are present — map keys are timestamps, not seq.
+    let (range_from, range_until) = match (from_ts, until_ts) {
+        (Some(from), Some(until)) => (from, until),
+        _ => (from_seq, until_seq),
+    };
+    let epoch_ref = until_ts.unwrap_or(range_until);
+
+    let keys: Vec<u32> = s
+        .buffer
+        .keys()
+        .filter(|&&ts| rtp_in_flush_range(ts, range_from, range_until))
+        .copied()
+        .collect();
+    for k in &keys {
+        s.buffer.remove(k);
+    }
+    // FLUSH is an RTP epoch boundary: drop orphans far from the flush end so a later
+    // multi-billion-tick re-anchor cannot trip the backstop.
+    let max_span = s.source_sample_rate.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+    let epoch_purged = retain_near_rtp_epoch(&mut s.buffer, epoch_ref, max_span);
+    s.pending_flush = true;
+
+    // Track skip often sends FLUSHBUFFERED without a following SETRATEANCHORTIME. Same-epoch
+    // skips leave the next frame ~prebuffer ahead of a stale playhead (~30 s silence) unless
+    // we re-anchor. Cross-epoch skips re-key RTP, so anchoring to flushUntilTS is wrong.
+    // Arm pending and resolve on the first post-flush packet that survives epoch enforcement.
+    // Do not compare flushUntilTS to the playhead — that comparison is cross-epoch coin-flip.
+    if s.rate != 0 && until_ts.is_some() {
+        s.pending_reanchor = true;
+        debug!("Flush armed pending re-anchor for first surviving post-flush packet");
+    }
+
+    debug!(
+        flushed = keys.len(),
+        epoch_purged,
+        map_len = s.buffer.len(),
+        has_ts = until_ts.is_some(),
+        pending_reanchor = s.pending_reanchor,
+        "Flushed"
+    );
+}
+
+/// Re-anchor playout to `inserted_ts` with 100 ms lead and clear `pending_reanchor`.
+///
+/// Returns the lead in source frames (for tracing).
+fn apply_reanchor_to_inserted(s: &mut PlayoutState, inserted_ts: u32) -> u32 {
+    let lead_frames = reanchor_lead_frames(s.source_sample_rate);
+    s.anchor_rtp = inserted_ts.wrapping_sub(lead_frames);
+    s.anchor_local_ns = mono_now_ns();
+    s.pending_reanchor = false;
+    lead_frames
+}
+
+/// Resolve a deferred flush re-anchor after a receive-path insert + epoch retain.
+///
+/// Call only after `buffer.insert(inserted_ts, …)` and [`retain_near_rtp_epoch`] so we can
+/// tell whether the inserted key is a real new-epoch packet (still in the map) or an
+/// old-epoch straggler that epoch purge just removed. Surviving packet re-anchors with a
+/// 100 ms lead ([`reanchor_lead_frames`]); straggler leaves `pending_reanchor` set for the
+/// next insert.
+fn resolve_pending_reanchor_after_insert(s: &mut PlayoutState, inserted_ts: u32) {
+    if !s.pending_reanchor {
+        return;
+    }
+    // Old-epoch straggler: epoch retain removed the key — wait for a real new-epoch packet.
+    if !s.buffer.contains_key(&inserted_ts) {
+        return;
+    }
+    let lead_frames = apply_reanchor_to_inserted(s, inserted_ts);
+    debug!(
+        inserted_ts,
+        lead_frames,
+        anchor_rtp = s.anchor_rtp,
+        "Pending re-anchor applied from first post-flush packet"
+    );
+}
+
+/// When epoch retain collapses the map onto a new RTP epoch while playing, re-anchor if the
+/// surviving insert is epoch-far from the current anchor.
+///
+/// Covers the cross-epoch skip hole where an old-epoch straggler claimed
+/// [`PlayoutState::pending_reanchor`] first: pending is already false, but the true new-epoch
+/// packet still needs the playhead moved. Wire SetRate still overrides later.
+fn maybe_reanchor_on_epoch_collapse(s: &mut PlayoutState, inserted_ts: u32, epoch_dropped: usize, max_span: u32) {
+    if epoch_dropped == 0 || s.rate == 0 || max_span == 0 {
+        return;
+    }
+    // Inserted packet is the retain reference so it always survives; require it present anyway.
+    if !s.buffer.contains_key(&inserted_ts) {
+        return;
+    }
+    if rtp_signed_delta(inserted_ts, s.anchor_rtp).unsigned_abs() <= max_span {
+        return;
+    }
+    let lead_frames = apply_reanchor_to_inserted(s, inserted_ts);
+    debug!(
+        inserted_ts,
+        lead_frames,
+        epoch_dropped,
+        anchor_rtp = s.anchor_rtp,
+        "Epoch-collapse re-anchor applied after map retained new epoch"
+    );
+}
+
+/// Insert decoded PCM, enforce RTP epoch, then pending / epoch-collapse re-anchor.
+///
+/// Shared by the production receive loop and unit tests so both hit the same post-retain
+/// logic. Returns the number of entries dropped by [`retain_near_rtp_epoch`] (for backstop
+/// logging). Callers that need the newest-drop backstop run [`enforce_newest_backstop`] after.
+fn insert_decoded_frame(s: &mut PlayoutState, timestamp: u32, samples: Vec<f32>) -> usize {
+    s.buffer.insert(timestamp, samples);
+    let max_span = s.source_sample_rate.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
+    let epoch_dropped = retain_near_rtp_epoch(&mut s.buffer, timestamp, max_span);
+    resolve_pending_reanchor_after_insert(s, timestamp);
+    maybe_reanchor_on_epoch_collapse(s, timestamp, epoch_dropped, max_span);
+    epoch_dropped
+}
+
 /// Pathological backstop: drop **newest** entries until under 3× target depth.
 ///
 /// Within a single epoch, never removes the head of the map (packets about to be
@@ -306,6 +522,7 @@ impl BufferedAudioProcessor {
                 format_changed: false,
                 pending_rate: None,
                 pending_flush: false,
+                pending_reanchor: false,
                 backstop_newest_drops: 0,
                 last_backstop_warn_ns: 0,
             }),
@@ -336,56 +553,16 @@ impl BufferedAudioProcessor {
                         anchor_time_ns: _,
                         rate,
                     } => {
-                        s.anchor_rtp = anchor_rtp;
-                        let was_paused = s.rate == 0;
-                        s.rate = rate;
-                        // Delivery thread owns the AudioSession; queue for on_rate.
-                        s.pending_rate = Some(rate);
-                        if rate == 0 {
-                            info!("Playout paused");
-                        } else {
-                            // Set anchor so the earliest buffered frame is deliverable
-                            // with a small lead time for smooth playback
-                            if let Some(&first_ts) = s.buffer.keys().next() {
-                                // Lead is in RTP source-clock frames, not output rate.
-                                let lead_frames = s.source_sample_rate / 10; // 100ms lead
-                                s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
-                            }
-                            s.anchor_local_ns = mono_now_ns();
-                            let stale: Vec<u32> = s
-                                .buffer
-                                .keys()
-                                .filter(|&&ts| (s.anchor_rtp.wrapping_sub(ts) as i32) > 0)
-                                .copied()
-                                .collect();
-                            if !stale.is_empty() {
-                                debug!(discarded = stale.len(), "Discarded stale frames");
-                            }
-                            for k in stale {
-                                s.buffer.remove(&k);
-                            }
-                            if was_paused {
-                                info!(anchor_rtp, "Playout started");
-                            }
-                        }
+                        apply_set_rate(&mut s, anchor_rtp, rate);
                         cvar.notify_all();
                     }
-                    PlayoutCommand::Flush { from_seq, until_seq } => {
-                        let keys: Vec<u32> = s
-                            .buffer
-                            .keys()
-                            .filter(|&&ts| rtp_in_flush_range(ts, from_seq, until_seq))
-                            .copied()
-                            .collect();
-                        for k in &keys {
-                            s.buffer.remove(k);
-                        }
-                        // FLUSH is an RTP epoch boundary: drop orphans far from the flush end
-                        // so a later multi-billion-tick re-anchor cannot trip the backstop.
-                        let max_span = s.source_sample_rate.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
-                        let epoch_purged = retain_near_rtp_epoch(&mut s.buffer, until_seq, max_span);
-                        s.pending_flush = true;
-                        debug!(flushed = keys.len(), epoch_purged, map_len = s.buffer.len(), "Flushed");
+                    PlayoutCommand::Flush {
+                        from_seq,
+                        until_seq,
+                        from_ts,
+                        until_ts,
+                    } => {
+                        apply_flush(&mut s, from_seq, until_seq, from_ts, until_ts);
                         cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
@@ -562,11 +739,9 @@ async fn receive_loop(
 
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            s.buffer.insert(timestamp, samples);
+            // Insert + epoch purge + pending/epoch-collapse re-anchor, then packet-count backstop.
+            let epoch_dropped = insert_decoded_frame(&mut s, timestamp, samples);
             let source_sr = s.source_sample_rate;
-            let max_span = source_sr.saturating_mul(BACKSTOP_BUFFER_DURATION_SECS);
-            // Epoch purge first (FLUSH re-anchor), then single-epoch packet-count backstop.
-            let epoch_dropped = retain_near_rtp_epoch(&mut s.buffer, timestamp, max_span);
             let backstop_dropped = enforce_newest_backstop(&mut s.buffer, source_sr);
             let dropped = epoch_dropped.saturating_add(backstop_dropped);
             if dropped > 0 {
@@ -798,11 +973,17 @@ mod tests {
                 format_changed: false,
                 pending_rate: None,
                 pending_flush: false,
+                pending_reanchor: false,
                 backstop_newest_drops: 0,
                 last_backstop_warn_ns: 0,
             }),
             Condvar::new(),
         ))
+    }
+
+    /// Mirror the receive path: insert → epoch retain → pending / epoch-collapse re-anchor.
+    fn receive_insert_with_pending_resolve(s: &mut PlayoutState, timestamp: u32, samples: Vec<f32>) {
+        let _epoch_dropped = insert_decoded_frame(s, timestamp, samples);
     }
 
     fn spawn_delivery(
@@ -1435,6 +1616,455 @@ mod tests {
                 "map must not retain multi-epoch bulk; len={} purged={purged}",
                 s.buffer.len()
             );
+        }
+    }
+
+    // --- FLUSHBUFFERED TS fields + pending re-anchor (track skip without SETRATEANCHORTIME) ---
+
+    /// Same-epoch skip: flush arms pending; first post-flush packet at until_ts re-anchors
+    /// so the frame is due within the lead window (protects the original ~30 s silence fix).
+    #[test]
+    fn flush_with_ts_while_playing_reanchors() {
+        let source_sr = 44_100u32;
+        let lead = source_sr / 10;
+        let flush_until = 1_322_880u32; // ~30 s at 44.1 kHz (sender prebuffer depth)
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = mono_now_ns();
+            let anchor_before = s.anchor_rtp;
+            let local_before = s.anchor_local_ns;
+            // Prebuffer/old track frames inside the flush range (removed by trim).
+            s.buffer.insert(1000, vec![0.0]);
+            s.buffer.insert(500_000, vec![0.5]);
+
+            apply_flush(&mut s, 0, 0, Some(0), Some(flush_until));
+
+            assert!(s.pending_flush);
+            assert!(s.pending_reanchor, "playing flush with until_ts must arm pending");
+            assert!(!s.buffer.contains_key(&1000));
+            assert!(!s.buffer.contains_key(&500_000));
+            // Anchor must not move until a surviving post-flush packet arrives.
+            assert_eq!(s.anchor_rtp, anchor_before);
+            assert_eq!(s.anchor_local_ns, local_before);
+
+            // Next-track packet at flush end (same epoch) — receive path resolve.
+            receive_insert_with_pending_resolve(&mut s, flush_until, vec![1.0, 1.0]);
+            assert!(!s.pending_reanchor, "surviving insert must clear pending");
+            assert_eq!(s.anchor_rtp, flush_until.wrapping_sub(lead));
+
+            let target_at_lead = s.anchor_rtp.wrapping_add(lead);
+            let due = take_due_frames(&mut s.buffer, target_at_lead, MAX_FRAMES_PER_TICK);
+            assert!(
+                due.iter().any(|(ts, _)| *ts == flush_until),
+                "frame at flushUntilTS must be due within lead; due={due:?}"
+            );
+        }
+    }
+
+    /// Cross-epoch skip with an in-flight old-epoch straggler before the first new-track
+    /// packet: straggler claims pending and clears it; true new-epoch insert collapses the
+    /// map (`epoch_dropped > 0`) and must still re-anchor (pending may already be false).
+    /// Without the epoch-collapse correction the anchor stays in the dead epoch and the
+    /// new-track burst firehoses via `take_due_frames`.
+    #[test]
+    fn flush_cross_epoch_straggler_then_new_epoch_reanchors() {
+        let source_sr = 44_100u32;
+        let lead = reanchor_lead_frames(source_sr);
+        let old_epoch_until = 1_000_000u32;
+        // In-flight old-epoch packet near flush end (same half-plane as pre-flush map).
+        let old_straggler = old_epoch_until.wrapping_sub(5_000);
+        // New RTP base ~2e9 ticks from old flush end (wrap-safe past half-plane).
+        let new_base = old_epoch_until.wrapping_sub(2_000_000_000);
+        let burst_packets = 40u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = mono_now_ns();
+            for i in 0..20u32 {
+                s.buffer.insert(i.wrapping_mul(AAC_FRAME_SAMPLES), vec![0.0]);
+            }
+
+            apply_flush(&mut s, 0, 0, Some(0), Some(old_epoch_until));
+            assert!(s.pending_reanchor);
+            assert_eq!(s.anchor_rtp, 0, "flush must not re-anchor until insert");
+
+            // Straggler arrives first: map still old-epoch → no collapse, claims pending.
+            receive_insert_with_pending_resolve(&mut s, old_straggler, vec![0.5, 0.5]);
+            assert!(!s.pending_reanchor, "straggler must clear pending_reanchor");
+            assert_eq!(
+                s.anchor_rtp,
+                old_straggler.wrapping_sub(lead),
+                "straggler claims anchor before new epoch arrives"
+            );
+            assert!(s.buffer.contains_key(&old_straggler));
+
+            // True new-epoch packet collapses map off the straggler; anchor must follow.
+            receive_insert_with_pending_resolve(&mut s, new_base, vec![1.0, 1.0]);
+            assert!(
+                !s.buffer.contains_key(&old_straggler),
+                "epoch retain must drop straggler"
+            );
+            assert!(s.buffer.contains_key(&new_base));
+            assert!(!s.pending_reanchor);
+            assert_eq!(
+                s.anchor_rtp,
+                new_base.wrapping_sub(lead),
+                "epoch-collapse must re-anchor to new-epoch insert despite pending already clear"
+            );
+
+            // Fill remaining burst on the new epoch (first packet already inserted).
+            for i in 1..burst_packets {
+                let ts = new_base.wrapping_add(i.wrapping_mul(AAC_FRAME_SAMPLES));
+                receive_insert_with_pending_resolve(&mut s, ts, vec![1.0, 1.0]);
+            }
+            // Anchor must stay on the new epoch (not drift back to the straggler).
+            assert_eq!(s.anchor_rtp, new_base.wrapping_sub(lead));
+
+            let target_at_lead = s.anchor_rtp.wrapping_add(lead);
+            assert_eq!(target_at_lead, new_base);
+            let due = take_due_frames(&mut s.buffer, target_at_lead, MAX_FRAMES_PER_TICK);
+            assert!(
+                !due.is_empty(),
+                "at least the first new-epoch frame must be due within lead"
+            );
+            assert!(
+                due.len() <= 2,
+                "lead window must not firehose the burst after straggler race; due={}",
+                due.len()
+            );
+            assert!(
+                due.iter().all(|(ts, _)| rtp_signed_delta(*ts, new_base) <= 0),
+                "only frames at/before new_base due at lead target; due={due:?}"
+            );
+            let remaining = s.buffer.len();
+            assert!(
+                remaining >= (burst_packets as usize).saturating_sub(due.len()),
+                "most of the burst must still be buffered; remaining={remaining} due={}",
+                due.len()
+            );
+
+            // Sanity: stranded old-epoch playhead would have firehosed the whole burst.
+            let bad_target = old_straggler.wrapping_sub(lead).wrapping_add(lead);
+            let mut probe = BTreeMap::new();
+            for i in 0..burst_packets {
+                let ts = new_base.wrapping_add(i.wrapping_mul(AAC_FRAME_SAMPLES));
+                probe.insert(ts, vec![1.0, 1.0]);
+            }
+            let would_be_due = take_due_frames(&mut probe, bad_target, MAX_FRAMES_PER_TICK);
+            assert!(
+                would_be_due.len() >= MAX_FRAMES_PER_TICK.min(burst_packets as usize),
+                "sanity: old-epoch playhead would firehose; due={}",
+                would_be_due.len()
+            );
+        }
+    }
+
+    /// Cross-epoch skip: Apple re-keys RTP after FLUSH into a past half-plane of the old
+    /// flushUntilTS. Immediate anchor to flushUntilTS would mark the whole new prebuffer
+    /// already-due (firehose). Pending resolve on the new-epoch insert keeps only the
+    /// lead-window amount due at the post-anchor target.
+    #[test]
+    fn flush_cross_epoch_pending_reanchor_no_firehose() {
+        let source_sr = 44_100u32;
+        let lead = source_sr / 10;
+        let old_epoch_until = 1_000_000u32;
+        // New RTP base ~2e9 ticks "behind" old flush end (wrap-safe past half-plane).
+        // Anchoring to old flushUntil would make this entire burst already-due.
+        let new_base = old_epoch_until.wrapping_sub(2_000_000_000);
+        let burst_packets = 40u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = mono_now_ns();
+            // Old-epoch prebuffer inside the flush range.
+            for i in 0..20u32 {
+                s.buffer.insert(i.wrapping_mul(AAC_FRAME_SAMPLES), vec![0.0]);
+            }
+
+            apply_flush(&mut s, 0, 0, Some(0), Some(old_epoch_until));
+            assert!(s.pending_reanchor);
+            assert_eq!(s.anchor_rtp, 0, "flush must not re-anchor until insert");
+
+            // Burst of new-epoch packets (receive path).
+            for i in 0..burst_packets {
+                let ts = new_base.wrapping_add(i.wrapping_mul(AAC_FRAME_SAMPLES));
+                receive_insert_with_pending_resolve(&mut s, ts, vec![1.0, 1.0]);
+            }
+            assert!(!s.pending_reanchor, "first surviving new-epoch insert must re-anchor");
+            assert_eq!(s.anchor_rtp, new_base.wrapping_sub(lead));
+
+            // Prove the firehose condition: relative to an old-epoch playhead the whole
+            // burst would be due; with correct re-anchor only the lead window is due.
+            let bad_target = old_epoch_until.wrapping_sub(lead);
+            let would_be_due = s
+                .buffer
+                .keys()
+                .filter(|&&ts| (bad_target.wrapping_sub(ts) as i32) >= 0)
+                .count();
+            assert!(
+                would_be_due >= burst_packets as usize,
+                "sanity: old-epoch playhead would firehose; would_be_due={would_be_due}"
+            );
+
+            let target_at_lead = s.anchor_rtp.wrapping_add(lead);
+            assert_eq!(target_at_lead, new_base);
+            let due = take_due_frames(&mut s.buffer, target_at_lead, MAX_FRAMES_PER_TICK);
+            assert!(
+                !due.is_empty(),
+                "at least the first new-epoch frame must be due within lead"
+            );
+            // At lead target only ~1 packet is due (the one at new_base), not the full tick cap.
+            assert!(
+                due.len() <= 2,
+                "lead window must not firehose the burst; due={}",
+                due.len()
+            );
+            assert!(
+                due.iter().all(|(ts, _)| rtp_signed_delta(*ts, new_base) <= 0),
+                "only frames at/before new_base due at lead target; due={due:?}"
+            );
+            let remaining = s.buffer.len();
+            assert!(
+                remaining >= (burst_packets as usize).saturating_sub(due.len()),
+                "most of the burst must still be buffered; remaining={remaining} due={}",
+                due.len()
+            );
+        }
+    }
+
+    /// Pause-path flush (rate == 0) must not arm pending re-anchor or move the anchor.
+    #[test]
+    fn flush_while_paused_does_not_reanchor() {
+        let source_sr = 44_100u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            s.anchor_rtp = 42_000;
+            s.anchor_local_ns = 99_000_000;
+            s.buffer.insert(100, vec![1.0]);
+            s.buffer.insert(50_000, vec![2.0]);
+
+            apply_flush(&mut s, 0, 0, Some(0), Some(50_000));
+
+            assert_eq!(s.anchor_rtp, 42_000);
+            assert_eq!(s.anchor_local_ns, 99_000_000);
+            assert!(s.pending_flush);
+            assert!(!s.pending_reanchor, "paused flush must not arm pending_reanchor");
+            assert!(!s.buffer.contains_key(&100));
+        }
+    }
+
+    /// Wire SETRATEANCHORTIME clears pending and applies SetRate anchor rules.
+    #[test]
+    fn set_rate_clears_pending_reanchor() {
+        let source_sr = 44_100u32;
+        let lead = source_sr / 10;
+        let flush_until = 1_000_000u32;
+        let wire = 2_000_000u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = mono_now_ns();
+            s.buffer.insert(wire, vec![1.0, 1.0]);
+
+            apply_flush(&mut s, 0, 0, Some(0), Some(flush_until));
+            assert!(s.pending_reanchor);
+
+            apply_set_rate(&mut s, wire, 1);
+
+            assert!(!s.pending_reanchor, "SetRate must clear pending_reanchor");
+            assert_eq!(s.anchor_rtp, wire.wrapping_sub(lead));
+            assert_eq!(s.rate, 1);
+        }
+    }
+
+    /// TS-based trim removes exactly [fromTS, untilTS] (wrap-safe) and leaves later frames.
+    #[test]
+    fn flush_ts_trim_removes_range_wrap_safe() {
+        let state = fresh_state(44_100, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0; // no re-anchor side effects
+            let from_ts = u32::MAX - 100;
+            let until_ts = 100u32;
+            s.buffer.insert(u32::MAX - 50, vec![1.0]);
+            s.buffer.insert(10, vec![2.0]);
+            s.buffer.insert(until_ts, vec![3.0]); // inclusive end
+            s.buffer.insert(5000, vec![4.0]); // after range
+            // Seq fields deliberately wrong units / values — TS path must win.
+            apply_flush(&mut s, 999_999, 999_999, Some(from_ts), Some(until_ts));
+
+            assert!(!s.buffer.contains_key(&(u32::MAX - 50)));
+            assert!(!s.buffer.contains_key(&10));
+            assert!(!s.buffer.contains_key(&until_ts));
+            assert!(s.buffer.contains_key(&5000));
+            assert_eq!(s.buffer.len(), 1);
+        }
+    }
+
+    /// Seq-only flush (no TS fields) keeps legacy range/epoch behavior and does not re-anchor.
+    #[test]
+    fn flush_seq_only_preserves_old_behavior() {
+        let source_sr = 44_100u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = mono_now_ns();
+            let anchor_before = s.anchor_rtp;
+            let local_before = s.anchor_local_ns;
+
+            // Keys are RTP timestamps; seq-only path compares seq numbers as if they were TS.
+            s.buffer.insert(u32::MAX - 50, vec![1.0]);
+            s.buffer.insert(10, vec![2.0]);
+            s.buffer.insert(5000, vec![3.0]);
+
+            let from_seq = u32::MAX - 100;
+            let until_seq = 100u32;
+            apply_flush(&mut s, from_seq, until_seq, None, None);
+
+            assert!(!s.buffer.contains_key(&(u32::MAX - 50)));
+            assert!(!s.buffer.contains_key(&10));
+            assert!(s.buffer.contains_key(&5000));
+            assert_eq!(s.buffer.len(), 1);
+            // No until_ts → no re-anchor / pending even while playing.
+            assert_eq!(s.anchor_rtp, anchor_before);
+            assert_eq!(s.anchor_local_ns, local_before);
+            assert!(s.pending_flush);
+            assert!(!s.pending_reanchor);
+        }
+    }
+
+    // --- SETRATEANCHORTIME wire-anchor authority + stray purge before lead nudge ---
+
+    /// A packet ~145 s behind the wire must not drag the playhead into the past after scrub.
+    #[test]
+    fn set_rate_purges_stray_far_behind_wire_anchor() {
+        let source_sr = 44_100u32;
+        let lead = source_sr / 10;
+        let wire = 941_597_805u32;
+        let stray = wire.wrapping_sub(145 * source_sr);
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            s.buffer.insert(stray, vec![0.0]);
+            s.buffer.insert(wire, vec![1.0, 1.0]);
+
+            apply_set_rate(&mut s, wire, 1);
+
+            assert!(!s.buffer.contains_key(&stray), "stray far behind wire must be purged");
+            assert!(s.buffer.contains_key(&wire), "frame at wire must remain");
+            assert_eq!(s.anchor_rtp, wire.wrapping_sub(lead));
+            assert_eq!(s.rate, 1);
+            assert_eq!(s.pending_rate, Some(1));
+
+            let target_at_lead = s.anchor_rtp.wrapping_add(lead);
+            let due = take_due_frames(&mut s.buffer, target_at_lead, MAX_FRAMES_PER_TICK);
+            assert!(
+                due.iter().any(|(ts, _)| *ts == wire),
+                "frame at wire must be due within lead; due={due:?}"
+            );
+        }
+    }
+
+    /// Earliest within the 2 s backward tolerance still gets the earliest-minus-lead nudge.
+    #[test]
+    fn set_rate_nudge_within_backward_tolerance() {
+        let source_sr = 44_100u32;
+        let lead = source_sr / 10;
+        let wire = 1_000_000u32;
+        let earliest = wire.wrapping_sub(source_sr); // 1 s behind wire
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            s.buffer.insert(earliest, vec![1.0]);
+            s.buffer.insert(wire, vec![2.0]);
+
+            apply_set_rate(&mut s, wire, 1);
+
+            assert!(s.buffer.contains_key(&earliest));
+            assert_eq!(s.anchor_rtp, earliest.wrapping_sub(lead));
+        }
+    }
+
+    /// Earliest ahead of wire: nudge to earliest - lead (skip dead air).
+    #[test]
+    fn set_rate_nudge_when_earliest_ahead_of_wire() {
+        let source_sr = 44_100u32;
+        let lead = source_sr / 10;
+        let wire = 1_000_000u32;
+        let earliest = wire.wrapping_add(5 * source_sr); // 5 s ahead
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            s.buffer.insert(earliest, vec![1.0]);
+
+            apply_set_rate(&mut s, wire, 1);
+
+            assert!(s.buffer.contains_key(&earliest));
+            assert_eq!(s.anchor_rtp, earliest.wrapping_sub(lead));
+        }
+    }
+
+    /// Empty map keeps the wire anchor exactly (no nudge source).
+    #[test]
+    fn set_rate_empty_buffer_keeps_wire_anchor() {
+        let source_sr = 44_100u32;
+        let wire = 941_597_805u32;
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 0;
+            // Sentinel: mono_now_ns() can legitimately return 0 on the process's first
+            // call (lazy epoch), so assert the field changed rather than became nonzero.
+            s.anchor_local_ns = u64::MAX;
+
+            apply_set_rate(&mut s, wire, 1);
+
+            assert!(s.buffer.is_empty());
+            assert_eq!(s.anchor_rtp, wire);
+            assert_ne!(s.anchor_local_ns, u64::MAX, "local anchor time must update on play");
+            assert_eq!(s.pending_rate, Some(1));
+        }
+    }
+
+    /// rate == 0: wire assignment only — no purge, no earliest-frame nudge.
+    #[test]
+    fn set_rate_zero_no_purge_no_nudge() {
+        let source_sr = 44_100u32;
+        let wire = 941_597_805u32;
+        let stray = wire.wrapping_sub(145 * source_sr);
+        let state = fresh_state(source_sr, 2);
+        {
+            let mut s = state.0.lock().unwrap_or_else(PoisonError::into_inner);
+            s.rate = 1;
+            s.anchor_rtp = 0;
+            s.anchor_local_ns = 123;
+            s.buffer.insert(stray, vec![0.0]);
+
+            s.pending_reanchor = true;
+            apply_set_rate(&mut s, wire, 0);
+
+            assert_eq!(s.rate, 0);
+            assert_eq!(s.anchor_rtp, wire);
+            assert_eq!(s.anchor_local_ns, 123, "pause must not rewrite local anchor");
+            assert!(s.buffer.contains_key(&stray), "pause must not purge strays");
+            assert_eq!(s.pending_rate, Some(0));
+            assert!(!s.pending_reanchor, "SetRate rate=0 must still clear pending");
         }
     }
 }

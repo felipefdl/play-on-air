@@ -10,7 +10,9 @@
 [![License: LGPL-3.0](https://img.shields.io/badge/license-LGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-A complete AirPlay audio and video receiver as a Rust library. Supports both classic AirPlay (AP1) and AirPlay 2 (AP2) with buffered audio, encrypted transport, HomeKit pairing, and screen mirroring. `#![forbid(unsafe_code)]`.
+A complete AirPlay 2 audio receiver as a Rust library, with buffered audio, encrypted transport, HomeKit pairing, and experimental screen mirroring. `#![forbid(unsafe_code)]`.
+
+> **PlayOnAir fork:** the AirPlay 1 stack (RSA / `airport.key`, legacy Ed25519 pairing, SDP ANNOUNCE, DACP remote control) is removed. See [PLAYONAIR.md](PLAYONAIR.md).
 
 **This is a clean-room Rust implementation — not a wrapper or FFI binding.** Every protocol handler, codec, and cryptographic primitive has been reimplemented from scratch in safe Rust. No C code from shairplay, shairport-sync, or any other project is linked or called.
 
@@ -24,7 +26,6 @@ A complete AirPlay audio and video receiver as a Rust library. Supports both cla
 
 |  | Feature | Details |
 |--|---------|---------|
-| 🎵 | **AirPlay 1 (Classic)** | ALAC decode, AES encryption, DACP remote control — rock solid |
 | 🎵 | **AirPlay 2** | Buffered AAC, SRP-6a pairing, ChaCha20-Poly1305 encrypted RTSP |
 | 🔊 | **Multichannel** | 5.1 and 7.1 AAC decode with ITU-R BS.775 mixdown to stereo |
 | 🔄 | **Resampling** | Automatic sample rate conversion via rubato |
@@ -39,8 +40,6 @@ A complete AirPlay audio and video receiver as a Rust library. Supports both cla
 > ¹ The crate itself contains no `unsafe` code. On macOS, mDNS service registration uses [astro-dnssd](https://crates.io/crates/astro-dnssd), which internally calls Apple's Bonjour C API via FFI. On Linux, [mdns-sd](https://crates.io/crates/mdns-sd) provides a pure Rust mDNS implementation with no native dependencies.
 
 ## Quick Start
-
-### AirPlay 1 (Classic)
 
 ```rust
 use std::sync::Arc;
@@ -57,7 +56,7 @@ impl AudioHandler for MyHandler {
 struct MySession;
 impl AudioSession for MySession {
     fn audio_process(&mut self, samples: &[f32]) {
-        // F32 interleaved PCM — same format for AP1 and AP2
+        // F32 interleaved PCM — same format for buffered and realtime streams
     }
 }
 
@@ -65,31 +64,14 @@ impl AudioSession for MySession {
 async fn main() -> Result<(), shairplay::ShairplayError> {
     let mut server = RaopServer::builder()
         .name("My Speaker")
+        .output_sample_rate(48000) // optional resampling
+        .output_max_channels(2) // optional multichannel mixdown
         .build(Arc::new(MyHandler))?;
     server.start().await?;
     tokio::signal::ctrl_c().await.unwrap();
     server.stop().await;
     Ok(())
 }
-```
-
-### AirPlay 2
-
-```rust
-// AP2 adds resampling and multichannel mixdown.
-// Output is always f32 interleaved PCM — same as AP1.
-let mut server = RaopServer::builder()
-    .name("My Speaker")
-    .output_sample_rate(48000)
-    .output_max_channels(2)
-    .build(Arc::new(MyHandler))?;
-
-// Or force AP1 mode at runtime (even with ap2 feature compiled in):
-use shairplay::AirPlayMode;
-let mut server = RaopServer::builder()
-    .name("My Speaker")
-    .mode(AirPlayMode::AirPlay1)
-    .build(Arc::new(MyHandler))?;
 ```
 
 ## Builder Options
@@ -102,11 +84,10 @@ let mut server = RaopServer::builder()
 | `.password()` | none | | HTTP Digest auth password |
 | `.max_clients()` | `10` | | Maximum concurrent connections |
 | `.bind()` | all interfaces | | Bind to specific IPs (multi-interface) |
-| `.output_sample_rate()` | source rate | `resample` | Resample all audio to this rate |
-| `.output_max_channels()` | source channels | `resample` | Mix down to this channel count |
-| `.pin()` | `"3939"` | `ap2` | PIN for HomeKit pairing |
-| `.mode()` | `AirPlayMode::AirPlay2` | `ap2` | Runtime protocol mode (AP1 or AP2) |
-| `.pairing_store()` | `MemoryPairingStore` | `ap2` | Persistent key storage |
+| `.output_sample_rate()` | source rate | | Resample all audio to this rate |
+| `.output_max_channels()` | source channels | | Mix down to this channel count |
+| `.pin()` | transient (no PIN) | | PIN for HomeKit pairing |
+| `.pairing_store()` | `MemoryPairingStore` | | Persistent key storage |
 | `.video_handler()` | none | `video` | Video session factory |
 | `.hls_handler()` | none | `hls` | HLS video playback handler |
 
@@ -114,17 +95,11 @@ let mut server = RaopServer::builder()
 
 | Flag | Dependencies | Description |
 |------|-------------|-------------|
-| *(default)* | — | AirPlay 1 only |
-| `resample` | rubato | Sample rate conversion + channel mixdown |
-| `ap2` | chacha20poly1305, hkdf, symphonia, … (implies `resample`) | Full AirPlay 2 audio |
-| `video` | (implies `ap2`) | Legacy feature set for screen mirroring (`0x527FFEE6`) |
+| *(default)* | — | AirPlay 2 audio |
+| `video` | aes, cbc, ctr | Legacy (UxPlay) feature set for screen mirroring (`0x527FFEE6`), including the legacy RTP audio it needs |
 | `hls` | (implies `video`) | HLS video playback (YouTube, etc.) — receiver relays URL to app |
 
 ## Implementation Status
-
-### ✅ AirPlay 1 — Production Ready
-
-Rock solid. ALAC decoding, AES encryption, DACP remote control, metadata (artwork, progress, track info). Works with iPhone, iPad, Mac, iTunes.
 
 ### ✅ AirPlay 2 Audio — Production Ready
 
@@ -152,35 +127,29 @@ for details.
 
 ### 🔬 Remote Control
 
-AP1 DACP remote control is fully implemented and works.
-
 Third-party AP2 receivers cannot send playback commands (play/pause/skip) to the iPhone. All paths require Apple ecosystem trust:
 
 - **Type 130 MRP data channel** — requires HomeKit seed (Home app pairing)
 - **Companion-link protocol** — requires same Apple ID
-- **DACP** — iPhone doesn't send Active-Remote header in AP2
+- **DACP** — iPhone doesn't send Active-Remote header in AP2 (the AP1 DACP client is not part of this fork)
 
-See [AP2-STATUS.md](AP2-STATUS.md) for the full research. If you have further insights or want to help investigate, please reach out!
+See [AP2-STATUS.md](AP2-STATUS.md) for the full research.
 
 ## Example Player
 
 The included example plays AirPlay audio through the system's default output device:
 
 ```bash
-# AirPlay 1
 cargo run --example player
 
-# AirPlay 2
-cargo run --example player --features ap2
-
 # With resampling to match output device rate (e.g. 44100→96000 Hz)
-cargo run --example player --features ap2 -- --resample
+cargo run --example player -- --resample
 
 # With persistent device identity (stable MAC + paired keys across restarts)
-cargo run --example player --features ap2 -- --persist state.json
+cargo run --example player -- --persist state.json
 
 # Custom name and interface binding
-cargo run --example player --features ap2 -- --name "Kitchen" --bind 192.168.1.100 --persist state.json --resample
+cargo run --example player -- --name "Kitchen" --bind 192.168.1.100 --persist state.json --resample
 
 # HLS video (YouTube) — requires mpv installed
 cargo run --example player --features hls -- --resample
@@ -194,34 +163,35 @@ Without `--resample`, audio is delivered at the source's native rate (44100 Hz).
 
 ``` plain
 src/
-├── raop/                RAOP server, RTSP handlers, RTP streaming
+├── raop/                AirPlay 2 server, RTSP handlers
 │   ├── buffered_audio   AP2 timed playout buffer with decrypt/decode/resample
+│   ├── realtime_audio   AP2 realtime (type 96) ALAC receiver
 │   ├── event_channel    AP2 encrypted event channel
+│   ├── rtp, buffer      Legacy RTP audio for screen mirroring (`video`)
 │   ├── video            Video handler traits (experimental)
 │   └── video_stream     Video stream receiver (experimental)
-├── crypto/              RSA, Ed25519+Curve25519, AES, FairPlay
+├── crypto/              Ed25519+Curve25519, FairPlay
 │   ├── pairing_homekit  AP2 SRP-6a + HomeKit pairing + pair-verify
 │   ├── chacha_transport AP2 ChaCha20-Poly1305 encrypted RTSP
+│   ├── playfair         FairPlay key decryption (`video`)
 │   ├── video_cipher     AES-128-CTR streaming cipher for video
 │   └── tlv              AP2 TLV codec for pairing messages
 ├── codec/               Audio decoders
-│   ├── alac             ALAC decoder (AP1)
-│   ├── aac              AAC decoder via symphonia (AP2)
+│   ├── alac             ALAC decoder (realtime streams)
+│   ├── aac              AAC decoder via symphonia (buffered streams)
 │   └── resample         Sample rate conversion + channel mixdown
-├── proto/               SDP, HTTP/RTSP, binary plist, HTTP Digest auth
+├── proto/               HTTP/RTSP, DMAP metadata, HTTP Digest auth
 ├── net/                 Async TCP server, mDNS, PTP timing, feature flags
-├── dacp/                DACP remote control client (AP1)
 └── error/               Error types
 ```
 
 ## Test Coverage
 
-158 tests including 17 C-verified pairing vectors from [pair_ap](https://github.com/ejurgensen/pair_ap) and 10 C-verified FairPlay vectors generated from the original [shairplay](https://github.com/juhovh/shairplay) C source:
+Pairing vectors are C-verified against [pair_ap](https://github.com/ejurgensen/pair_ap); FairPlay vectors were generated from the original [shairplay](https://github.com/juhovh/shairplay) C source:
 
 ```plain
-cargo test                    # AP1 tests
-cargo test --features ap2     # AP1 + AP2 tests
-cargo test --features video   # All tests
+cargo test                    # AirPlay 2 tests
+cargo test --features video   # + screen mirroring / legacy RTP tests
 ```
 
 ## Development

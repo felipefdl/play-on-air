@@ -1,5 +1,10 @@
 # AirPlay 2 — Implementation Status & Research
 
+This fork is AirPlay 2 only: the AirPlay 1 stack (RSA `airport.key`, legacy
+pairing, ANNOUNCE/SDP, DACP remote control) is removed. See
+[PLAYONAIR.md](PLAYONAIR.md) item 21 for what was removed and which AirPlay 1-era
+pieces the `video` feature still compiles in.
+
 ## Complete
 
 | Feature | Stream Type | Details |
@@ -8,7 +13,7 @@
 | SRP-6a transient pairing | — | PIN 3939, automatic, no persistence |
 | Normal HomeKit pairing | — | Configurable PIN, PairingStore key persistence |
 | Encrypted RTSP transport | — | ChaCha20-Poly1305, HKDF-SHA512 key derivation |
-| FairPlay handshake | — | Full fp-setup M1/M2 |
+| FairPlay handshake | — | Full fp-setup M1/M2 (required: features advertise `Authentication4`). Key decryption (`playfair`) is `video`-only |
 | PTP timing | — | ⚠ Client implemented but **not wired** to playout — see [Open / Unwired](#open--unwired--scaffolding-present-not-connected) |
 | Buffered audio | 103 | AAC decode (symphonia), per-packet ChaCha20 decrypt |
 | Multichannel | 103 | 5.1/7.1 AAC → stereo mixdown (ITU-R BS.775) |
@@ -170,19 +175,21 @@ With these changes, the trust relationship is established instantly, and audio s
 ## AP2 Remote Control — Research
 
 Third-party AP2 receivers cannot send playback commands (play/pause/skip) to
-the iPhone. AP1 DACP remote control is fully implemented and works.
-
-See previous sections for full remote control research (unchanged).
+the iPhone. The AP1 DACP client was removed with the AirPlay 1 stack (iOS does
+not send `Active-Remote` on AP2 sessions anyway).
 
 ## Test Coverage
 
-130 tests, 17 C-verified vectors from pair_ap reference implementation:
+Default build (AirPlay 2): 126 lib + 21 integration + 33 unit tests; `--features video`
+adds the legacy RTP buffer, playfair, and video cipher tests (140 lib + 37 unit).
+17 C-verified vectors from the pair_ap reference implementation:
 - TLV codec, HKDF-SHA512, ChaCha20 transport framing
 - ADTS framing, audio packet decryption, server keypair
 - Anchor time calculation, channel mixdown, SSRC mapping
 - Full M1→M4 SRP integration test over real TCP
-- Video cipher streaming AES-CTR partial block tests
-- FairPlay cross-validation test against C `playfair_decrypt` output
+- AirPlay 1 requests (legacy pair-setup, ANNOUNCE, `Transport` SETUP) are not served
+- `video`: video cipher streaming AES-CTR partial block tests, FairPlay cross-validation
+  against C `playfair_decrypt` output
 
 ## References
 

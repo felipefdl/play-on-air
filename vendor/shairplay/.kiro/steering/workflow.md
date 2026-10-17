@@ -51,7 +51,7 @@ cargo publish --registry crates-io
 
 ## Important Files
 
-- `.cargo/audit.toml` — ignored security advisories (rsa Marvin attack, instant unmaintained)
+- `.cargo/audit.toml` — ignored security advisories (instant unmaintained, plist transitive)
 - `.github/workflows/ci.yml` — CI on push + PR
 - `.github/workflows/release-please.yml` — release automation + crates.io publish
 - `CHANGELOG.md` — managed by release-please, do not edit manually

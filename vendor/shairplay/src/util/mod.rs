@@ -12,7 +12,6 @@ static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 /// Saturates to 0 if the clock is before the epoch. Use only where absolute
 /// wall/PTP time is required (e.g. protocol timestamps). Playout scheduling
 /// must use [`mono_now_ns`] so NTP steps cannot jump anchors.
-#[cfg(feature = "ap2")]
 pub fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -24,7 +23,6 @@ pub fn now_ns() -> u64 {
 ///
 /// Safe for playout anchors and delivery scheduling: does not jump when the
 /// wall clock steps (NTP, manual set). Not comparable across processes.
-#[cfg(feature = "ap2")]
 pub fn mono_now_ns() -> u64 {
     let epoch = MONO_EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_nanos() as u64
@@ -70,7 +68,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ap2")]
     #[test]
     fn mono_now_ns_is_monotonic() {
         let mut prev = mono_now_ns();
