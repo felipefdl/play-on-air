@@ -1,9 +1,11 @@
 //! Lossless FLAC encode for Cast HTTP media egress.
 //!
-//! Offline snapshot encode ([`encode_pcm_i16_to_flac`]) and live streaming helpers
-//! (STREAMINFO header + per-block frames via [`encode_fixed_size_frame`]).
+//! Offline snapshot encode ([`encode_pcm_i16_to_flac`]) and the live streaming encoder
+//! ([`LiveFlacEncoder`]: STREAMINFO header, then one fixed-size FLAC frame per PCM block).
 
-use bytes::BytesMut;
+use std::fmt;
+
+use bytes::{Bytes, BytesMut};
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, Stream, StreamInfo};
 use flacenc::config;
@@ -13,11 +15,19 @@ use flacenc::source::{Fill, FrameBuf};
 
 use crate::error::{Error, Result};
 
-/// Re-export for live stream state that reuses the frame write sink.
-pub use flacenc::bitsink::ByteSink as FlacByteSink;
+/// Fixed FLAC block size (frames per channel) for live streaming.
+///
+/// 2048 frames is ~46 ms at 44.1 kHz: the steady state waits for half as much PCM per frame as
+/// flacenc's 4096 default. On stereo 44.1 kHz music it encodes at the same CPU cost (within
+/// run-to-run noise) and ~1 % smaller than 4096. It has a dedicated frame-header code and stays
+/// inside the FLAC streamable subset.
+pub const FLAC_BLOCK_SIZE: usize = 2048;
 
-/// Fixed FLAC block size used for live streaming (flacenc default).
-pub const FLAC_BLOCK_SIZE: usize = 4096;
+/// Initial capacity of a live egress output arena (FLAC frames and WAV chunks).
+///
+/// 64 KiB is the largest capacity `BytesMut` remembers when it must replace a buffer that is
+/// still shared, so a replacement arena is the same size as the first one.
+pub(crate) const LIVE_ARENA_BYTES: usize = 64 * 1024;
 
 /// Encode interleaved little-endian-order i16 PCM to a complete FLAC bitstream.
 ///
@@ -59,7 +69,7 @@ pub fn encode_pcm_i16_to_flac(samples: &[i16], channels: u16, sample_rate: u32) 
 }
 
 /// Default verified encoder config for offline and live encode paths.
-pub fn verified_encoder_config() -> Result<Verified<config::Encoder>> {
+fn verified_encoder_config() -> Result<Verified<config::Encoder>> {
   config::Encoder::default()
     .into_verified()
     .map_err(|(_cfg, err)| Error::Audio(format!("invalid FLAC encoder config: {err:?}")))
@@ -68,7 +78,7 @@ pub fn verified_encoder_config() -> Result<Verified<config::Encoder>> {
 /// Build a streaming [`StreamInfo`] with fixed block size and unknown total samples.
 ///
 /// `total_samples` stays 0 and MD5 is zeroed (RFC 9639 allows both for live streams).
-pub fn live_stream_info(sample_rate: u32, channels: u16) -> Result<StreamInfo> {
+fn live_stream_info(sample_rate: u32, channels: u16) -> Result<StreamInfo> {
   if channels == 0 {
     return Err(Error::Audio("channels must be at least 1".to_owned()));
   }
@@ -85,7 +95,7 @@ pub fn live_stream_info(sample_rate: u32, channels: u16) -> Result<StreamInfo> {
 }
 
 /// Write `fLaC` + STREAMINFO only (empty stream body) for the start of a live HTTP response.
-pub fn live_stream_header_bytes(stream_info: &StreamInfo) -> Result<Vec<u8>> {
+fn live_stream_header_bytes(stream_info: &StreamInfo) -> Result<Vec<u8>> {
   let stream = Stream::with_stream_info(stream_info.clone());
   let mut sink = ByteSink::new();
   stream
@@ -94,72 +104,13 @@ pub fn live_stream_header_bytes(stream_info: &StreamInfo) -> Result<Vec<u8>> {
   Ok(sink.as_slice().to_vec())
 }
 
-/// Allocate a reusable [`FrameBuf`] for live FLAC block encoding.
-pub fn live_frame_buf(channels: u16) -> Result<FrameBuf> {
-  let ch = usize::from(channels.max(1));
-  FrameBuf::with_size(ch, FLAC_BLOCK_SIZE).map_err(|err| Error::Audio(format!("FLAC FrameBuf alloc failed: {err:?}")))
-}
-
-/// Encode one interleaved i16 PCM block (≤ [`FLAC_BLOCK_SIZE`] frames) into a single FLAC frame.
+/// Worst-case bytes of one live FLAC frame.
 ///
-/// Writes frame bytes into `out`, reusing its capacity (`out` is cleared first). Callers that
-/// need owned `Bytes` should hold a `BytesMut` and `split().freeze()` after this returns.
-///
-/// `i16_samples` length must be `frames * channels`. Live STREAMINFO uses fixed
-/// `min_block_size = max_block_size = FLAC_BLOCK_SIZE`; steady-state live encode must pass full
-/// blocks only (see live stream partial-pop policy).
-#[expect(
-  clippy::too_many_arguments,
-  reason = "encoder state is threaded explicitly for reusable live stream buffers"
-)]
-pub fn encode_i16_block_to_frame(
-  i16_samples: &[i16],
-  channels: u16,
-  frame_number: usize,
-  encoder_config: &Verified<config::Encoder>,
-  stream_info: &StreamInfo,
-  framebuf: &mut FrameBuf,
-  i32_scratch: &mut Vec<i32>,
-  frame_sink: &mut ByteSink,
-  out: &mut BytesMut,
-) -> Result<()> {
-  let ch = usize::from(channels.max(1));
-  if ch == 0 || !i16_samples.len().is_multiple_of(ch) {
-    return Err(Error::Audio(format!(
-      "FLAC block sample count {} is not a multiple of channels {channels}",
-      i16_samples.len()
-    )));
-  }
-  let frames = i16_samples.len() / ch;
-  if frames == 0 {
-    return Err(Error::Audio("FLAC block has zero frames".to_owned()));
-  }
-  if frames > FLAC_BLOCK_SIZE {
-    return Err(Error::Audio(format!(
-      "FLAC block frames {frames} exceed FLAC_BLOCK_SIZE {FLAC_BLOCK_SIZE}"
-    )));
-  }
-
-  i32_scratch.clear();
-  i32_scratch.reserve(i16_samples.len());
-  for &s in i16_samples {
-    i32_scratch.push(i32::from(s));
-  }
-
-  framebuf
-    .fill_interleaved(i32_scratch)
-    .map_err(|err| Error::Audio(format!("FLAC FrameBuf fill failed: {err}")))?;
-
-  let frame = encode_fixed_size_frame(encoder_config, framebuf, frame_number, stream_info)
-    .map_err(|err| Error::Audio(format!("FLAC frame encode failed: {err}")))?;
-
-  frame_sink.clear();
-  frame
-    .write(frame_sink)
-    .map_err(|err| Error::Audio(format!("FLAC frame write failed: {err}")))?;
-  out.clear();
-  out.extend_from_slice(frame_sink.as_slice());
-  Ok(())
+/// Frame header ≤ 16 bytes; per channel a 1-byte subframe header plus verbatim samples at up to
+/// 17 bits (stereo side channel); then byte alignment and CRC-16.
+const fn max_live_frame_bytes(channels: usize) -> usize {
+  let verbatim_subframe = FLAC_BLOCK_SIZE.saturating_mul(17).div_ceil(8).saturating_add(1);
+  channels.saturating_mul(verbatim_subframe).saturating_add(19)
 }
 
 /// Round frame count up to a whole number of [`FLAC_BLOCK_SIZE`] blocks (fixed-size live stream).
@@ -170,23 +121,100 @@ pub const fn round_up_to_flac_blocks(frames: usize) -> usize {
   frames.div_ceil(FLAC_BLOCK_SIZE).saturating_mul(FLAC_BLOCK_SIZE)
 }
 
+/// Live FLAC encoder: one fixed-size ([`FLAC_BLOCK_SIZE`]) frame per PCM block.
+///
+/// Every per-frame buffer is sized at construction. Encoded frames are appended to an output
+/// arena and handed out as owned [`Bytes`] views of it. Once the HTTP layer drops every earlier
+/// chunk, the next frame reclaims the whole arena, so the steady state allocates no output
+/// buffers; while chunks are still in flight, a fresh arena is allocated at most once per
+/// arena's worth of frames. Allocations inside flacenc's frame encoder are outside this type.
+pub struct LiveFlacEncoder {
+  channels: u16,
+  encoder_config: Verified<config::Encoder>,
+  stream_info: StreamInfo,
+  framebuf: FrameBuf,
+  /// i16 → i32 widening for flacenc input, sized for one block.
+  i32_scratch: Vec<i32>,
+  /// flacenc bit sink, sized for a worst-case frame so it never grows.
+  frame_sink: ByteSink,
+  /// Output arena; each frame is split off as an owned chunk.
+  arena: BytesMut,
+  frame_number: usize,
+}
+
+impl fmt::Debug for LiveFlacEncoder {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("LiveFlacEncoder")
+      .field("channels", &self.channels)
+      .field("frame_number", &self.frame_number)
+      .field("arena_capacity", &self.arena.capacity())
+      .finish_non_exhaustive()
+  }
+}
+
+impl LiveFlacEncoder {
+  /// Build an encoder for `sample_rate` Hz and `channels` 16-bit channels.
+  pub fn new(sample_rate: u32, channels: u16) -> Result<Self> {
+    let stream_info = live_stream_info(sample_rate, channels)?;
+    let ch = usize::from(channels);
+    let framebuf = FrameBuf::with_size(ch, FLAC_BLOCK_SIZE)
+      .map_err(|err| Error::Audio(format!("FLAC FrameBuf alloc failed: {err:?}")))?;
+    let max_frame = max_live_frame_bytes(ch);
+    Ok(Self {
+      channels,
+      encoder_config: verified_encoder_config()?,
+      stream_info,
+      framebuf,
+      i32_scratch: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(ch)),
+      frame_sink: ByteSink::with_capacity(max_frame.saturating_mul(8)),
+      arena: BytesMut::with_capacity(LIVE_ARENA_BYTES.max(max_frame.saturating_mul(2))),
+      frame_number: 0,
+    })
+  }
+
+  /// `fLaC` + STREAMINFO (min = max block size, unknown length) that starts every live body.
+  pub fn header_bytes(&self) -> Result<Bytes> {
+    live_stream_header_bytes(&self.stream_info).map(Bytes::from)
+  }
+
+  /// Encode exactly one block (`FLAC_BLOCK_SIZE * channels` interleaved samples) as the next frame.
+  ///
+  /// STREAMINFO declares a fixed block size, so a short block is rejected rather than encoded.
+  pub fn encode_block(&mut self, i16_samples: &[i16]) -> Result<Bytes> {
+    let expected = FLAC_BLOCK_SIZE.saturating_mul(usize::from(self.channels));
+    if i16_samples.len() != expected {
+      return Err(Error::Audio(format!(
+        "FLAC block has {} samples, expected {expected} ({FLAC_BLOCK_SIZE} frames x {} channels)",
+        i16_samples.len(),
+        self.channels
+      )));
+    }
+
+    self.i32_scratch.clear();
+    self.i32_scratch.extend(i16_samples.iter().map(|&s| i32::from(s)));
+    self
+      .framebuf
+      .fill_interleaved(&self.i32_scratch)
+      .map_err(|err| Error::Audio(format!("FLAC FrameBuf fill failed: {err}")))?;
+
+    let frame = encode_fixed_size_frame(&self.encoder_config, &self.framebuf, self.frame_number, &self.stream_info)
+      .map_err(|err| Error::Audio(format!("FLAC frame encode failed: {err}")))?;
+    self.frame_sink.clear();
+    frame
+      .write(&mut self.frame_sink)
+      .map_err(|err| Error::Audio(format!("FLAC frame write failed: {err}")))?;
+
+    let encoded = self.frame_sink.as_slice();
+    self.arena.reserve(encoded.len());
+    self.arena.extend_from_slice(encoded);
+    self.frame_number = self.frame_number.saturating_add(1);
+    Ok(self.arena.split().freeze())
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  fn sine_i16(frames: usize, channels: u16, freq_hz: f32, sample_rate: u32) -> Vec<i16> {
-    let ch = usize::from(channels);
-    let mut out = Vec::with_capacity(frames * ch);
-    for n in 0..frames {
-      let t = n as f32 / sample_rate as f32;
-      let s = (2.0 * std::f32::consts::PI * freq_hz * t).sin();
-      let v = (s * 16_000.0).round() as i16;
-      for _ in 0..ch {
-        out.push(v);
-      }
-    }
-    out
-  }
 
   /// Distinct L/R pattern so a channel swap fails bit-exact checks.
   fn stereo_distinct_i16(frames: usize) -> Vec<i16> {
@@ -197,6 +225,18 @@ mod tests {
       let left = i16::try_from(phase - 1_500).unwrap_or(0);
       out.push(left);
       out.push(-12_000);
+    }
+    out
+  }
+
+  /// Hard-to-compress stereo PCM (LCG noise, independent channels) so frames approach verbatim
+  /// size and a run of them overflows one output arena.
+  fn stereo_noise_i16(frames: usize, seed: u32) -> Vec<i16> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(frames * 2);
+    for _ in 0..frames * 2 {
+      state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      out.push((state >> 16) as i16);
     }
     out
   }
@@ -248,48 +288,86 @@ mod tests {
 
   #[test]
   fn live_header_is_flac_magic_plus_streaminfo() {
-    let info = live_stream_info(48_000, 2).expect("stream info");
-    let header = live_stream_header_bytes(&info).expect("header");
+    let encoder = LiveFlacEncoder::new(48_000, 2).expect("encoder");
+    let header = encoder.header_bytes().expect("header");
     assert_eq!(&header[0..4], b"fLaC");
     // fLaC (4) + metadata block header (4) + STREAMINFO body (34) = 42
     assert_eq!(header.len(), 42);
   }
 
+  /// Many live frames held at once (HTTP backlog) across arena turnover: the concatenated
+  /// stream decodes bit-exact, and every frame is exactly the STREAMINFO block size.
   #[test]
-  fn live_block_encode_roundtrip_claxon() {
-    let sample_rate = 8_000_u32;
-    let channels = 1_u16;
-    let info = live_stream_info(sample_rate, channels).expect("info");
-    let header = live_stream_header_bytes(&info).expect("header");
-    let config = verified_encoder_config().expect("config");
-    let mut framebuf = live_frame_buf(channels).expect("framebuf");
-    let mut i32_scratch = Vec::new();
-    let mut frame_sink = ByteSink::new();
-    let mut frame_out = BytesMut::new();
+  fn live_frames_held_across_arena_turnover_decode_bit_exact() {
+    let sample_rate = 44_100_u32;
+    let channels = 2_u16;
+    let mut encoder = LiveFlacEncoder::new(sample_rate, channels).expect("encoder");
+    let blocks = 24;
+    let pcm = stereo_noise_i16(FLAC_BLOCK_SIZE * blocks, 7);
 
-    let pcm = sine_i16(FLAC_BLOCK_SIZE, channels, 440.0, sample_rate);
-    encode_i16_block_to_frame(
-      &pcm,
-      channels,
-      0,
-      &config,
-      &info,
-      &mut framebuf,
-      &mut i32_scratch,
-      &mut frame_sink,
-      &mut frame_out,
-    )
-    .expect("frame");
+    let mut chunks = Vec::with_capacity(blocks);
+    for block in pcm.as_chunks::<{ FLAC_BLOCK_SIZE * 2 }>().0 {
+      chunks.push(encoder.encode_block(block).expect("frame"));
+    }
+    let frame_bytes: usize = chunks.iter().map(Bytes::len).sum();
+    assert!(
+      frame_bytes > LIVE_ARENA_BYTES * 2,
+      "test must overflow the arena ({frame_bytes} bytes)"
+    );
 
-    let mut bitstream = header;
-    bitstream.extend_from_slice(&frame_out);
-
+    let mut bitstream = encoder.header_bytes().expect("header").to_vec();
+    for chunk in &chunks {
+      bitstream.extend_from_slice(chunk);
+    }
     let mut reader = claxon::FlacReader::new(std::io::Cursor::new(&bitstream)).expect("claxon");
-    let decoded: Vec<i32> = reader.samples().map(|r| r.expect("sample")).collect();
+    let info = reader.streaminfo();
+    assert_eq!(usize::from(info.min_block_size), FLAC_BLOCK_SIZE);
+    assert_eq!(usize::from(info.max_block_size), FLAC_BLOCK_SIZE);
+
+    let mut decoded = Vec::with_capacity(pcm.len());
+    let mut frames = reader.blocks();
+    let mut buffer = Vec::new();
+    while let Some(block) = frames.read_next_or_eof(buffer).expect("frame") {
+      assert_eq!(block.duration() as usize, FLAC_BLOCK_SIZE, "fixed block size");
+      for (left, right) in block.stereo_samples() {
+        decoded.push(left);
+        decoded.push(right);
+      }
+      buffer = block.into_buffer();
+    }
     assert_eq!(decoded.len(), pcm.len());
     for (i, (&orig, &dec)) in pcm.iter().zip(decoded.iter()).enumerate() {
       assert_eq!(i32::from(orig), dec, "mismatch at sample {i}");
     }
+  }
+
+  /// Steady state: when each chunk is dropped before the next encode (HTTP wrote it), every
+  /// frame lands in the arena allocated at construction — no per-frame output allocation.
+  #[test]
+  fn live_frames_reuse_one_arena_when_chunks_are_released() {
+    let mut encoder = LiveFlacEncoder::new(44_100, 2).expect("encoder");
+    let base = encoder.arena.as_ptr() as usize;
+    let capacity = encoder.arena.capacity();
+    let pcm = stereo_noise_i16(FLAC_BLOCK_SIZE * 64, 11);
+    let mut total = 0_usize;
+    for (n, block) in pcm.as_chunks::<{ FLAC_BLOCK_SIZE * 2 }>().0.iter().enumerate() {
+      let chunk = encoder.encode_block(block).expect("frame");
+      let start = chunk.as_ptr() as usize;
+      assert!(
+        start >= base && start + chunk.len() <= base + capacity,
+        "frame {n} left the original arena (reallocated)"
+      );
+      total += chunk.len();
+    }
+    assert!(total > capacity * 4, "frames must wrap the arena several times");
+  }
+
+  #[test]
+  fn live_encoder_rejects_short_block() {
+    let mut encoder = LiveFlacEncoder::new(44_100, 2).expect("encoder");
+    let short = vec![0_i16; (FLAC_BLOCK_SIZE - 1) * 2];
+    let err = encoder.encode_block(&short).unwrap_err();
+    assert!(matches!(err, Error::Audio(_)));
   }
 
   #[test]

@@ -21,8 +21,7 @@ use tokio::sync::{Notify, oneshot};
 use tokio::time::sleep;
 
 use crate::audio::{
-  FLAC_BLOCK_SIZE, FlacByteSink, PcmRing, continuous_wav_header, encode_i16_block_to_frame, live_frame_buf,
-  live_stream_header_bytes, live_stream_info, round_up_to_flac_blocks, verified_encoder_config,
+  FLAC_BLOCK_SIZE, LIVE_ARENA_BYTES, LiveFlacEncoder, PcmRing, continuous_wav_header, round_up_to_flac_blocks,
 };
 use crate::error::{Error, Result};
 
@@ -157,6 +156,8 @@ pub struct MediaServerHandle {
   pub addr: SocketAddr,
   /// Shared content slot for the active stream.
   content: Arc<RwLock<MediaContent>>,
+  /// Same generation counter live bodies poll for supersede (cloned from [`AppState`]).
+  live_generation: Arc<AtomicU64>,
   max_body_bytes: Arc<AtomicU64>,
   bytes_served: Arc<AtomicU64>,
   last_body_write: Arc<RwLock<Option<Instant>>>,
@@ -174,6 +175,18 @@ impl MediaServerHandle {
   /// Replace the body served at `/stream`.
   pub fn set_content(&self, content: MediaContent) {
     *self.content.write() = content;
+  }
+
+  /// Actively end in-flight LiveWav/LiveFlac bodies and refuse new pulls.
+  ///
+  /// Sets content to [`MediaContent::Empty`] (subsequent GET → 404) and bumps
+  /// `live_generation` so active bodies see `is_superseded()` and return `None`.
+  /// Safe to call more than once. Prefer this before aborting the serve task so
+  /// bodies end cleanly even when graceful shutdown is slow.
+  pub fn invalidate_live(&self) {
+    *self.content.write() = MediaContent::Empty;
+    let generation = self.live_generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    tracing::debug!(generation, "media live bodies invalidated");
   }
 
   /// Shared rollover signal for bridge re-LOAD loops.
@@ -203,8 +216,9 @@ impl MediaServerHandle {
 
   /// Shut down the HTTP server task.
   ///
-  /// Graceful shutdown alone would wait on in-flight requests, and a `LiveWav`
-  /// body never completes — abort so the stream (and its PCM ring) is released.
+  /// Invalidates live bodies first so in-flight streams end via supersede, then
+  /// signals graceful shutdown and aborts the serve task (Live bodies never complete
+  /// on their own if invalidation were skipped).
   pub fn shutdown(self) {
     drop(self);
   }
@@ -212,6 +226,8 @@ impl MediaServerHandle {
 
 impl Drop for MediaServerHandle {
   fn drop(&mut self) {
+    // Kill live bodies before abort so streams see supersede even if abort is slow.
+    self.invalidate_live();
     if let Some(tx) = self.shutdown_tx.take() {
       let _sent = tx.send(());
     }
@@ -224,11 +240,18 @@ impl Drop for MediaServerHandle {
 pub struct MediaServer;
 
 impl MediaServer {
-  /// Bind `0.0.0.0:0`, spawn the serve loop, return a handle with a LAN-facing URL.
+  /// Bind `0.0.0.0:0` (or `[::]:0` for a bracketed IPv6 `advertise_host`), spawn the serve
+  /// loop, return a handle with a LAN-facing URL.
   ///
-  /// `advertise_host` is the host/IP embedded in `base_url` (e.g. LAN IPv4 or `127.0.0.1` for tests).
+  /// `advertise_host` is the URL host embedded in `base_url` (e.g. LAN IPv4, `[2001:db8::5]`,
+  /// or `127.0.0.1` for tests).
   pub async fn start(advertise_host: &str) -> Result<MediaServerHandle> {
-    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+    let bind_ip = if advertise_host.trim().starts_with('[') {
+      std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    } else {
+      std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
+    let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))
       .await
       .map_err(|err| Error::Media(format!("bind failed: {err}")))?;
 
@@ -244,13 +267,14 @@ impl MediaServer {
     });
 
     let content = Arc::new(RwLock::new(MediaContent::Empty));
+    let live_generation = Arc::new(AtomicU64::new(0));
     let max_body_bytes = Arc::new(AtomicU64::new(LIVE_CONTENT_LENGTH));
     let bytes_served = Arc::new(AtomicU64::new(0));
     let last_body_write = Arc::new(RwLock::new(None));
     let rollover = Arc::new(RolloverSignal::default());
     let state = AppState {
       content: Arc::clone(&content),
-      live_generation: Arc::new(AtomicU64::new(0)),
+      live_generation: Arc::clone(&live_generation),
       max_body_bytes: Arc::clone(&max_body_bytes),
       bytes_served: Arc::clone(&bytes_served),
       last_body_write: Arc::clone(&last_body_write),
@@ -286,6 +310,7 @@ impl MediaServer {
       base_url,
       addr,
       content,
+      live_generation,
       max_body_bytes,
       bytes_served,
       last_body_write,
@@ -490,32 +515,18 @@ fn live_flac_response(
 ) -> Response {
   let ch = channels.max(1);
   let rate = sample_rate.max(1);
-  let stream_info = match live_stream_info(rate, ch) {
-    Ok(info) => info,
+  let encoder = match LiveFlacEncoder::new(rate, ch) {
+    Ok(encoder) => encoder,
     Err(err) => {
-      tracing::error!(error = %err, "failed to build live FLAC StreamInfo");
-      return (StatusCode::INTERNAL_SERVER_ERROR, "flac streaminfo").into_response();
+      tracing::error!(error = %err, "failed to build live FLAC encoder");
+      return (StatusCode::INTERNAL_SERVER_ERROR, "flac encoder").into_response();
     },
   };
-  let header = match live_stream_header_bytes(&stream_info) {
+  let header = match encoder.header_bytes() {
     Ok(h) => h,
     Err(err) => {
       tracing::error!(error = %err, "failed to build live FLAC header");
       return (StatusCode::INTERNAL_SERVER_ERROR, "flac header").into_response();
-    },
-  };
-  let encoder_config = match verified_encoder_config() {
-    Ok(cfg) => cfg,
-    Err(err) => {
-      tracing::error!(error = %err, "failed to build live FLAC encoder config");
-      return (StatusCode::INTERNAL_SERVER_ERROR, "flac config").into_response();
-    },
-  };
-  let framebuf = match live_frame_buf(ch) {
-    Ok(fb) => fb,
-    Err(err) => {
-      tracing::error!(error = %err, "failed to allocate live FLAC FrameBuf");
-      return (StatusCode::INTERNAL_SERVER_ERROR, "flac framebuf").into_response();
     },
   };
 
@@ -535,9 +546,7 @@ fn live_flac_response(
     rate,
     header,
     preroll_frames,
-    stream_info,
-    encoder_config,
-    framebuf,
+    encoder,
     live_generation,
     generation,
     bytes_served,
@@ -597,13 +606,12 @@ fn live_wav_byte_stream(
   rollover: Arc<RolloverSignal>,
 ) -> impl stream::Stream<Item = std::result::Result<Bytes, Infallible>> + Send {
   let header_bytes = Bytes::copy_from_slice(&header);
-  let chunk_cap = LIVE_CHUNK_FRAMES.saturating_mul(usize::from(channels)).saturating_mul(2);
   let initial = LiveStreamState {
     ring,
     header: Some(header_bytes),
     preroll_frames_left: preroll_frames,
     i16_buf: Vec::with_capacity(LIVE_CHUNK_FRAMES.saturating_mul(usize::from(channels))),
-    bytes_buf: BytesMut::with_capacity(chunk_cap),
+    bytes_buf: BytesMut::with_capacity(LIVE_ARENA_BYTES),
     channels,
     sample_rate: sample_rate.max(1),
     live_generation,
@@ -703,11 +711,9 @@ fn live_flac_byte_stream(
   ring: Arc<PcmRing>,
   channels: u16,
   sample_rate: u32,
-  header: Vec<u8>,
+  header: Bytes,
   preroll_frames: usize,
-  stream_info: flacenc::component::StreamInfo,
-  encoder_config: flacenc::error::Verified<flacenc::config::Encoder>,
-  framebuf: flacenc::source::FrameBuf,
+  encoder: LiveFlacEncoder,
   live_generation: Arc<AtomicU64>,
   generation: u64,
   bytes_served: Arc<AtomicU64>,
@@ -716,12 +722,10 @@ fn live_flac_byte_stream(
   let ch = channels.max(1);
   let initial = LiveFlacState {
     ring,
-    header: Some(Bytes::from(header)),
+    header: Some(header),
     preroll_frames_left: preroll_frames,
     i16_buf: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
-    i32_scratch: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
-    frame_sink: FlacByteSink::new(),
-    frame_bytes: BytesMut::new(),
+    encoder,
     channels: ch,
     sample_rate: sample_rate.max(1),
     live_generation,
@@ -733,10 +737,6 @@ fn live_flac_byte_stream(
     last_body_write,
     last_drop_log: None,
     last_drops_seen: 0,
-    stream_info,
-    encoder_config,
-    framebuf,
-    frame_number: 0,
   };
 
   stream::unfold(initial, |mut live| async move {
@@ -824,11 +824,8 @@ struct LiveFlacState {
   header: Option<Bytes>,
   preroll_frames_left: usize,
   i16_buf: Vec<i16>,
-  i32_scratch: Vec<i32>,
-  /// Reusable flacenc bit sink (cleared each frame).
-  frame_sink: FlacByteSink,
-  /// Reusable frame byte buffer; `split().freeze()` for each HTTP chunk.
-  frame_bytes: BytesMut,
+  /// Fixed-block FLAC encoder; owns the reusable output arena for HTTP chunks.
+  encoder: LiveFlacEncoder,
   channels: u16,
   sample_rate: u32,
   live_generation: Arc<AtomicU64>,
@@ -841,10 +838,6 @@ struct LiveFlacState {
   last_body_write: Arc<RwLock<Option<Instant>>>,
   last_drop_log: Option<Instant>,
   last_drops_seen: u64,
-  stream_info: flacenc::component::StreamInfo,
-  encoder_config: flacenc::error::Verified<flacenc::config::Encoder>,
-  framebuf: flacenc::source::FrameBuf,
-  frame_number: usize,
 }
 
 impl LiveFlacState {
@@ -853,19 +846,7 @@ impl LiveFlacState {
   }
 
   fn encode_current_i16_buf(&mut self) -> Result<Bytes> {
-    encode_i16_block_to_frame(
-      &self.i16_buf,
-      self.channels,
-      self.frame_number,
-      &self.encoder_config,
-      &self.stream_info,
-      &mut self.framebuf,
-      &mut self.i32_scratch,
-      &mut self.frame_sink,
-      &mut self.frame_bytes,
-    )?;
-    self.frame_number = self.frame_number.saturating_add(1);
-    Ok(self.frame_bytes.split().freeze())
+    self.encoder.encode_block(&self.i16_buf)
   }
 
   fn maybe_log_ring_drops(&mut self) {
@@ -922,7 +903,7 @@ struct LiveStreamState {
   header: Option<Bytes>,
   preroll_frames_left: usize,
   i16_buf: Vec<i16>,
-  /// Reusable LE byte buffer (avoids per-chunk `Vec` alloc in steady state).
+  /// LE byte arena: each chunk is split off as an owned `Bytes`; reclaimed once chunks drain.
   bytes_buf: BytesMut,
   channels: u16,
   sample_rate: u32,
@@ -1698,6 +1679,70 @@ mod tests {
     assert!(ended.is_ok(), "superseded LiveWav body must end");
     // Supersede must not look like a Content-Length rollover.
     assert_eq!(handle.rollover_signal().count(), 0, "supersede must not signal rollover");
+    handle.shutdown();
+  }
+
+  /// `invalidate_live` must end an active `LiveFlac` body and refuse subsequent pulls with 404.
+  #[tokio::test]
+  async fn invalidate_live_ends_body_and_returns_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let ring = Arc::new(PcmRing::new(2, 48_000));
+    // Soft tone so the live body keeps producing without relying on silence-only path.
+    let mut samples = Vec::with_capacity(24_000 * 2);
+    for n in 0..24_000 {
+      let t = n as f32 / 48_000.0;
+      let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.1;
+      samples.push(s);
+      samples.push(s);
+    }
+    ring.push_f32(&samples);
+
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac {
+      ring: Arc::clone(&ring),
+      channels: 2,
+      sample_rate: 48_000,
+    });
+
+    let host_port = format!("127.0.0.1:{}", handle.addr.port());
+    let req = format!("GET /stream HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+
+    let mut live = TcpStream::connect(&host_port).await.expect("connect live");
+    live.write_all(req.as_bytes()).await.expect("write live");
+    let mut prefix = [0_u8; 1024];
+    let n = live.read(&mut prefix).await.expect("read live prefix");
+    assert!(n > 0, "LiveFlac body must produce bytes before invalidate");
+
+    handle.invalidate_live();
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), async move {
+      let mut sink = [0_u8; 8192];
+      loop {
+        match live.read(&mut sink).await {
+          Ok(0) | Err(_) => break,
+          Ok(_) => {},
+        }
+      }
+    })
+    .await;
+    assert!(ended.is_ok(), "invalidated LiveFlac body must end within a few seconds");
+
+    // Subsequent GET must see Empty → 404 (not a new live generation).
+    let mut after = TcpStream::connect(&host_port).await.expect("connect after");
+    after.write_all(req.as_bytes()).await.expect("write after");
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 512];
+    loop {
+      match after.read(&mut tmp).await {
+        Ok(0) | Err(_) => break,
+        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+      }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 404"), "post-invalidate GET must 404; got: {text}");
+
     handle.shutdown();
   }
 
