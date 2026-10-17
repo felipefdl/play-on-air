@@ -149,16 +149,16 @@ fn find_token_after<'a>(line: &'a str, token: &str) -> Option<&'a str> {
   line.get(idx + token.len()..)
 }
 
-/// Resolved fields from `dns-sd -L` or avahi `=` lines.
+/// Resolved fields from one `dns-sd -L` lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveInfo {
   /// Hostname (may end with `.local.`).
   pub hostname: String,
-  /// Port (usually 8009).
+  /// Port (8009 for speakers; Cast groups use their own port).
   pub port: u16,
   /// Raw TXT string in dns-sd style (`key=value` space-separated, `\` escapes).
   pub txt: String,
-  /// Optional pre-resolved address (e.g. from avahi). When set, used as Cast host.
+  /// IP literal from the reach line (IPv4 or IPv6), used as the Cast host when set.
   pub address: Option<String>,
 }
 
@@ -225,12 +225,8 @@ fn parse_reachable_line(trimmed: &str, reached_idx: usize) -> Option<LookupReach
     let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
   });
-  // Prefer treating a dotted-quad as address for Cast host selection.
-  let address = if is_ipv4_literal(&host_raw) {
-    Some(host_raw.clone())
-  } else {
-    None
-  };
+  // An IP-literal reach host (IPv4 or IPv6) is the Cast host as-is.
+  let address = crate::net::parse_ip_host(&host_raw).map(crate::net::format_ip_host);
   Some(LookupReachable {
     hostname: host_raw,
     port,
@@ -244,7 +240,9 @@ fn parse_reachable_line(trimmed: &str, reached_idx: usize) -> Option<LookupReach
 /// Preference order:
 /// 1. Exact match of a preferred local IPv4 to the reach host/address
 /// 2. Same IPv4 /24 (first three octets) as a preferred local address
-/// 3. First reach line (stable, not last-wins)
+/// 3. First reach line that is not an IPv6 literal (IPv4 preferred; hostnames resolve
+///    IPv4-first)
+/// 4. First reach line (stable, not last-wins)
 fn choose_reachable(reachables: &[LookupReachable], preferred_ipv4: &[String]) -> Option<LookupReachable> {
   if reachables.is_empty() {
     return None;
@@ -269,8 +267,12 @@ fn choose_reachable(reachables: &[LookupReachable], preferred_ipv4: &[String]) -
       return Some(hit.clone());
     }
   }
-  // First match wins (deterministic; avoids last-line-wins nondeterminism).
-  reachables.first().cloned()
+  // IPv4 (or hostname) before an IPv6 literal; then first line (deterministic, not last-wins).
+  reachables
+    .iter()
+    .find(|r| r.address.as_deref().is_none_or(|a| !a.contains(':')))
+    .or_else(|| reachables.first())
+    .cloned()
 }
 
 /// First three IPv4 octets as a stable key, or `None` if not a dotted-quad.
@@ -361,19 +363,6 @@ fn unescape_dns_sd(s: &str) -> String {
   out
 }
 
-/// Escape spaces (and backslashes) so [`parse_txt_blob`] keeps multi-word values.
-fn escape_txt_value(s: &str) -> String {
-  let mut out = String::with_capacity(s.len());
-  for c in s.chars() {
-    match c {
-      '\\' => out.push_str("\\\\"),
-      ' ' => out.push_str("\\ "),
-      other => out.push(other),
-    }
-  }
-  out
-}
-
 /// Build a [`Device`] from instance name + resolve info.
 pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
   let txt = parse_txt_blob(&info.txt);
@@ -387,6 +376,7 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
     .cloned()
     .filter(|s| !s.is_empty())
     .unwrap_or_else(|| instance.replace('-', " "));
+  let model = txt.get("md").cloned().unwrap_or_default();
   let hostname = info.hostname.trim_end_matches('.').to_owned();
   let host = info
     .address
@@ -395,7 +385,7 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
     .filter(|a| !a.is_empty())
     .map_or_else(|| resolve_cast_host(&hostname), ToOwned::to_owned);
   let port = if info.port == 0 { 8009 } else { info.port };
-  Device::new(id, name, host, hostname, port, instance)
+  Device::new(id, name, host, hostname, port, instance).with_model(model)
 }
 
 /// Mark a device pending leave when mDNS reports a remove (debounced ~20s).
@@ -433,9 +423,10 @@ fn leave_by_instance(registry: &DeviceRegistry, instance: &str) {
   }
 }
 
-/// Prefer a resolved IPv4 address; fall back to hostname for Cast control.
+/// Cast control host for `hostname`: resolved IPv4 preferred, else IPv6 (link-local
+/// as `fe80::…%<scope index>`), else the hostname itself.
 pub fn resolve_cast_host(hostname: &str) -> String {
-  crate::net::resolve_host_ipv4(hostname).unwrap_or_else(|| {
+  crate::net::resolve_host_ip(hostname).unwrap_or_else(|| {
     let host = hostname.trim_end_matches('.');
     if host.is_empty() {
       "127.0.0.1".to_owned()
@@ -642,173 +633,8 @@ fn run_lookup_dns_sd(instance: &str, shutdown: &watch::Receiver<bool>) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// Linux: avahi-browse
+// Linux: mdns-sd
 // ---------------------------------------------------------------------------
-
-/// Parsed avahi-browse event (parsable mode).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AvahiEvent {
-  /// Fully resolved service (`=` line).
-  Resolved {
-    /// Service instance name.
-    instance: String,
-    /// Resolve info (hostname, port, TXT, address).
-    info: ResolveInfo,
-  },
-  /// Service removed (`-` line).
-  Removed {
-    /// Service instance name.
-    instance: String,
-  },
-}
-
-/// Split an avahi parsable line on unescaped `;`.
-pub fn split_avahi_fields(line: &str) -> Vec<String> {
-  let mut fields = Vec::new();
-  let mut cur = String::new();
-  let mut chars = line.chars();
-  while let Some(c) = chars.next() {
-    if c == '\\' {
-      if let Some(n) = chars.next() {
-        cur.push(n);
-      }
-    } else if c == ';' {
-      fields.push(std::mem::take(&mut cur));
-    } else {
-      cur.push(c);
-    }
-  }
-  fields.push(cur);
-  fields
-}
-
-/// Convert avahi TXT field (`"k=v" "k2=v2"`) into dns-sd-style space-separated pairs.
-///
-/// Values with spaces are escaped for [`parse_txt_blob`].
-pub fn normalize_avahi_txt(txt: &str) -> String {
-  let trimmed = txt.trim();
-  if trimmed.is_empty() {
-    return String::new();
-  }
-
-  let mut pairs = Vec::new();
-  let mut cur = String::new();
-  let mut in_quotes = false;
-  let mut chars = trimmed.chars();
-  while let Some(ch) = chars.next() {
-    match ch {
-      '"' if !in_quotes => {
-        in_quotes = true;
-      },
-      '"' if in_quotes => {
-        in_quotes = false;
-        if !cur.is_empty() {
-          pairs.push(std::mem::take(&mut cur));
-        }
-      },
-      '\\' if in_quotes => {
-        if let Some(n) = chars.next() {
-          cur.push(n);
-        }
-      },
-      _ if in_quotes => {
-        cur.push(ch);
-      },
-      _ if ch.is_whitespace() => {},
-      other => {
-        // Unquoted fallback character: accumulate into a free-form token.
-        cur.push(other);
-      },
-    }
-  }
-  if !cur.is_empty() {
-    pairs.push(cur);
-  }
-
-  let mut out = String::new();
-  for pair in pairs {
-    let Some((k, v)) = pair.split_once('=') else {
-      continue;
-    };
-    if !out.is_empty() {
-      out.push(' ');
-    }
-    out.push_str(k);
-    out.push('=');
-    out.push_str(&escape_txt_value(v));
-  }
-  out
-}
-
-/// Parse one avahi-browse `-p` line into a resolved or removed event.
-///
-/// Examples:
-/// ```text
-/// =;eth0;IPv4;Living Room;_googlecast._tcp;local;Chromecast-xxx.local;192.168.1.50;8009;"id=abc" "fn=Living Room" "md=Chromecast"
-/// -;eth0;IPv4;Living Room;_googlecast._tcp;local
-/// ```
-///
-/// `+` cache/add lines are ignored (wait for `=` when using `-r`). Non-IPv4
-/// resolves are skipped so IPv6 does not overwrite a good IPv4 host.
-pub fn parse_avahi_line(line: &str) -> Option<AvahiEvent> {
-  let trimmed = line.trim();
-  if trimmed.is_empty() || trimmed.starts_with('#') {
-    return None;
-  }
-  let fields = split_avahi_fields(trimmed);
-  let kind = fields.first()?.as_str();
-  match kind {
-    "-" => {
-      let instance = fields.get(3)?.clone();
-      if instance.is_empty() {
-        return None;
-      }
-      Some(AvahiEvent::Removed { instance })
-    },
-    "=" => {
-      // =;if;proto;name;type;domain;host;addr;port;txt...
-      if fields.len() < 9 {
-        return None;
-      }
-      let proto = fields.get(2).map(String::as_str)?;
-      if proto != "IPv4" {
-        return None;
-      }
-      let instance = fields.get(3)?.clone();
-      if instance.is_empty() {
-        return None;
-      }
-      let service_type = fields.get(4).map_or("", String::as_str);
-      if !service_type.is_empty() && !service_type.contains("googlecast") {
-        return None;
-      }
-      let hostname = fields.get(6)?.trim_end_matches('.').to_owned();
-      let address = fields.get(7)?.clone();
-      let port = fields
-        .get(8)
-        .and_then(|p| p.parse::<u16>().ok())
-        .filter(|&p| p != 0)
-        .unwrap_or(8009);
-      let txt_raw = fields.get(9).cloned().unwrap_or_default();
-      let txt = normalize_avahi_txt(&txt_raw);
-      Some(AvahiEvent::Resolved {
-        instance,
-        info: ResolveInfo {
-          hostname,
-          port,
-          txt,
-          address: if address.is_empty() {
-            None
-          } else {
-            Some(address)
-          },
-        },
-      })
-    },
-    // "+" cache/add lines and unknown kinds: wait for "=" when using -r.
-    _ => None,
-  }
-}
 
 /// mDNS service type including domain (required by `mdns-sd`).
 #[cfg(target_os = "linux")]
@@ -908,6 +734,9 @@ fn instance_from_mdns_fullname(fullname: &str) -> &str {
 }
 
 /// Map a resolved mDNS service into a Cast [`Device`].
+///
+/// Host: IPv4 preferred (same /24 as this host first), else IPv6 with its scope id;
+/// see [`crate::net::select_cast_addr`].
 #[cfg(target_os = "linux")]
 fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
   let props = resolved.get_properties();
@@ -921,18 +750,35 @@ fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
     .map(|p| p.val_str().to_owned())
     .filter(|s| !s.is_empty())
     .unwrap_or_else(|| instance_from_mdns_fullname(resolved.get_fullname()).replace('-', " "));
+  let model = props.get("md").map(|p| p.val_str().to_owned()).unwrap_or_default();
   let hostname = resolved.get_hostname().trim_end_matches('.').to_owned();
-  let host = resolved
-    .get_addresses_v4()
-    .into_iter()
-    .next()
-    .map_or_else(|| resolve_cast_host(&hostname), |ip| ip.to_string());
+  let mut candidates: Vec<std::net::SocketAddr> = resolved
+    .get_addresses()
+    .iter()
+    .map(|ip| match ip.to_ip_addr() {
+      std::net::IpAddr::V4(v4) => std::net::SocketAddr::from((v4, 0)),
+      std::net::IpAddr::V6(v6) => {
+        // Link-local IPv6 is only dialable with the interface it was seen on.
+        let scope_id = if let mdns_sd::ScopedIp::V6(scoped) = ip {
+          scoped.scope_id().index
+        } else {
+          0
+        };
+        std::net::SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, scope_id))
+      },
+    })
+    .collect();
+  // The address set is a HashSet: sort so ties pick the same address every resolve.
+  candidates.sort_unstable();
+  let local_v4 = crate::net::advertise_host_ip().parse::<std::net::Ipv4Addr>().ok();
+  let host = crate::net::select_cast_addr(&candidates, local_v4)
+    .map_or_else(|| resolve_cast_host(&hostname), crate::net::format_ip_host);
   let port = {
     let p = resolved.get_port();
     if p == 0 { 8009 } else { p }
   };
   let instance = instance_from_mdns_fullname(resolved.get_fullname()).to_owned();
-  Device::new(id, name, host, hostname, port, instance)
+  Device::new(id, name, host, hostname, port, instance).with_model(model)
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,56 +888,54 @@ Lookup multi-homed._googlecast._tcp.local.
   }
 
   #[test]
-  fn parse_avahi_resolved_line() {
-    let line = r#"=;eth0;IPv4;Living Room;_googlecast._tcp;local;Chromecast-xxx.local;192.168.1.50;8009;"id=abc" "fn=Living Room" "md=Chromecast""#;
-    let event = parse_avahi_line(line).expect("parse");
-    match event {
-      AvahiEvent::Resolved { instance, info } => {
-        assert_eq!(instance, "Living Room");
-        assert_eq!(info.hostname, "Chromecast-xxx.local");
-        assert_eq!(info.port, 8009);
-        assert_eq!(info.address.as_deref(), Some("192.168.1.50"));
-        let d = device_from_resolve(&instance, &info);
-        assert_eq!(d.id, "abc");
-        assert_eq!(d.name, "Living Room");
-        assert_eq!(d.host, "192.168.1.50");
-        assert_eq!(d.port, 8009);
-      },
-      AvahiEvent::Removed { .. } => panic!("expected resolved"),
-    }
+  fn resolve_cast_host_keeps_ipv6_literals_with_scope() {
+    // Link-local keeps its numeric scope (needed to dial); brackets are stripped.
+    assert_eq!(resolve_cast_host("fe80::1c2b:3cff:fe4d:5e6f%7"), "fe80::1c2b:3cff:fe4d:5e6f%7");
+    assert_eq!(resolve_cast_host("[2001:db8::50]"), "2001:db8::50");
+    assert_eq!(resolve_cast_host("192.168.1.50."), "192.168.1.50");
   }
 
   #[test]
-  fn parse_avahi_remove_line() {
-    let line = "-;eth0;IPv4;Living Room;_googlecast._tcp;local";
-    let event = parse_avahi_line(line).expect("parse");
-    match event {
-      AvahiEvent::Removed { instance } => assert_eq!(instance, "Living Room"),
-      AvahiEvent::Resolved { .. } => panic!("expected removed"),
-    }
+  fn parse_lookup_ipv6_only_reach_line_becomes_cast_host() {
+    let out = r"
+Lookup v6-only._googlecast._tcp.local.
+10:00:00.001  v6-only._googlecast._tcp.local. can be reached at 2001:db8::50:8009 (interface 4) Flags: 1
+ id=v6id fn=Attic md=Nest\ Mini
+";
+    let info = parse_lookup_output(out).expect("lookup");
+    assert_eq!(info.port, 8009);
+    assert_eq!(info.address.as_deref(), Some("2001:db8::50"));
+    let d = device_from_resolve("v6-only", &info);
+    assert_eq!(d.host, "2001:db8::50");
+    assert_eq!(d.model, "Nest Mini");
   }
 
   #[test]
-  fn parse_avahi_ignores_add_and_ipv6() {
-    assert!(parse_avahi_line("+;eth0;IPv4;Living Room;_googlecast._tcp;local").is_none());
-    let ipv6 = r#"=;eth0;IPv6;Living Room;_googlecast._tcp;local;Chromecast-xxx.local;fe80::1;8009;"id=abc""#;
-    assert!(parse_avahi_line(ipv6).is_none());
+  fn parse_lookup_prefers_ipv4_over_earlier_ipv6_line() {
+    let out = r"
+Lookup dual._googlecast._tcp.local.
+10:00:00.001  dual._googlecast._tcp.local. can be reached at 2001:db8::50:8009 (interface 4) Flags: 1
+10:00:00.002  dual._googlecast._tcp.local. can be reached at 10.0.0.5:8009 (interface 4) Flags: 1
+ id=dual fn=Den
+";
+    let info = parse_lookup_output(out).expect("lookup");
+    assert_eq!(info.address.as_deref(), Some("10.0.0.5"));
   }
 
   #[test]
-  fn normalize_avahi_txt_quoted_pairs() {
-    let raw = r#""id=abc" "fn=Living Room" "md=Chromecast""#;
-    let norm = normalize_avahi_txt(raw);
-    let m = parse_txt_blob(&norm);
-    assert_eq!(m.get("id").map(String::as_str), Some("abc"));
-    assert_eq!(m.get("fn").map(String::as_str), Some("Living Room"));
-    assert_eq!(m.get("md").map(String::as_str), Some("Chromecast"));
-  }
-
-  #[test]
-  fn split_avahi_fields_unescapes() {
-    let fields = split_avahi_fields(r"a;b\;c;d");
-    assert_eq!(fields, vec!["a", "b;c", "d"]);
+  fn cast_group_keeps_its_own_port_and_model() {
+    // Groups advertise on the leader's host with a non-8009 port; Cast control must use it.
+    let out = r"
+Lookup Google-Cast-Group-abc._googlecast._tcp.local.
+10:00:00.001  Google-Cast-Group-abc._googlecast._tcp.local. can be reached at 7e5621b9-9750-22b2-4ef6-a17173a19135.local.:32187 (interface 4) Flags: 1
+ id=1c2a3b4c5d6e7f80 cd=1c2a md=Google\ Cast\ Group fn=Downstairs ca=199204 st=0
+";
+    let info = parse_lookup_output(out).expect("lookup");
+    let d = device_from_resolve("Google-Cast-Group-abc", &info);
+    assert_eq!(d.port, 32187);
+    assert_eq!(d.model, "Google Cast Group");
+    assert_eq!(d.name, "Downstairs");
+    assert_eq!(d.id, "1c2a3b4c5d6e7f80");
   }
 
   #[test]

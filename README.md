@@ -66,6 +66,8 @@ No config file and no flags required. Keep the process running on a machine on t
 
 Never required to play audio. Empty defaults keep Cast names and show every discovered device.
 
+Two Chromecasts with the same name get distinct AirPlay names: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured rename is used exactly as written.
+
 - **Home Assistant:** Configuration tab (log level, rename, hide). Full field reference: [play-on-air/DOCS.md](play-on-air/DOCS.md).
 - **Binary / container:** optional TOML (`--config PATH`, `$PLAY_ON_AIR_CONFIG`, or `./play-on-air.toml`).
 

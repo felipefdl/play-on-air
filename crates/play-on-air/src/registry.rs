@@ -39,7 +39,10 @@ pub struct Device {
   pub id: String,
   /// Advertised friendly name.
   pub name: String,
-  /// Preferred IPv4 (or host string) for Cast control.
+  /// Model from TXT `md` (e.g. `Nest Audio`, `Google Cast Group`); empty when absent.
+  pub model: String,
+  /// Cast control host: IPv4 preferred, else IPv6 (link-local as `fe80::…%<scope index>`),
+  /// else the mDNS hostname.
   pub host: String,
   /// mDNS hostname (e.g. `uuid.local`) for re-resolution before connect.
   pub hostname: String,
@@ -69,6 +72,7 @@ impl Device {
     Self {
       id: id.into(),
       name: name.into(),
+      model: String::new(),
       host: host.into(),
       hostname: hostname.into(),
       port,
@@ -77,6 +81,13 @@ impl Device {
       pending_leave_deadline: None,
       pending_leave_since: None,
     }
+  }
+
+  /// Set the TXT `md` model (used to tell same-name devices apart on the AirPlay picker).
+  #[must_use]
+  pub fn with_model(mut self, model: impl Into<String>) -> Self {
+    self.model = model.into();
+    self
   }
 }
 
@@ -414,7 +425,7 @@ mod tests {
     assert_eq!(reg.len(), 1);
     assert_eq!(reg.get("a").map(|d| d.name), Some("New".to_owned()));
     assert_eq!(reg.drain_pending_leave_cancellations(), vec!["a".to_owned()]);
-    assert!(reg.drain_pending_leave_cancellations().is_empty());
+    assert_eq!(reg.drain_pending_leave_cancellations(), Vec::<String>::new());
   }
 
   #[test]
@@ -422,7 +433,7 @@ mod tests {
     let reg = DeviceRegistry::new();
     assert!(reg.appear(sample("a", "A")));
     assert!(!reg.appear(sample("a", "A2")));
-    assert!(reg.drain_pending_leave_cancellations().is_empty());
+    assert_eq!(reg.drain_pending_leave_cancellations(), Vec::<String>::new());
   }
 
   #[test]
@@ -453,7 +464,7 @@ mod tests {
     let reg = DeviceRegistry::new();
     let _ = reg.appear(sample("a", "A"));
     let removed = reg.expire_stale(DEFAULT_STALE_TTL);
-    assert!(removed.is_empty());
+    assert_eq!(removed, Vec::<Device>::new());
     assert_eq!(reg.len(), 1);
   }
 
@@ -474,7 +485,7 @@ mod tests {
       PendingLeaveMark::NewlyMarked
     );
     let removed = reg.expire_stale(DEFAULT_STALE_TTL);
-    assert!(removed.is_empty());
+    assert_eq!(removed, Vec::<Device>::new());
     assert!(reg.get("p").is_some());
   }
 
@@ -487,7 +498,7 @@ mod tests {
       reg.mark_pending_leave("a", now, Duration::from_secs(20)),
       PendingLeaveMark::NewlyMarked
     );
-    assert!(reg.take_due_leaves(now + Duration::from_secs(10)).is_empty());
+    assert_eq!(reg.take_due_leaves(now + Duration::from_secs(10)), Vec::<Device>::new());
     assert_eq!(reg.len(), 1);
     let due = reg.take_due_leaves(now + Duration::from_secs(21));
     assert_eq!(due.len(), 1);

@@ -9,12 +9,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 
 use crate::airplay::{AirPlayManager, AirPlaySessionEvent, cast_linear_to_airplay_db};
-use crate::bridge::Bridge;
+use crate::bridge::{Bridge, SHUTDOWN_TIMEOUT as BRIDGE_SHUTDOWN_TIMEOUT};
 use crate::cast::CastPool;
 use crate::config::Config;
 use crate::discover::Discovery;
 use crate::error::Result;
-use crate::names::{airplay_name_with_id, is_hidden};
+use crate::names::airplay_names;
 use crate::registry::{
   DEFAULT_STALE_TTL, Device, DeviceRegistry, SESSION_GUARD_GONE, WithdrawDecision, decide_airplay_withdraw,
 };
@@ -25,6 +25,8 @@ const VOLUME_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 const VOLUME_SEED_MAX_ATTEMPTS: u32 = 5;
 /// Bound for joining a blocking `cast_pool.remove` / shutdown / task abort join.
 const POOL_BLOCKING_JOIN: Duration = Duration::from_secs(5);
+/// Bound for `Bridge::run` to finish after shutdown is requested (its own budget + margin).
+const BRIDGE_SHUTDOWN_JOIN: Duration = BRIDGE_SHUTDOWN_TIMEOUT.saturating_add(Duration::from_secs(2));
 /// Max maintain-task restarts per rolling window before giving up.
 const MAINTAIN_RESTART_MAX: u32 = 5;
 /// Rolling window for maintain-task restart budget.
@@ -139,11 +141,11 @@ impl App {
     tracing::info!("shutting down PlayOnAir");
     join_task_result(maintain.await, "maintain", true);
     discovery_handle.abort();
-    // Abort before await: `Bridge::run` only exits when all `event_tx` clones drop, and
-    // airplay / bridge / ownership still hold senders here. Without abort, the first
-    // signal never reaches `cast_pool.shutdown`.
-    bridge_task.abort();
-    await_aborted_task(bridge_task, "bridge").await;
+    // `Bridge::run` never sees its event channel close here (AirPlay still holds a sender), so
+    // request shutdown explicitly: it closes intake, drains device workers, and ends every live
+    // session (media, Cast STOP) while the Cast pool is still up. Abort only past its budget.
+    bridge.request_shutdown();
+    join_bridge_on_shutdown(bridge_task).await;
     ownership_watch.abort();
     await_aborted_task(ownership_watch, "ownership watch").await;
     media_recovered_watch.abort();
@@ -174,6 +176,20 @@ async fn await_aborted_task(handle: tokio::task::JoinHandle<()>, label: &str) {
     join_task_result(result, label, false);
   } else {
     tracing::warn!(task = label, "task join timed out on shutdown");
+  }
+}
+
+/// Await `Bridge::run` after [`Bridge::request_shutdown`]; abort it if it overruns its budget.
+async fn join_bridge_on_shutdown(mut handle: tokio::task::JoinHandle<()>) {
+  if let Ok(result) = tokio::time::timeout(BRIDGE_SHUTDOWN_JOIN, &mut handle).await {
+    join_task_result(result, "bridge", true);
+  } else {
+    tracing::warn!(
+      budget_ms = BRIDGE_SHUTDOWN_JOIN.as_millis(),
+      "bridge shutdown overran its budget; aborting"
+    );
+    handle.abort();
+    await_aborted_task(handle, "bridge").await;
   }
 }
 
@@ -306,6 +322,8 @@ async fn maintain_airplay(
   }
 
   let devices = registry.list();
+  // Hidden devices are absent; same-name devices get distinct, order-independent names.
+  let names = airplay_names(&devices, config);
   let mut desired: HashSet<String> = HashSet::new();
   let mut present_ids: HashSet<String> = HashSet::new();
   // Snapshot before ensure so we can log advertise transitions once.
@@ -313,9 +331,9 @@ async fn maintain_airplay(
 
   for device in &devices {
     let _ = present_ids.insert(device.id.clone());
-    if is_hidden(&device.name, &device.id, config) {
+    let Some(name) = names.get(&device.id) else {
       continue;
-    }
+    };
     // Device re-appeared after full leave/expire → reset volume seed attempts.
     if !guards.known_ids.lock().contains(&device.id) {
       let _ = guards.volume_attempts.lock().remove(&device.id);
@@ -338,8 +356,12 @@ async fn maintain_airplay(
       continue;
     }
 
-    let name = airplay_name_with_id(&device.name, &device.id, config);
-    if let Err(err) = airplay.ensure(&device.id, &name).await {
+    // A rename (e.g. a same-name device just appeared) rebuilds the receiver and would cut
+    // a live AirPlay session; keep the current advertisement until the session ends.
+    if previously_advertised.contains(&device.id) && bridge.has_session(&device.id) {
+      continue;
+    }
+    if let Err(err) = airplay.ensure(&device.id, name).await {
       tracing::error!(
         id = %device.id,
         airplay_name = %name,
@@ -350,7 +372,7 @@ async fn maintain_airplay(
   }
   *guards.known_ids.lock() = present_ids;
 
-  log_new_advertisements(airplay, config, &devices, &previously_advertised);
+  log_new_advertisements(airplay, &names, &previously_advertised);
   sync_volume_seeds(airplay, cast_pool, guards, &devices);
   withdraw_undesired(registry, airplay, cast_pool, bridge, &desired, guards).await;
   drop_orphan_cast_workers(cast_pool, bridge, airplay, &desired).await;
@@ -434,18 +456,14 @@ async fn apply_stale_expiry(
 
 fn log_new_advertisements(
   airplay: &AirPlayManager,
-  config: &Config,
-  devices: &[Device],
+  names: &HashMap<String, String>,
   previously_advertised: &HashSet<String>,
 ) {
   for id in airplay.active_ids() {
     if previously_advertised.contains(&id) {
       continue;
     }
-    let name = devices
-      .iter()
-      .find(|d| d.id == id)
-      .map_or_else(|| id.clone(), |d| airplay_name_with_id(&d.name, &d.id, config));
+    let name = names.get(&id).map_or(id.as_str(), String::as_str);
     tracing::info!(%id, airplay_name = %name, "AirPlay receiver advertised");
   }
 }
@@ -784,7 +802,7 @@ mod tests {
       let _ = guards.volume_attempts.lock().remove(&id);
     }
     assert!(!guards.volume_attempts.lock().contains_key("a"));
-    assert!(reg.drain_pending_leave_cancellations().is_empty());
+    assert_eq!(reg.drain_pending_leave_cancellations(), Vec::<String>::new());
   }
 
   #[tokio::test]

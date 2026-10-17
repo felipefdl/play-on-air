@@ -51,6 +51,8 @@ struct ConfigFile {
 pub struct DeviceOverride {
   /// Name shown on the AirPlay picker.
   pub display_name: String,
+  /// True when a config entry set `name` (the AirPlay name is user-chosen, used verbatim).
+  pub renamed: bool,
   /// When true, skip AirPlay advertisement.
   pub hidden: bool,
 }
@@ -99,16 +101,17 @@ impl Config {
         continue;
       }
       if matches_device(&entry.id, cast_name, cast_id) {
-        let display_name = entry
-          .name
-          .as_deref()
-          .filter(|n| !n.is_empty())
-          .map_or_else(|| cast_name.to_owned(), str::to_owned);
-        return DeviceOverride { display_name, hidden: entry.hide };
+        let rename = entry.name.as_deref().filter(|n| !n.is_empty());
+        return DeviceOverride {
+          display_name: rename.map_or_else(|| cast_name.to_owned(), str::to_owned),
+          renamed: rename.is_some(),
+          hidden: entry.hide,
+        };
       }
     }
     DeviceOverride {
       display_name: cast_name.to_owned(),
+      renamed: false,
       hidden: false,
     }
   }

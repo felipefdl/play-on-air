@@ -1,7 +1,7 @@
 //! LAN host IP helpers for advertising Cast-reachable media URLs and Cast connect.
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
@@ -104,7 +104,7 @@ pub fn ensure_global_ptp_sink() {
       rt.block_on(async {
         let mut bound = 0_u8;
         for port in [319_u16, 320_u16] {
-          match tokio::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).await {
+          match tokio::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).await {
             Ok(sock) => {
               bound = bound.saturating_add(1);
               // Detached for the process lifetime; do not join.
@@ -154,31 +154,91 @@ pub fn advertise_host_ip() -> String {
   Ipv4Addr::LOCALHOST.to_string()
 }
 
-/// Pick a local IPv4 that can reach `peer_host` (Cast device).
+/// Pick a local address that can reach `peer_host` (Cast device) for the media URL host.
 ///
 /// Multi-homed Macs often have two addresses on the same /24 (e.g. Wi‑Fi `en0` and
 /// Thunderbolt `en7`). Advertising / routing via the wrong one yields
 /// `No route to host` to Nest speakers and silent playback.
+///
+/// IPv4 peers get a ranked local IPv4. An IPv6-only peer gets a bracketed local IPv6
+/// (`[2001:db8::5]`, ready for a URL authority); IPv4 stays the fallback.
 pub fn advertise_host_for_peer(peer_host: &str) -> String {
   let peer = peer_host.trim().trim_end_matches('.');
   if peer.is_empty() {
     return advertise_host_ip();
   }
 
-  let peer_v4 = resolve_host_ipv4(peer).and_then(|s| s.parse::<Ipv4Addr>().ok());
-
-  if let Some(peer_ip) = peer_v4 {
-    // Peer-aware ranking: same-subnet first, virtual ifaces blacklisted.
-    if let Some(ip) = preferred_local_ipv4s_for_peer(Some(peer_ip)).into_iter().next() {
-      return ip.to_string();
-    }
-    // Fall back: kernel route toward peer.
-    if let Some(local) = udp_discover_ipv4(peer_ip, 8009) {
-      return local.to_string();
-    }
+  match resolve_host_addr(peer) {
+    Some(SocketAddr::V4(peer_v4)) => {
+      let peer_ip = *peer_v4.ip();
+      // Peer-aware ranking: same-subnet first, virtual ifaces blacklisted.
+      if let Some(ip) = preferred_local_ipv4s_for_peer(Some(peer_ip)).into_iter().next() {
+        return ip.to_string();
+      }
+      // Fall back: kernel route toward peer.
+      if let Some(local) = udp_discover_ipv4(peer_ip, 8009) {
+        return local.to_string();
+      }
+    },
+    Some(SocketAddr::V6(peer_v6)) => {
+      if let Some(local) = advertise_ipv6_for_peer(peer_v6) {
+        return format!("[{local}]");
+      }
+    },
+    None => {},
   }
 
   advertise_host_ip()
+}
+
+/// Local IPv6 a Cast device on `peer`'s link can pull media from.
+///
+/// Kernel source selection (UDP connect, no packet sent) picks the address. A
+/// link-local source is swapped for a routable address on the same interface when one
+/// exists: Cast receivers cannot dial a zone-less `fe80::` URL host.
+fn advertise_ipv6_for_peer(peer: SocketAddrV6) -> Option<Ipv6Addr> {
+  let mut dest = peer;
+  dest.set_port(8009);
+  let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
+  socket.connect(dest).ok()?;
+  let IpAddr::V6(source) = socket.local_addr().ok()?.ip() else {
+    return None;
+  };
+  if source.is_unspecified() {
+    return None;
+  }
+  if !source.is_unicast_link_local() {
+    return Some(source);
+  }
+  let routable = routable_ipv6_on_interface(peer.scope_id());
+  if routable.is_none() {
+    tracing::warn!(
+      peer = %peer,
+      local = %source,
+      "only a link-local IPv6 reaches this Cast device; media URLs need a routable IPv6 (or IPv4) on the LAN"
+    );
+  }
+  Some(routable.unwrap_or(source))
+}
+
+/// First global / unique-local IPv6 on interface `index` (`0` = unknown → `None`).
+fn routable_ipv6_on_interface(index: u32) -> Option<Ipv6Addr> {
+  if index == 0 {
+    return None;
+  }
+  get_if_addrs()
+    .ok()?
+    .into_iter()
+    .filter(|iface| iface.index == Some(index))
+    .find_map(|iface| match iface.addr {
+      IfAddr::V6(v6) if is_routable_v6(v6.ip) => Some(v6.ip),
+      IfAddr::V4(_) | IfAddr::V6(_) => None,
+    })
+}
+
+/// Global or unique-local unicast IPv6 (usable as a URL host without a zone).
+const fn is_routable_v6(ip: Ipv6Addr) -> bool {
+  !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() && !ip.is_unicast_link_local()
 }
 
 /// Ordered Cast connect targets for a device: prefer IPv4 literals, then hostname.
@@ -208,34 +268,34 @@ pub fn cast_connect_hosts(host: &str, hostname: Option<&str>) -> Vec<String> {
   out
 }
 
-/// Best-effort wake so Nest ARP/route is hot before Cast TLS.
+/// Best-effort wake so Nest ARP/route (or IPv6 neighbor cache) is hot before Cast TLS.
 ///
 /// Uses a UDP poke plus short TCP SYNs from preferred local interfaces. Does not
 /// spawn an external `ping` process (HAOS containers often lack it).
 pub fn wake_cast_host(host: &str) {
-  let target = host.trim().trim_end_matches('.');
-  if target.is_empty() {
+  let Some(mut dest) = resolve_host_addr(host) else {
     return;
-  }
+  };
+  dest.set_port(8009);
   // UDP poke on Cast port (no response required).
-  if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-    drop(sock.send_to(&[0_u8], (target, 8009)));
+  let unspecified = match dest {
+    SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+  };
+  if let Ok(sock) = UdpSocket::bind((unspecified, 0)) {
+    drop(sock.send_to(&[0_u8], dest));
   }
-  // TCP SYN from each preferred local IP so ARP is populated on the right iface
+  // TCP SYN from each preferred local IPv4 so ARP is populated on the right iface
   // (unbound probes only use the default route, which may be the wrong NIC).
-  if let Some(ip_s) = resolve_host_ipv4(target)
-    && let Ok(ip) = ip_s.parse::<Ipv4Addr>()
-  {
-    let dest = SocketAddr::from((ip, 8009));
-    let locals = preferred_local_ipv4s_for_peer(Some(ip));
-    for local in locals {
+  if let SocketAddr::V4(dest_v4) = dest {
+    for local in preferred_local_ipv4s_for_peer(Some(*dest_v4.ip())) {
       if let Ok(stream) = tcp_connect_from(Some(local), dest, CAST_WAKE_TCP_TIMEOUT) {
         drop(stream);
       }
     }
-    if let Ok(stream) = tcp_connect_from(None, dest, CAST_WAKE_TCP_TIMEOUT) {
-      drop(stream);
-    }
+  }
+  if let Ok(stream) = tcp_connect_from(None, dest, CAST_WAKE_TCP_TIMEOUT) {
+    drop(stream);
   }
 }
 
@@ -244,12 +304,18 @@ pub fn wake_cast_host(host: &str) {
 /// Multi-homed hosts (e.g. Wi‑Fi `en0` + USB LAN `en7` on the same /24) often
 /// have a default route on the wrong NIC while AirPlay is active. Binding the
 /// source address forces the kernel onto a working path without needing root
-/// route changes. Returns the connected stream and the local IPv4 used.
+/// route changes. Returns the connected stream and the local address used.
+///
+/// IPv6 destinations (IPv6-only devices) dial unbound: the link-local scope id or
+/// kernel source selection already pins the link.
 ///
 /// Interface list is gathered **once** per dial (not twice for subnet checks).
-pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(TcpStream, Ipv4Addr)> {
-  let dest_ip = resolve_dest_ipv4(dest_host)?;
-  let dest = SocketAddr::from((dest_ip, dest_port));
+pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(TcpStream, IpAddr)> {
+  let dest = resolve_dest_addr(dest_host, dest_port)?;
+  let dest_ip = match dest {
+    SocketAddr::V4(v4) => *v4.ip(),
+    SocketAddr::V6(v6) => return tcp_connect_cast_unbound(dest, !v6.ip().is_loopback(), None),
+  };
 
   // Loopback destinations (unit tests): bind to 127.0.0.1, never a LAN NIC.
   if dest_ip.is_loopback() {
@@ -257,7 +323,7 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
       Ok(stream) => {
         apply_cast_socket_options(&stream, /*keepalive*/ false);
         tracing::info!(local = %Ipv4Addr::LOCALHOST, %dest, "Cast TCP loopback connect ok");
-        return Ok((stream, Ipv4Addr::LOCALHOST));
+        return Ok((stream, IpAddr::V4(Ipv4Addr::LOCALHOST)));
       },
       Err(err) => {
         tracing::warn!(%dest, error = %err, "Cast TCP loopback connect failed; trying unbound");
@@ -265,7 +331,7 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
     }
     let stream = tcp_connect_from(None, dest, CAST_CONNECT_TIMEOUT)?;
     apply_cast_socket_options(&stream, /*keepalive*/ false);
-    return Ok((stream, Ipv4Addr::LOCALHOST));
+    return Ok((stream, IpAddr::V4(Ipv4Addr::LOCALHOST)));
   }
 
   // One iface snapshot for this dial attempt cycle.
@@ -276,7 +342,7 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
       Ok(stream) => {
         apply_cast_socket_options(&stream, /*keepalive*/ true);
         tracing::info!(%local, %dest, "Cast TCP bound connect ok");
-        return Ok((stream, local));
+        return Ok((stream, IpAddr::V4(local)));
       },
       Err(err) => {
         tracing::debug!(%local, %dest, error = %err, "Cast TCP bound connect failed");
@@ -285,17 +351,27 @@ pub fn tcp_connect_cast_bound(dest_host: &str, dest_port: u16) -> io::Result<(Tc
     }
   }
 
+  tcp_connect_cast_unbound(dest, /*keepalive*/ true, last_err)
+}
+
+/// Unbound Cast TCP connect (kernel picks the source); returns `last_err` over the
+/// unbound error when an earlier bound attempt failed.
+fn tcp_connect_cast_unbound(
+  dest: SocketAddr,
+  keepalive: bool,
+  last_err: Option<io::Error>,
+) -> io::Result<(TcpStream, IpAddr)> {
   match tcp_connect_from(None, dest, CAST_CONNECT_TIMEOUT) {
     Ok(stream) => {
-      apply_cast_socket_options(&stream, /*keepalive*/ true);
-      let local = local_ipv4_of(&stream).unwrap_or(Ipv4Addr::UNSPECIFIED);
+      apply_cast_socket_options(&stream, keepalive);
+      let local = local_ip_of(&stream).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
       tracing::info!(%local, %dest, "Cast TCP unbound connect ok");
       Ok((stream, local))
     },
     Err(err) => {
       tracing::warn!(%dest, error = %err, "Cast TCP unbound connect failed");
       #[cfg(target_os = "macos")]
-      note_macos_local_network_diag(dest_ip, &err);
+      note_macos_local_network_diag(dest.ip(), &err);
       Err(last_err.unwrap_or(err))
     },
   }
@@ -319,7 +395,7 @@ const fn macos_local_network_permission_signature(distinct_hosts: usize, consecu
 
 /// Record a failed Cast dial on macOS; emit one process-lifetime error when the signature is broad.
 #[cfg(target_os = "macos")]
-fn note_macos_local_network_diag(dest: Ipv4Addr, err: &io::Error) {
+fn note_macos_local_network_diag(dest: IpAddr, err: &io::Error) {
   let should_emit = {
     let mut state = MACOS_LOCAL_NETWORK_DIAG.lock();
     if err.raw_os_error() == Some(MACOS_EHOSTUNREACH) {
@@ -356,8 +432,8 @@ fn note_macos_local_network_diag(dest: Ipv4Addr, err: &io::Error) {
 
 #[cfg(target_os = "macos")]
 struct MacosLocalNetworkDiagState {
-  hosts_with_ehostunreach: Vec<Ipv4Addr>,
-  last_host: Option<Ipv4Addr>,
+  hosts_with_ehostunreach: Vec<IpAddr>,
+  last_host: Option<IpAddr>,
   consecutive_on_host: u32,
 }
 
@@ -431,31 +507,32 @@ pub fn spawn_cast_connect_relay(dest_host: &str, dest_port: u16) -> io::Result<(
 /// Try TCP connect to `host:port` from each preferred local IPv4 and log results.
 ///
 /// Used after Cast connect failures so the next log capture shows which interface
-/// still works while AirPlay is active.
+/// still works while AirPlay is active. IPv6 destinations get the unbound probe only.
 pub fn probe_cast_reachability(host: &str, port: u16) {
   let target = host.trim().trim_end_matches('.');
   if target.is_empty() {
     return;
   }
-  let Ok(dest_ip) = resolve_dest_ipv4(target) else {
-    tracing::warn!(%target, port, "Cast reachability probe: no IPv4 for host");
+  let Ok(dest) = resolve_dest_addr(target, port) else {
+    tracing::warn!(%target, port, "Cast reachability probe: no IP address for host");
     return;
   };
-  let dest = SocketAddr::from((dest_ip, port));
-  for local in preferred_local_ipv4s_for_peer(Some(dest_ip)) {
-    match tcp_connect_from(Some(local), dest, CAST_CONNECT_TIMEOUT) {
-      Ok(stream) => {
-        tracing::info!(%local, %dest, "Cast reachability probe: bound ok");
-        drop(stream);
-      },
-      Err(err) => {
-        tracing::warn!(%local, %dest, error = %err, "Cast reachability probe: bound failed");
-      },
+  if let SocketAddr::V4(dest_v4) = dest {
+    for local in preferred_local_ipv4s_for_peer(Some(*dest_v4.ip())) {
+      match tcp_connect_from(Some(local), dest, CAST_CONNECT_TIMEOUT) {
+        Ok(stream) => {
+          tracing::info!(%local, %dest, "Cast reachability probe: bound ok");
+          drop(stream);
+        },
+        Err(err) => {
+          tracing::warn!(%local, %dest, error = %err, "Cast reachability probe: bound failed");
+        },
+      }
     }
   }
   match tcp_connect_from(None, dest, CAST_CONNECT_TIMEOUT) {
     Ok(stream) => {
-      let local = local_ipv4_of(&stream).unwrap_or(Ipv4Addr::UNSPECIFIED);
+      let local = local_ip_of(&stream).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
       tracing::info!(%local, %dest, "Cast reachability probe: unbound ok");
       drop(stream);
     },
@@ -465,19 +542,17 @@ pub fn probe_cast_reachability(host: &str, port: u16) {
   }
 }
 
-fn resolve_dest_ipv4(host: &str) -> io::Result<Ipv4Addr> {
-  let ip_s = resolve_host_ipv4(host)
-    .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, format!("no IPv4 address for Cast host {host}")))?;
-  ip_s.parse::<Ipv4Addr>().map_err(|parse_err| {
-    io::Error::new(
-      ErrorKind::InvalidInput,
-      format!("invalid IPv4 for Cast host {host}: {ip_s} ({parse_err})"),
-    )
-  })
+/// Resolve a Cast host (IP literal or mDNS hostname) to a connectable socket address.
+fn resolve_dest_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
+  let mut addr = resolve_host_addr(host)
+    .ok_or_else(|| io::Error::new(ErrorKind::AddrNotAvailable, format!("no IP address for Cast host {host}")))?;
+  addr.set_port(port);
+  Ok(addr)
 }
 
+/// TCP connect to `dest`, optionally from local IPv4 `local` (IPv4 destinations only).
 fn tcp_connect_from(local: Option<Ipv4Addr>, dest: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-  let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+  let socket = Socket::new(Domain::for_address(dest), Type::STREAM, Some(Protocol::TCP))?;
   if let Some(ip) = local {
     socket.bind(&SocketAddr::from((ip, 0)).into())?;
   }
@@ -487,11 +562,8 @@ fn tcp_connect_from(local: Option<Ipv4Addr>, dest: SocketAddr, timeout: Duration
   Ok(socket.into())
 }
 
-fn local_ipv4_of(stream: &TcpStream) -> Option<Ipv4Addr> {
-  match stream.local_addr().ok()?.ip() {
-    IpAddr::V4(v4) => Some(v4),
-    IpAddr::V6(_) => None,
-  }
+fn local_ip_of(stream: &TcpStream) -> Option<IpAddr> {
+  stream.local_addr().ok().map(|addr| addr.ip())
 }
 
 /// Bidirectional byte bridge until either side closes.
@@ -590,6 +662,137 @@ pub fn resolve_host_ipv4(hostname: &str) -> Option<String> {
     }
   }
   None
+}
+
+/// Resolve `hostname` (IP literal or mDNS name) to a Cast host string: IPv4 preferred,
+/// else IPv6 (link-local carries `%<scope index>`). See [`select_cast_addr`].
+#[must_use]
+pub fn resolve_host_ip(hostname: &str) -> Option<String> {
+  resolve_host_addr(hostname).map(format_ip_host)
+}
+
+/// Resolve `hostname` to one socket address (port 0); literals are taken as-is.
+fn resolve_host_addr(hostname: &str) -> Option<SocketAddr> {
+  use std::net::ToSocketAddrs;
+  let host = hostname.trim().trim_end_matches('.');
+  if host.is_empty() {
+    return None;
+  }
+  if let Some(literal) = parse_ip_host(host) {
+    return Some(literal);
+  }
+  let addrs: Vec<SocketAddr> = (host, 0_u16).to_socket_addrs().ok()?.collect();
+  select_cast_addr(&addrs, None)
+}
+
+/// Parse an IP-literal Cast host into a socket address (port 0).
+///
+/// Accepts IPv4, IPv6, and IPv6 with a `%scope` zone (numeric interface index or
+/// interface name, e.g. `fe80::1%15` / `fe80::1%en0`), optionally in brackets.
+/// Returns `None` for hostnames and for unknown interface names.
+#[must_use]
+pub fn parse_ip_host(host: &str) -> Option<SocketAddr> {
+  let trimmed = host.trim();
+  let inner = trimmed
+    .strip_prefix('[')
+    .and_then(|rest| rest.strip_suffix(']'))
+    .unwrap_or(trimmed);
+  if let Ok(v4) = inner.parse::<Ipv4Addr>() {
+    return Some(SocketAddr::from((v4, 0)));
+  }
+  let (addr_part, zone) = inner.split_once('%').map_or((inner, None), |(addr, zone)| (addr, Some(zone)));
+  let v6 = addr_part.parse::<Ipv6Addr>().ok()?;
+  if let Some(v4) = v6.to_ipv4_mapped() {
+    return Some(SocketAddr::from((v4, 0)));
+  }
+  let scope_id = match zone {
+    None => 0,
+    Some(name) => name.parse::<u32>().ok().or_else(|| interface_index(name))?,
+  };
+  Some(SocketAddr::V6(SocketAddrV6::new(v6, 0, 0, scope_id)))
+}
+
+/// OS interface index for `name` (e.g. `en0`), when the interface exists.
+fn interface_index(name: &str) -> Option<u32> {
+  get_if_addrs()
+    .ok()?
+    .into_iter()
+    .find(|iface| iface.name == name)
+    .and_then(|iface| iface.index)
+}
+
+/// Canonical Cast host string: dotted IPv4, or IPv6 with `%<index>` only when link-local.
+///
+/// Round-trips through [`parse_ip_host`].
+#[must_use]
+pub fn format_ip_host(addr: SocketAddr) -> String {
+  match addr {
+    SocketAddr::V4(v4) => v4.ip().to_string(),
+    SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or_else(
+      || {
+        if v6.ip().is_unicast_link_local() && v6.scope_id() != 0 {
+          format!("{}%{}", v6.ip(), v6.scope_id())
+        } else {
+          v6.ip().to_string()
+        }
+      },
+      |v4| v4.to_string(),
+    ),
+  }
+}
+
+/// Pick the Cast control address among resolved candidates (input order breaks ties).
+///
+/// 1. IPv4 on the same /24 as `local_v4`
+/// 2. Any other IPv4
+/// 3. Global / unique-local IPv6
+/// 4. Link-local IPv6 carrying a scope id
+///
+/// Unspecified and multicast addresses, and link-local IPv6 without a scope id
+/// (not dialable), are never picked. IPv4-mapped IPv6 is returned as IPv4.
+#[must_use]
+pub fn select_cast_addr(candidates: &[SocketAddr], local_v4: Option<Ipv4Addr>) -> Option<SocketAddr> {
+  candidates
+    .iter()
+    .copied()
+    .map(unmap_ipv4)
+    .filter_map(|addr| cast_addr_rank(addr, local_v4).map(|rank| (rank, addr)))
+    .min_by_key(|(rank, _)| *rank)
+    .map(|(_, addr)| addr)
+}
+
+/// `::ffff:a.b.c.d` → `a.b.c.d` (same port); everything else unchanged.
+fn unmap_ipv4(addr: SocketAddr) -> SocketAddr {
+  match addr {
+    SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(addr, |v4| SocketAddr::from((v4, v6.port()))),
+    SocketAddr::V4(_) => addr,
+  }
+}
+
+/// Preference rank for [`select_cast_addr`] (lower wins; `None` = unusable).
+fn cast_addr_rank(addr: SocketAddr, local_v4: Option<Ipv4Addr>) -> Option<u8> {
+  match addr {
+    SocketAddr::V4(v4) => {
+      let ip = *v4.ip();
+      if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+        None
+      } else if local_v4.is_some_and(|local| same_class_c(local, ip)) {
+        Some(0)
+      } else {
+        Some(1)
+      }
+    },
+    SocketAddr::V6(v6) => {
+      let ip = v6.ip();
+      if ip.is_unspecified() || ip.is_multicast() {
+        None
+      } else if ip.is_unicast_link_local() {
+        (v6.scope_id() != 0).then_some(3)
+      } else {
+        Some(2)
+      }
+    },
+  }
 }
 
 /// Local advertiseable IPv4 addresses, preferred interface first.
@@ -1000,6 +1203,99 @@ tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
     assert_eq!(&got, b"ping-cast");
     drop(client);
     echo_thread.join().expect("echo thread");
+  }
+
+  fn sa(s: &str) -> SocketAddr {
+    s.parse().expect("socket addr")
+  }
+
+  #[test]
+  fn parse_ip_host_handles_ipv4_ipv6_scope_and_brackets() {
+    assert_eq!(parse_ip_host("192.168.1.50"), Some(sa("192.168.1.50:0")));
+    assert_eq!(parse_ip_host("[2001:db8::50]"), Some(sa("[2001:db8::50]:0")));
+    let SocketAddr::V6(scoped) = parse_ip_host("fe80::1%7").expect("scoped") else {
+      panic!("expected IPv6");
+    };
+    assert_eq!(scoped.scope_id(), 7);
+    // IPv4-mapped IPv6 is plain IPv4 for Cast purposes.
+    assert_eq!(parse_ip_host("::ffff:10.0.0.5"), Some(sa("10.0.0.5:0")));
+    // Hostnames and unknown zone names are not IP literals.
+    assert_eq!(parse_ip_host("speaker.local"), None);
+    assert_eq!(parse_ip_host("fe80::1%no-such-iface0"), None);
+  }
+
+  #[test]
+  fn parse_ip_host_resolves_interface_name_zone() {
+    let Some(iface) = get_if_addrs()
+      .expect("ifaddrs")
+      .into_iter()
+      .find(|iface| iface.index.is_some_and(|index| index != 0))
+    else {
+      return;
+    };
+    let index = iface.index.expect("index");
+    let SocketAddr::V6(scoped) = parse_ip_host(&format!("fe80::1%{}", iface.name)).expect("named zone") else {
+      panic!("expected IPv6");
+    };
+    assert_eq!(scoped.scope_id(), index);
+    // Canonical form uses the numeric index and round-trips.
+    let canonical = format_ip_host(SocketAddr::V6(scoped));
+    assert_eq!(canonical, format!("fe80::1%{index}"));
+    assert_eq!(parse_ip_host(&canonical), Some(SocketAddr::V6(scoped)));
+  }
+
+  #[test]
+  fn format_ip_host_scopes_only_link_local() {
+    let global = SocketAddr::V6(SocketAddrV6::new("2001:db8::50".parse().expect("v6"), 0, 0, 4));
+    assert_eq!(format_ip_host(global), "2001:db8::50");
+    let link_local = SocketAddr::V6(SocketAddrV6::new("fe80::50".parse().expect("v6"), 0, 0, 4));
+    assert_eq!(format_ip_host(link_local), "fe80::50%4");
+    assert_eq!(format_ip_host(sa("10.0.0.5:0")), "10.0.0.5");
+  }
+
+  #[test]
+  fn select_cast_addr_prefers_ipv4_then_routable_then_scoped_link_local() {
+    let link_local = SocketAddr::V6(SocketAddrV6::new("fe80::50".parse().expect("v6"), 0, 0, 4));
+    let unscoped_link_local = sa("[fe80::51]:0");
+    let global = sa("[2001:db8::50]:0");
+    let lan = sa("192.168.1.50:0");
+    let other = sa("10.0.0.5:0");
+
+    // IPv4 wins over IPv6 regardless of order.
+    assert_eq!(select_cast_addr(&[global, link_local, other], None), Some(other));
+    // Same /24 as the local IPv4 beats earlier IPv4.
+    assert_eq!(select_cast_addr(&[other, lan], Some(Ipv4Addr::new(192, 168, 1, 10))), Some(lan));
+    // IPv6-only: routable before link-local.
+    assert_eq!(select_cast_addr(&[link_local, global], None), Some(global));
+    // Link-local only: needs a scope id to be dialable.
+    assert_eq!(select_cast_addr(&[unscoped_link_local, link_local], None), Some(link_local));
+    assert_eq!(select_cast_addr(&[unscoped_link_local], None), None);
+    // IPv4-mapped IPv6 comes back as IPv4.
+    assert_eq!(select_cast_addr(&[sa("[::ffff:10.0.0.5]:0")], None), Some(other));
+  }
+
+  #[test]
+  fn tcp_connect_cast_bound_dials_ipv6_destination() {
+    let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+      return; // Host without IPv6 loopback.
+    };
+    let port = listener.local_addr().expect("local_addr").port();
+    let accept = std::thread::spawn(move || {
+      let (stream, _) = listener.accept().expect("accept");
+      drop(stream);
+    });
+    let (stream, local) = tcp_connect_cast_bound("::1", port).expect("IPv6 connect");
+    assert_eq!(local, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    drop(stream);
+    accept.join().expect("accept thread");
+  }
+
+  #[test]
+  fn advertise_host_for_ipv6_peer_is_bracketed_ipv6() {
+    if UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+      return; // Host without IPv6 loopback.
+    }
+    assert_eq!(advertise_host_for_peer("::1"), "[::1]");
   }
 }
 
