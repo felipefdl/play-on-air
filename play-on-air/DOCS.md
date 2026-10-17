@@ -40,6 +40,8 @@ Examples:
 - Match id `Living Room`, AirPlay name `TV` → picker shows **TV**.
 - Match id `bedroom`, Hide enabled → that speaker never appears in AirPlay.
 
+Two Chromecasts with the same name get distinct AirPlay names without any configuration: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured AirPlay name is used exactly as written.
+
 Save, then **Restart** the app so the entrypoint reloads options.
 
 ### How options become runtime config
@@ -84,12 +86,12 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Symptom | What to check |
 |---------|----------------|
 | iOS/macOS AirPlay picker is empty | App is **Started**; host and phone on the same LAN; wait a few seconds after start for discovery; Log tab for discovery errors. |
-| Device name wrong or still visible | Configuration **Optional rename / hide** match id is a substring of the real Cast name; app was restarted after save. |
-| Ghost AirPlay after Hey Google | Use 0.1.10+; Log should show `Cast ownership lost` then kick. Restart app if still on an older image. |
-| Silent after re-cast (post steal) | Use 0.1.11+; Log should show Cast load ok without an immediate `AirPlay paused` right after. |
-| iPhone volume shows 100% but Nest is quieter | Use 0.1.12+; AirPlay reported volume is seeded from Cast. Reconnect after app update. |
+| Device name wrong or still visible | Configuration **Optional rename / hide** match id is a substring of the real Cast name; app was restarted after save. A suffix such as `(Nest Audio)` or `(7e56)` means another Chromecast has the same name; rename one of them in the Google Home app or set an AirPlay name here. |
+| Speaker still shows AirPlay after "Hey Google" | When Google Assistant or another Cast app takes the speaker, the Log shows `Cast ownership lost` and PlayOnAir disconnects the AirPlay client. iOS can take a moment to clear Now Playing. If that line never appears, restart the app. |
+| Silent after AirPlaying again (after another Cast app took the speaker) | Each new AirPlay stream starts a fresh Cast session. The Log shows `bridge session Cast load ok` when the speaker accepted it; if it is missing, check the Log for Cast errors around that time. |
+| iPhone volume shows 100% but Nest is quieter | PlayOnAir reports the Cast speaker's volume to AirPlay once it can reach the speaker. Disconnect and reconnect AirPlay on the phone to pick up the current value. |
 | Nest silent while iPhone still Streaming | Cast pause follows real AirPlay pause/flush events; a stalled stream re-loads automatically. |
-| Nest Mini / Nest speakers cut out or sound wrong | Use a current image (playback pacing and underrun handling are fixed). Prefer stable LAN Wi‑Fi; avoid forcing extreme log levels during normal listening. |
+| Nest Mini / Nest speakers cut out or sound wrong | Keep the host and speakers on a stable LAN (wired host or strong Wi-Fi). Use `info` log level for normal listening; `debug` and `trace` add load. |
 | Nothing after install | Confirm `host_network: true` is still set in the published app config; do not run PlayOnAir on a bridge-only network without multicast. |
 | Config changes ignored | Restart the app after saving Configuration. |
 

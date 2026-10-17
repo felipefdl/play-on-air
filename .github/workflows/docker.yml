@@ -50,6 +50,12 @@ jobs:
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
           echo "Resolved version=${VERSION} image=${IMAGE}"
 
+      # Every downstream job (build, merge, release) needs this job, so a mismatch blocks publishing.
+      - name: Check version sync
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/check-version-sync.sh "${VERSION}"
+
   build:
     needs: version
     strategy:

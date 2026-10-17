@@ -41,8 +41,44 @@ jobs:
       - name: Test
         run: TZ=UTC cargo nextest run --workspace --all-features
 
+  # Supply-chain gates from AGENTS.md. Each step runs even if an earlier one fails so one run reports all three.
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Install cargo-deny, cargo-audit, cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit,cargo-machete
+
+      - name: Deny
+        run: cargo deny check
+
+      - name: Audit
+        if: success() || failure()
+        run: cargo audit
+
+      - name: Machete
+        if: success() || failure()
+        run: cargo machete --with-metadata
+
+  # Release version surfaces (AGENTS.md "Deploy and release") must agree on every change.
+  version-sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check version sync
+        run: scripts/check-version-sync.sh
+
   # Compiles and lints the macOS-only discovery path (#[cfg(target_os = "macos")] in discover.rs).
-  # Ubuntu remains the full gate host when supply-chain checks are added; macOS runs fmt/clippy/test only.
+  # Ubuntu is the full gate host (including supply-chain checks); macOS runs fmt/clippy/test only.
   check-macos:
     runs-on: macos-latest
     steps:

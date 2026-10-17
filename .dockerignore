@@ -5,8 +5,11 @@ target
 **/target
 play-on-air.log
 **/*.log
+log.txt
+**/log.txt
 .DS_Store
 **/.DS_Store
+**/.kiro
 *.md
 !VISION.md
 !LICENSE.md

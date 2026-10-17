@@ -14,4 +14,7 @@ play-on-air.toml
 .vscode/
 *.swp
 *~
-play-on-air.log
+
+# Local run logs
+/log.txt
+*.log
