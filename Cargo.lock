@@ -1826,6 +1826,7 @@ dependencies = [
  "rand",
  "rubato",
  "sha2",
+ "socket2",
  "subtle",
  "symphonia",
  "thiserror 2.0.19",

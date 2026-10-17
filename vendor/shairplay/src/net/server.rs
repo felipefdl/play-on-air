@@ -266,7 +266,7 @@ impl HttpServer {
 async fn bind_listener(addr: IpAddr, start_port: u16, auto_port: bool) -> Result<TcpListener, NetworkError> {
     let mut port = start_port;
     loop {
-        match TcpListener::bind(SocketAddr::new(addr, port)).await {
+        match bind_std_listener(SocketAddr::new(addr, port)).and_then(TcpListener::from_std) {
             Ok(listener) => return Ok(listener),
             Err(_e) if auto_port && port < start_port.saturating_add(100) => {
                 port += 1;
@@ -275,6 +275,26 @@ async fn bind_listener(addr: IpAddr, start_port: u16, auto_port: bool) -> Result
         }
     }
 }
+
+/// Bind a non-blocking listener. IPv6 sockets are v6-only so `[::]` and `0.0.0.0`
+/// can share a port on Linux, where a dual-stack `[::]` would collide with the IPv4 bind.
+fn bind_std_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
 /// Spawn a tokio task that accepts connections on the given listener.
 /// Drive a single accepted connection to completion: read → optional decrypt →
 /// HTTP/RTSP framing → dispatch → optional encrypt → write, looping until the peer
