@@ -2,7 +2,7 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use if_addrs::{IfAddr, get_if_addrs};
@@ -389,7 +389,7 @@ static MACOS_LOCAL_NETWORK_DIAG: Mutex<MacosLocalNetworkDiagState> = Mutex::new(
 });
 
 #[cfg(target_os = "macos")]
-static MACOS_LOCAL_NETWORK_DIAG_ONCE: Once = Once::new();
+static MACOS_LOCAL_NETWORK_DIAG_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// Pre-dial Nest with multi-source bind, then expose a one-shot localhost TCP relay
 /// so `rust_cast` (which has no source-bind API) only dials `127.0.0.1`.
