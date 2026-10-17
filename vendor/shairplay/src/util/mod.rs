@@ -1,23 +1,11 @@
-//! Utility functions — hardware address formatting, hex encoding, wall and mono time.
+//! Utility functions — hardware address formatting, hex encoding, monotonic time.
 
 use std::fmt::Write;
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 /// Process-local epoch for [`mono_now_ns`]. Fixed at first call.
 static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
-
-/// Current wall-clock time in nanoseconds since the UNIX epoch.
-///
-/// Saturates to 0 if the clock is before the epoch. Use only where absolute
-/// wall/PTP time is required (e.g. protocol timestamps). Playout scheduling
-/// must use [`mono_now_ns`] so NTP steps cannot jump anchors.
-pub fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
 
 /// Monotonic nanoseconds since an arbitrary process-local epoch.
 ///

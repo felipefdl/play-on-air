@@ -3,27 +3,43 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use parking_lot::Mutex;
-use shairplay::{AudioFormat, AudioHandler, AudioSession, RaopServer};
+use shairplay::{AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, RaopServer, TrackMetadata};
 use tokio::sync::mpsc;
 
 use crate::audio::PcmRing;
 use crate::error::{Error, Result};
+use crate::media::{Artwork, MAX_ARTWORK_BYTES};
 
 /// Base TCP port for RAOP listeners; each device gets `BASE + (hash % PORT_SPAN)`.
 const RAOP_PORT_BASE: u16 = 5100;
 const RAOP_PORT_SPAN: u64 = 1000;
-/// Default stereo capacity (~2 s at 48 kHz) until `audio_init` sets the real layout.
+/// Placeholder stereo capacity (~2 s at 48 kHz) until `audio_init` sets the real layout.
 const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
+/// Session PCM ring depth in seconds of output audio.
+///
+/// shairplay releases buffered audio on the sender's anchor timeline at presentation time
+/// minus `Audio-Latency` (~2 s) and back-pressures the sender over TCP, so the producer is
+/// real-time paced. The ring only ever holds:
+/// - up to `Audio-Latency` released at once when an anchor arrives with less lead than that;
+/// - real PCM produced while Cast is not pulling yet (initial LOAD, re-LOAD, FLAC to WAV
+///   fallback), typically 1–4 s.
+///
+/// 10 s covers both with headroom. Overflow means Cast stopped pulling for longer than that;
+/// dropping the oldest audio is then the correct live-stream behavior.
+const SESSION_RING_SECONDS: usize = 10;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
 /// RTSP `Audio-Latency` advertised on RECORD (samples at stream rate).
 ///
-/// Stream rate is not known at receiver build (passthrough). Use 2 s at 48 kHz
-/// so the constant is visible product-side and matches shairplay's default.
+/// This is the receiver output latency: shairplay releases each buffered sample this long
+/// before its anchor presentation time, so after the ~2 s Cast cushion (HTTP silence preroll
+/// plus `LIVE_LEAD`) it is audible close to when the sender scheduled it. Stream rate is not
+/// known at receiver build (passthrough): 2 s at 48 kHz, ~2.18 s at 44.1 kHz.
 const AUDIO_LATENCY_SAMPLES: u32 = 48_000 * 2;
 /// Lifecycle events from an AirPlay receiver toward the bridge.
 #[derive(Debug, Clone)]
@@ -69,7 +85,30 @@ pub enum AirPlaySessionEvent {
     /// Volume in dB.
     volume_db: f32,
   },
+  /// The sender's now-playing title / artist / album or artwork changed.
+  NowPlaying {
+    /// Device id this receiver is bound to.
+    device_id: String,
+    /// Full now-playing state after the change.
+    now_playing: NowPlaying,
+  },
 }
+
+/// Now-playing state the sender last reported for a receiver.
+#[derive(Debug, Clone, Default)]
+pub struct NowPlaying {
+  /// Track title.
+  pub title: Option<String>,
+  /// Track artist.
+  pub artist: Option<String>,
+  /// Album name.
+  pub album: Option<String>,
+  /// Album artwork (a new image gets a new id).
+  pub artwork: Option<Arc<Artwork>>,
+}
+
+/// Process-unique artwork ids, so each image has its own `/artwork/<id>` URL.
+static NEXT_ARTWORK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Shared mutable ring slot so `audio_init` can rebuild the ring for the stream format.
 #[derive(Debug)]
@@ -233,6 +272,25 @@ impl Drop for RingSession {
 /// Creates ring-backed sessions and notifies the bridge on lifecycle events.
 struct RingHandler {
   state: Arc<DeviceAudioState>,
+  now_playing: Arc<Mutex<NowPlaying>>,
+}
+
+impl RingHandler {
+  fn new(state: Arc<DeviceAudioState>) -> Self {
+    Self {
+      state,
+      now_playing: Arc::new(Mutex::new(NowPlaying::default())),
+    }
+  }
+
+  fn emit_now_playing(&self, now_playing: NowPlaying) {
+    if let Some(tx) = &self.state.event_tx {
+      drop(tx.send(AirPlaySessionEvent::NowPlaying {
+        device_id: self.state.device_id.clone(),
+        now_playing,
+      }));
+    }
+  }
 }
 
 impl AudioHandler for RingHandler {
@@ -242,8 +300,7 @@ impl AudioHandler for RingHandler {
     let channels = u16::from(format.channels.clamp(1, OUTPUT_MAX_CHANNELS));
     let capacity_frames = usize::try_from(sample_rate)
       .unwrap_or(48_000)
-      .saturating_mul(2)
-      .max(DEFAULT_RING_FRAMES);
+      .saturating_mul(SESSION_RING_SECONDS);
     let ring = Arc::new(PcmRing::new(channels, capacity_frames));
     // shairplay aborts any prior audio session before this callback (exclusive
     // active audio). We always replace the ring; the stack drops the old session.
@@ -274,6 +331,60 @@ impl AudioHandler for RingHandler {
     }
   }
 
+  fn on_metadata(&self, metadata: &TrackMetadata) {
+    let snapshot = {
+      let mut now_playing = self.now_playing.lock();
+      if now_playing.title == metadata.title
+        && now_playing.artist == metadata.artist
+        && now_playing.album == metadata.album
+      {
+        return;
+      }
+      now_playing.title.clone_from(&metadata.title);
+      now_playing.artist.clone_from(&metadata.artist);
+      now_playing.album.clone_from(&metadata.album);
+      now_playing.clone()
+    };
+    tracing::info!(
+      device_id = %self.state.device_id,
+      title = ?snapshot.title,
+      artist = ?snapshot.artist,
+      album = ?snapshot.album,
+      "AirPlay now playing"
+    );
+    self.emit_now_playing(snapshot);
+  }
+
+  fn on_coverart(&self, mime_type: &str, coverart: &[u8]) {
+    if coverart.len() > MAX_ARTWORK_BYTES {
+      tracing::warn!(
+        device_id = %self.state.device_id,
+        bytes = coverart.len(),
+        max = MAX_ARTWORK_BYTES,
+        "AirPlay artwork too large; ignoring"
+      );
+      return;
+    }
+    let snapshot = {
+      let mut now_playing = self.now_playing.lock();
+      if now_playing
+        .artwork
+        .as_ref()
+        .is_some_and(|art| art.content_type == mime_type && art.body.as_ref() == coverart)
+      {
+        return;
+      }
+      now_playing.artwork = Some(Arc::new(Artwork {
+        id: NEXT_ARTWORK_ID.fetch_add(1, Ordering::Relaxed),
+        content_type: mime_type.to_owned(),
+        body: Bytes::copy_from_slice(coverart),
+      }));
+      now_playing.clone()
+    };
+    tracing::debug!(device_id = %self.state.device_id, mime_type, bytes = coverart.len(), "AirPlay artwork");
+    self.emit_now_playing(snapshot);
+  }
+
   fn on_client_connected(&self, addr: &str) {
     tracing::debug!(device_id = %self.state.device_id, %addr, "AirPlay RTSP client connected");
   }
@@ -291,6 +402,25 @@ impl AudioHandler for RingHandler {
   }
 }
 
+/// Network options applied to every [`AirPlayReceiver`] a manager builds.
+///
+/// The product uses [`ReceiverOptions::default`]. In-process tests disable mDNS and use
+/// ephemeral PTP ports so a receiver touches nothing beyond its own listeners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverOptions {
+  /// Register the `_raop._tcp` / `_airplay._tcp` mDNS services (product: `true`).
+  pub advertise: bool,
+  /// PTP `(event, general)` UDP ports; `None` keeps the AirPlay standard 319/320, `0` binds
+  /// an ephemeral port.
+  pub ptp_ports: Option<(u16, u16)>,
+}
+
+impl Default for ReceiverOptions {
+  fn default() -> Self {
+    Self { advertise: true, ptp_ports: None }
+  }
+}
+
 /// One running AirPlay 2 advertisement for a Cast device.
 pub struct AirPlayReceiver {
   /// Bound Cast / registry device id.
@@ -301,6 +431,8 @@ pub struct AirPlayReceiver {
   pub port: u16,
   state: Arc<DeviceAudioState>,
   server: RaopServer,
+  /// Shared with the handler; read when the bridge builds Cast metadata.
+  now_playing: Arc<Mutex<NowPlaying>>,
   /// True after reported volume was seeded from Cast (host path).
   volume_seeded_from_cast: AtomicBool,
 }
@@ -322,6 +454,7 @@ impl AirPlayReceiver {
     device_id: impl Into<String>,
     name: impl Into<String>,
     event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
+    options: ReceiverOptions,
   ) -> Result<Self> {
     let device_id_owned = device_id.into();
     let name_owned = name.into();
@@ -332,17 +465,23 @@ impl AirPlayReceiver {
       event_tx,
       device_id: device_id_owned.clone(),
     });
-    let handler = Arc::new(RingHandler { state: Arc::clone(&state) });
+    let handler = Arc::new(RingHandler::new(Arc::clone(&state)));
+    let now_playing = Arc::clone(&handler.now_playing);
 
     let hwaddr = stable_hwaddr(&device_id_owned);
     let port = stable_raop_port(&device_id_owned);
 
-    let server = RaopServer::builder()
+    let mut builder = RaopServer::builder()
       .name(name_owned.clone())
       .hwaddr(hwaddr.to_vec())
       .port(port)
       .output_max_channels(OUTPUT_MAX_CHANNELS)
       .audio_latency_samples(AUDIO_LATENCY_SAMPLES)
+      .advertise(options.advertise);
+    if let Some((event, general)) = options.ptp_ports {
+      builder = builder.ptp_ports(event, general);
+    }
+    let server = builder
       .build(handler)
       .map_err(|err| Error::AirPlay(format!("build RaopServer for {name_owned}: {err}")))?;
 
@@ -359,6 +498,7 @@ impl AirPlayReceiver {
       port,
       state,
       server,
+      now_playing,
       volume_seeded_from_cast: AtomicBool::new(false),
     })
   }
@@ -397,6 +537,30 @@ impl AirPlayReceiver {
     self.volume_seeded_from_cast.load(Ordering::Relaxed)
   }
 
+  /// What the sender last reported as now playing.
+  pub fn now_playing(&self) -> NowPlaying {
+    self.now_playing.lock().clone()
+  }
+
+  /// Report a Cast-side volume change to the sender (`dvlc`) and to `GET_PARAMETER volume`.
+  ///
+  /// `level` is the Cast level, which maps one to one onto the iOS slider.
+  pub fn report_volume(&self, level: f32, muted: bool) -> Result<()> {
+    self.volume_seeded_from_cast.store(true, Ordering::Relaxed);
+    self
+      .server
+      .report_volume(level, muted)
+      .map_err(|err| Error::AirPlay(format!("report volume for {}: {err}", self.name)))
+  }
+
+  /// Ask the sender to perform a playback command (`paus`, `play`, …).
+  pub fn send_media_remote_command(&self, command: MediaRemoteCommand) -> Result<()> {
+    self
+      .server
+      .send_media_remote_command(command)
+      .map_err(|err| Error::AirPlay(format!("send {} to {}: {err}", command.code(), self.name)))
+  }
+
   /// Stop mDNS + accept loop, then force-close live RTSP sockets on this port.
   ///
   /// Required for kick: dropping `RaopServer` alone leaves accepted TCP streams open.
@@ -418,6 +582,7 @@ pub struct AirPlayManager {
   /// Device ids mid-kick: [`Self::ensure`] must not recreate them (maintain race).
   kicking: Mutex<HashSet<String>>,
   event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
+  options: ReceiverOptions,
 }
 
 impl AirPlayManager {
@@ -427,7 +592,15 @@ impl AirPlayManager {
       receivers: Mutex::new(HashMap::new()),
       kicking: Mutex::new(HashSet::new()),
       event_tx,
+      options: ReceiverOptions::default(),
     }
+  }
+
+  /// Build every receiver with `options` instead of the product defaults.
+  #[must_use]
+  pub const fn with_receiver_options(mut self, options: ReceiverOptions) -> Self {
+    self.options = options;
+    self
   }
 
   /// Ensure a receiver exists for `device_id` with the given AirPlay name.
@@ -447,7 +620,7 @@ impl AirPlayManager {
 
     self.remove(device_id);
 
-    let mut rx = AirPlayReceiver::build(device_id, airplay_name, self.event_tx.clone())?;
+    let mut rx = AirPlayReceiver::build(device_id, airplay_name, self.event_tx.clone(), self.options)?;
     rx.start().await?;
     {
       let mut guard = self.receivers.lock();
@@ -613,7 +786,7 @@ impl AirPlayManager {
     tokio::time::sleep(KICK_WITHDRAW_HOLD).await;
 
     // Re-advertise under same name (kicking flag still set — use direct insert path).
-    let mut replacement = AirPlayReceiver::build(device_id, &airplay_name, self.event_tx.clone())?;
+    let mut replacement = AirPlayReceiver::build(device_id, &airplay_name, self.event_tx.clone(), self.options)?;
     replacement.start().await?;
     {
       let mut guard = self.receivers.lock();
@@ -656,6 +829,31 @@ impl AirPlayManager {
       .lock()
       .get(device_id)
       .is_some_and(|rx| !rx.volume_seeded_from_cast())
+  }
+
+  /// What the sender last reported as now playing for `device_id`, if advertised.
+  pub fn now_playing(&self, device_id: &str) -> Option<NowPlaying> {
+    self.receivers.lock().get(device_id).map(AirPlayReceiver::now_playing)
+  }
+
+  /// Report a Cast-side volume / mute change to `device_id`'s sender.
+  pub fn report_volume(&self, device_id: &str, level: f32, muted: bool) -> Result<()> {
+    self
+      .receivers
+      .lock()
+      .get(device_id)
+      .ok_or_else(|| Error::AirPlay(format!("no AirPlay receiver for {device_id}")))?
+      .report_volume(level, muted)
+  }
+
+  /// Ask `device_id`'s sender to perform a playback command.
+  pub fn send_media_remote_command(&self, device_id: &str, command: MediaRemoteCommand) -> Result<()> {
+    self
+      .receivers
+      .lock()
+      .get(device_id)
+      .ok_or_else(|| Error::AirPlay(format!("no AirPlay receiver for {device_id}")))?
+      .send_media_remote_command(command)
   }
 }
 
@@ -711,37 +909,31 @@ fn format_hwaddr(mac: [u8; 6]) -> String {
   format!("{b0:02x}:{b1:02x}:{b2:02x}:{b3:02x}:{b4:02x}:{b5:02x}")
 }
 
-/// AirPlay mute floor in dB (`GET_PARAMETER` / `SET_PARAMETER`).
+/// AirPlay mute sentinel in dB (`GET_PARAMETER` / `SET_PARAMETER`).
 const AIRPLAY_VOLUME_DB_MIN: f32 = -144.0;
-/// Floor for `log10` when mapping near-silent Cast levels to AirPlay dB.
-const CAST_LINEAR_LOG_EPS: f32 = 1.0e-7;
+/// Bottom of the audible AirPlay range: iOS slider position 0. Apple mutes at or below it.
+const AIRPLAY_VOLUME_DB_FLOOR: f32 = -30.0;
 
-/// Map AirPlay volume (dB, 0 = max, -144 = mute) to Cast linear `0.0..=1.0`.
+/// Map AirPlay volume (dB, `0` = max, `-30` = slider bottom, `-144` = mute) to Cast level.
+///
+/// Cast level is the iOS slider position: `(dB + 30) / 30`, clamped to `0..=1`, so the
+/// slider drives the Cast device's (already perceptual) volume one to one. At or below
+/// `-30` dB, including the `-144` mute sentinel, the level is `0` (Apple mutes there).
 pub fn airplay_db_to_cast_linear(volume_db: f32) -> f32 {
-  if volume_db <= AIRPLAY_VOLUME_DB_MIN {
+  if volume_db.is_nan() || volume_db <= AIRPLAY_VOLUME_DB_FLOOR {
     return 0.0;
   }
-  if volume_db >= 0.0 {
-    return 1.0;
-  }
-  // Approximate amplitude: 10^(dB/20).
-  let linear = 10_f32.powf(volume_db / 20.0);
-  linear.clamp(0.0, 1.0)
+  ((volume_db - AIRPLAY_VOLUME_DB_FLOOR) / -AIRPLAY_VOLUME_DB_FLOOR).clamp(0.0, 1.0)
 }
 
-/// Map Cast linear volume (`0.0..=1.0`) to AirPlay dB (`0.0` = max, `-144.0` = mute).
+/// Map Cast level (`0.0..=1.0`) to AirPlay dB: `-30 + 30 * level`, `-144` (mute) at `0`.
 ///
-/// Inverse of [`airplay_db_to_cast_linear`] for the amplitude path (`20 * log10(level)`).
+/// Inverse of [`airplay_db_to_cast_linear`] on `(0, 1]`.
 pub fn cast_linear_to_airplay_db(level: f32) -> f32 {
   if !level.is_finite() || level <= 0.0 {
     return AIRPLAY_VOLUME_DB_MIN;
   }
-  if level >= 1.0 {
-    return 0.0;
-  }
-  let clamped = level.clamp(CAST_LINEAR_LOG_EPS, 1.0);
-  let db = 20.0 * clamped.log10();
-  db.clamp(AIRPLAY_VOLUME_DB_MIN, 0.0)
+  level.min(1.0).mul_add(-AIRPLAY_VOLUME_DB_FLOOR, AIRPLAY_VOLUME_DB_FLOOR)
 }
 
 #[cfg(test)]
@@ -768,31 +960,86 @@ mod tests {
     assert_eq!(stable_raop_port("device-1"), stable_raop_port("device-1"));
   }
 
+  /// Spec 6: the iOS slider is linear in dB over `-30..0`; Cast level follows it one to one.
   #[test]
-  fn airplay_db_to_cast_linear_bounds() {
-    assert!((airplay_db_to_cast_linear(0.0) - 1.0).abs() < f32::EPSILON);
-    assert!((airplay_db_to_cast_linear(-144.0) - 0.0).abs() < f32::EPSILON);
-    let mid = airplay_db_to_cast_linear(-6.0);
-    assert!(mid > 0.4 && mid < 0.6);
-  }
-
-  #[test]
-  fn cast_linear_to_airplay_db_bounds() {
-    assert!((cast_linear_to_airplay_db(0.0) - AIRPLAY_VOLUME_DB_MIN).abs() < f32::EPSILON);
-    assert!((cast_linear_to_airplay_db(1.0) - 0.0).abs() < f32::EPSILON);
-    let mid = cast_linear_to_airplay_db(0.5);
-    assert!((mid - (-6.020_6)).abs() < 0.01);
-  }
-
-  #[test]
-  fn cast_linear_airplay_db_roundtrip_mid() {
-    for level in [0.1_f32, 0.25, 0.5, 0.75, 0.9] {
-      let db = cast_linear_to_airplay_db(level);
-      let back = airplay_db_to_cast_linear(db);
-      assert!((back - level).abs() < 1.0e-5, "level={level} db={db} back={back}");
+  fn airplay_db_to_cast_level_follows_slider() {
+    for (db, level) in [
+      (-144.0_f32, 0.0_f32),
+      (-60.0, 0.0),
+      (-30.0, 0.0),
+      (-15.0, 0.5),
+      (-7.5, 0.75),
+      (0.0, 1.0),
+    ] {
+      let got = airplay_db_to_cast_linear(db);
+      assert!((got - level).abs() < 1.0e-6, "dB {db}: expected {level}, got {got}");
     }
-    assert!((airplay_db_to_cast_linear(cast_linear_to_airplay_db(0.0)) - 0.0).abs() < f32::EPSILON);
-    assert!((airplay_db_to_cast_linear(cast_linear_to_airplay_db(1.0)) - 1.0).abs() < f32::EPSILON);
+    assert!((airplay_db_to_cast_linear(3.0) - 1.0).abs() < f32::EPSILON, "above 0 dB clamps");
+    assert!((airplay_db_to_cast_linear(f32::NAN) - 0.0).abs() < f32::EPSILON);
+  }
+
+  #[test]
+  fn cast_level_to_airplay_db_inverse() {
+    for (level, db) in [(0.0_f32, -144.0_f32), (0.5, -15.0), (1.0, 0.0), (1.4, 0.0)] {
+      let got = cast_linear_to_airplay_db(level);
+      assert!((got - db).abs() < 1.0e-5, "level {level}: expected {db}, got {got}");
+    }
+    // A tiny nonzero level is the slider bottom (-30 dB), not the mute sentinel.
+    assert!((cast_linear_to_airplay_db(1.0e-6) - -30.0).abs() < 1.0e-3);
+    assert!((cast_linear_to_airplay_db(f32::NAN) - AIRPLAY_VOLUME_DB_MIN).abs() < f32::EPSILON);
+    for level in [0.1_f32, 0.25, 0.5, 0.75, 0.9] {
+      let back = airplay_db_to_cast_linear(cast_linear_to_airplay_db(level));
+      assert!((back - level).abs() < 1.0e-5, "roundtrip {level} -> {back}");
+    }
+  }
+
+  /// Metadata and artwork are surfaced once per change; artwork gets a fresh id per image
+  /// and oversized images are dropped.
+  #[test]
+  fn now_playing_events_dedupe_and_bound_artwork() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+      event_tx: Some(tx),
+      device_id: "dev-np".to_owned(),
+    });
+    let handler = RingHandler::new(state);
+    let meta = TrackMetadata {
+      title: Some("Song".to_owned()),
+      artist: Some("Band".to_owned()),
+      ..TrackMetadata::default()
+    };
+    handler.on_metadata(&meta);
+    handler.on_metadata(&meta);
+    let first = match rx.try_recv() {
+      Ok(AirPlaySessionEvent::NowPlaying { device_id, now_playing }) => {
+        assert_eq!(device_id, "dev-np");
+        now_playing
+      },
+      other => panic!("expected NowPlaying, got {other:?}"),
+    };
+    assert_eq!(first.title.as_deref(), Some("Song"));
+    assert_eq!(first.artist.as_deref(), Some("Band"));
+    assert!(rx.try_recv().is_err(), "identical metadata must not re-emit");
+
+    handler.on_coverart("image/jpeg", b"jpeg-1");
+    let art1 = match rx.try_recv() {
+      Ok(AirPlaySessionEvent::NowPlaying { now_playing, .. }) => now_playing.artwork.expect("artwork"),
+      other => panic!("expected artwork NowPlaying, got {other:?}"),
+    };
+    assert_eq!(art1.content_type, "image/jpeg");
+    handler.on_coverart("image/jpeg", b"jpeg-1");
+    assert!(rx.try_recv().is_err(), "same image must not re-emit");
+    handler.on_coverart("image/jpeg", b"jpeg-2");
+    let art2 = match rx.try_recv() {
+      Ok(AirPlaySessionEvent::NowPlaying { now_playing, .. }) => now_playing.artwork.expect("artwork"),
+      other => panic!("expected artwork NowPlaying, got {other:?}"),
+    };
+    assert_ne!(art1.id, art2.id);
+
+    handler.on_coverart("image/jpeg", &vec![0_u8; MAX_ARTWORK_BYTES + 1]);
+    assert!(rx.try_recv().is_err(), "oversized artwork is dropped");
+    assert_eq!(handler.now_playing.lock().artwork.as_ref().map(|a| a.id), Some(art2.id));
   }
 
   #[test]
@@ -802,7 +1049,7 @@ mod tests {
       event_tx: None,
       device_id: "dev".to_owned(),
     });
-    let handler = RingHandler { state: Arc::clone(&state) };
+    let handler = RingHandler::new(Arc::clone(&state));
     let format = AudioFormat {
       codec: shairplay::AudioCodec::Pcm,
       bits: 32,
@@ -825,7 +1072,7 @@ mod tests {
       event_tx: Some(tx),
       device_id: "dev-fmt".to_owned(),
     });
-    let handler = RingHandler { state: Arc::clone(&state) };
+    let handler = RingHandler::new(Arc::clone(&state));
     let fmt = |channels: u8| AudioFormat {
       codec: shairplay::AudioCodec::Pcm,
       bits: 32,
@@ -936,7 +1183,7 @@ mod tests {
         event_tx: Some(tx),
         device_id: "dev-race".to_owned(),
       });
-      let handler = RingHandler { state: Arc::clone(&state) };
+      let handler = RingHandler::new(Arc::clone(&state));
 
       let session1 = handler.audio_init(fmt);
       match rx.try_recv() {
@@ -972,7 +1219,8 @@ mod tests {
           | AirPlaySessionEvent::Paused { .. }
           | AirPlaySessionEvent::Resumed { .. }
           | AirPlaySessionEvent::Flushed { .. }
-          | AirPlaySessionEvent::Volume { .. } => {},
+          | AirPlaySessionEvent::Volume { .. }
+          | AirPlaySessionEvent::NowPlaying { .. } => {},
         }
       }
       assert!(

@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 
 use crate::audio::PcmRing;
-use crate::cast::CastPool;
+use crate::cast::{CastPool, CastTrack};
 use crate::media::MediaServerHandle;
 
 use super::fallback::FlacStrikeReason;
@@ -96,6 +96,8 @@ pub(super) struct PlayingSession {
   pub(super) late_stop_allowed: Arc<AtomicBool>,
   /// Last AirPlay volume as Cast linear level (updated by volume events).
   pub(super) last_volume_linear: Arc<Mutex<Option<f32>>>,
+  /// Now-playing metadata currently shown on Cast; every (re-)LOAD sends it.
+  pub(super) track: Arc<Mutex<CastTrack>>,
   /// In-flight blocking Cast LOAD (rollover / reload); awaited on teardown before media STOP.
   pub(super) inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
   /// Serializes join → publish → await → take of `inflight_load` across concurrent re-LOAD

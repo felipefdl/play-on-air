@@ -12,8 +12,8 @@ use crate::util;
 pub(crate) const RAOP_CN: &str = "0,1";
 /// Digest auth supported.
 pub(crate) const RAOP_DA: &str = "true";
-/// Transport protocols.
-pub(crate) const RAOP_TP: &str = "TCP,UDP";
+/// Transport protocols. Apple and the Sonos SDK receiver both advertise `UDP` only.
+pub(crate) const RAOP_TP: &str = "UDP";
 /// Metadata types: 0=text, 1=artwork, 2=progress.
 pub(crate) const RAOP_MD: &str = "0,1,2";
 /// Encryption types advertised in `_raop` TXT (0=none, 3/5=FairPlay).
@@ -27,8 +27,8 @@ pub(crate) const RAOP_VN: &str = "65537";
 pub(crate) const GLOBAL_MODEL: &str = crate::raop::config::GLOBAL_MODEL;
 /// Source version string.
 pub(crate) const AP2_SRCVERS: &str = crate::raop::config::AP2_SRCVERS;
-/// OS version string.
-pub(crate) const AP2_OSVERS: &str = "15.6";
+/// Receiver settings flags (`rsf`). The Sonos SDK receiver sends `0x0`; Apple's Mac sends `0x8`.
+pub(crate) const AP2_RSF: &str = "0x0";
 /// Firmware version string.
 pub(crate) const AP2_FW_VERSION: &str = "77.40.00";
 /// Protocol version string.
@@ -64,23 +64,18 @@ impl AirPlayServiceInfo {
         already_paired: bool,
     ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
-        let hw_airplay = util::hwaddr_airplay(hwaddr);
         let raop_name = format!("{hw_raop}@{name}");
 
-        let features = super::features::receiver_features_for_pairing(requires_pin_pairing);
-        let features_lo = features & 0xFFFFFFFF;
-        let features_hi = (features >> 32) & 0xFFFFFFFF;
-        let ft = format!("0x{features_lo:X},0x{features_hi:X}");
-        let status_flags = crate::raop::config::ap2_status_flags(requires_pin_pairing, already_paired);
+        let ft = features_txt(requires_pin_pairing);
+        let status_flags = crate::raop::config::ap2_status_flags(password, requires_pin_pairing, already_paired);
 
+        // Key set follows Apple's Mac and the Sonos SDK receiver (spec section 4).
+        // A password is signaled by statusFlags bit 7, not a `pw` key.
         let raop_txt = vec![
-            // Base RAOP fields AirPlay 2 receivers still publish (shairport-sync parity)
             ("cn".into(), RAOP_CN.into()),
             ("da".into(), RAOP_DA.into()),
             ("et".into(), RAOP_ET.into()),
-            ("pw".into(), (if password { "true" } else { "false" }).into()),
-            // AP2 fields
-            ("ft".into(), ft.clone()),
+            ("ft".into(), ft),
             ("fv".into(), AP2_FW_VERSION.into()),
             ("sf".into(), format!("0x{status_flags:X}")),
             ("md".into(), RAOP_MD.into()),
@@ -89,27 +84,9 @@ impl AirPlayServiceInfo {
             ("tp".into(), RAOP_TP.into()),
             ("vn".into(), RAOP_VN.into()),
             ("vs".into(), AP2_SRCVERS.into()),
-            ("ov".into(), AP2_OSVERS.into()),
         ];
 
-        let airplay_txt = vec![
-            ("acl".into(), "0".into()),
-            ("btaddr".into(), "00:00:00:00:00:00".into()),
-            ("deviceid".into(), hw_airplay),
-            ("features".into(), ft),
-            ("flags".into(), format!("0x{status_flags:X}")),
-            ("gid".into(), pi.into()),
-            ("igl".into(), "0".into()),
-            ("gcgl".into(), "0".into()),
-            ("model".into(), GLOBAL_MODEL.into()),
-            ("protovers".into(), AP2_PROTOVERS.into()),
-            ("pi".into(), pi.into()),
-            ("pk".into(), pk_hex.into()),
-            ("srcvers".into(), AP2_SRCVERS.into()),
-            ("osvers".into(), AP2_OSVERS.into()),
-            ("vv".into(), "2".into()),
-            ("fv".into(), AP2_FW_VERSION.into()),
-        ];
+        let airplay_txt = airplay_txt(hwaddr, password, pk_hex, pi, requires_pin_pairing, already_paired);
 
         Self {
             raop_name,
@@ -119,6 +96,65 @@ impl AirPlayServiceInfo {
             airplay_txt,
         }
     }
+}
+
+/// `features` / `ft` TXT value: `0x<low 32 bits>,0x<high 32 bits>`.
+fn features_txt(requires_pin_pairing: bool) -> String {
+    let features = super::features::receiver_features_for_pairing(requires_pin_pairing);
+    let features_lo = features & 0xFFFF_FFFF;
+    let features_hi = features >> 32;
+    format!("0x{features_lo:X},0x{features_hi:X}")
+}
+
+/// `_airplay._tcp` TXT key/value pairs.
+///
+/// Shared by mDNS registration and the `txtAirPlay` key of `GET /info`, which Apple fills
+/// with the same record. `gid` equals `pi`, as the Sonos SDK receiver does. Apple-only keys
+/// with no meaning for this receiver (`btaddr`, `osvers`, `vv`, `psi`) are omitted, as the
+/// Sonos SDK receiver omits them.
+pub(crate) fn airplay_txt(
+    hwaddr: &[u8],
+    password: bool,
+    pk_hex: &str,
+    pi: &str,
+    requires_pin_pairing: bool,
+    already_paired: bool,
+) -> Vec<(String, String)> {
+    let status_flags = crate::raop::config::ap2_status_flags(password, requires_pin_pairing, already_paired);
+    vec![
+        ("acl".into(), "0".into()),
+        ("deviceid".into(), util::hwaddr_airplay(hwaddr)),
+        ("features".into(), features_txt(requires_pin_pairing)),
+        ("rsf".into(), AP2_RSF.into()),
+        ("flags".into(), format!("0x{status_flags:X}")),
+        ("gid".into(), pi.into()),
+        ("igl".into(), "0".into()),
+        ("gcgl".into(), "0".into()),
+        ("model".into(), GLOBAL_MODEL.into()),
+        ("protovers".into(), AP2_PROTOVERS.into()),
+        ("pi".into(), pi.into()),
+        ("pk".into(), pk_hex.into()),
+        ("srcvers".into(), AP2_SRCVERS.into()),
+        ("fv".into(), AP2_FW_VERSION.into()),
+    ]
+}
+
+/// Encode TXT key/value pairs as DNS TXT record bytes (length-prefixed `key=value` strings).
+///
+/// Entries longer than 255 bytes cannot be represented and are skipped.
+pub(crate) fn encode_txt(txt: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, value) in txt {
+        let len = key.len() + 1 + value.len();
+        let Ok(len) = u8::try_from(len) else {
+            continue;
+        };
+        out.push(len);
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value.as_bytes());
+    }
+    out
 }
 
 /// Convert TXT record pairs to a `HashMap` for mDNS registration.
@@ -293,17 +329,19 @@ mod tests {
             false,
         );
 
+        let keys: Vec<&str> = info.raop_txt.iter().map(|(k, _)| k.as_str()).collect();
         let find = |key: &str| info.raop_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
 
-        // AP2 _raop._tcp must have these fields (matching shairport-sync)
+        // Key set of Apple's Mac / the Sonos SDK receiver (spec section 4): no `pw`, `ov`.
+        assert_eq!(
+            keys,
+            ["cn", "da", "et", "ft", "fv", "sf", "md", "am", "pk", "tp", "vn", "vs"]
+        );
         assert_eq!(find("vn"), Some("65537"));
-        assert_eq!(find("tp"), Some("TCP,UDP"));
-        assert!(find("ft").unwrap().contains(",")); // features has hi,lo
-        assert!(find("pk").is_some()); // Ed25519 public key
-        assert!(find("sf").is_some()); // status flags
+        assert_eq!(find("tp"), Some("UDP"));
         assert_eq!(find("cn"), Some("0,1"));
         assert_eq!(find("da"), Some("true"));
-        assert_eq!(find("pw"), Some("false"));
+        assert_eq!(find("sf"), Some("0x4"));
     }
 
     #[test]
@@ -319,19 +357,40 @@ mod tests {
             false,
         );
 
+        let keys: Vec<&str> = info.airplay_txt.iter().map(|(k, _)| k.as_str()).collect();
         let find = |key: &str| info.airplay_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
 
-        // AP2 _airplay._tcp required fields
-        assert_eq!(find("acl"), Some("0"));
-        assert!(find("deviceid").is_some());
-        assert!(find("features").is_some());
-        assert!(find("flags").is_some());
-        assert!(find("gid").is_some());
+        // Sonos SDK receiver key set; no Apple-only `btaddr`, `osvers`, `vv`.
+        assert_eq!(
+            keys,
+            [
+                "acl",
+                "deviceid",
+                "features",
+                "rsf",
+                "flags",
+                "gid",
+                "igl",
+                "gcgl",
+                "model",
+                "protovers",
+                "pi",
+                "pk",
+                "srcvers",
+                "fv"
+            ]
+        );
+        assert_eq!(find("deviceid"), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(find("rsf"), Some("0x0"));
+        assert_eq!(find("gid"), find("pi"));
         assert_eq!(find("model"), Some("PlayOnAir1,1"));
         assert_eq!(find("protovers"), Some("1.1"));
-        assert!(find("pi").is_some());
-        assert!(find("pk").is_some());
-        assert_eq!(find("vv"), Some("2"));
+    }
+
+    #[test]
+    fn encode_txt_length_prefixes_entries() {
+        let txt = vec![("a".to_string(), "1".to_string()), ("bc".to_string(), String::new())];
+        assert_eq!(encode_txt(&txt), b"\x03a=1\x03bc=");
     }
 
     #[test]
@@ -366,8 +425,8 @@ mod tests {
         let raop = |key: &str| info.raop_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         let airplay = |key: &str| info.airplay_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
 
-        assert_eq!(raop("ft"), Some("0x405D4A00,0x14340"));
-        assert_eq!(airplay("features"), Some("0x405D4A00,0x14340"));
+        assert_eq!(raop("ft"), Some("0x405FCA00,0x14340"));
+        assert_eq!(airplay("features"), Some("0x405FCA00,0x14340"));
         assert_eq!(raop("sf"), Some("0x204"));
         assert_eq!(airplay("flags"), Some("0x204"));
     }

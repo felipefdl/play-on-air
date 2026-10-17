@@ -209,11 +209,13 @@ mod rtp_buffer_tests {
 // ============================================================
 #[test]
 fn service_info_with_password() {
+    // Apple signals a password with statusFlags bit 7; there is no `pw` TXT key.
     let info = AirPlayServiceInfo::new("Test", 5000, &[0; 6], true, "pk", "pi", false, false);
-    assert_eq!(
-        info.raop_txt.iter().find(|(k, _)| k == "pw").map(|(_, v)| v.as_str()),
-        Some("true")
-    );
+    let raop = |key: &str| info.raop_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    let airplay = |key: &str| info.airplay_txt.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    assert_eq!(raop("sf"), Some("0x84"));
+    assert_eq!(airplay("flags"), Some("0x84"));
+    assert_eq!(raop("pw"), None);
 }
 
 mod ap2_tests {
@@ -423,35 +425,6 @@ mod frac_edge_tests {
         let frac: u64 = 0x0041_8937_0000_0000;
         let ns = ((frac >> 32) * 1_000_000_000) >> 32;
         assert!((ns as i64 - 1_000_000).abs() < 100_000, "got {ns}"); // ~1ms ± 0.1ms
-    }
-}
-
-// --- Playout buffer logic ---
-
-mod playout_tests {
-    use shairplay::raop::buffered_audio::PlayoutCommand;
-
-    #[test]
-    fn playout_command_variants() {
-        // Just verify the enum is constructible (compile-time check)
-        let _ = PlayoutCommand::SetRate {
-            anchor_rtp: 0,
-            anchor_time_ns: 0,
-            rate: 1,
-        };
-        let _ = PlayoutCommand::Flush {
-            from_seq: 0,
-            until_seq: 100,
-            from_ts: None,
-            until_ts: None,
-        };
-        let _ = PlayoutCommand::Flush {
-            from_seq: 0,
-            until_seq: 100,
-            from_ts: Some(1_000),
-            until_ts: Some(50_000),
-        };
-        let _ = PlayoutCommand::Stop;
     }
 }
 

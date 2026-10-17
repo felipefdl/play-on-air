@@ -19,7 +19,6 @@ clap = { version = "4", features = ["derive", "env"] }
 claxon = "0.4"
 flacenc = "0.5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-hound = "3.5"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
@@ -33,6 +32,8 @@ rustls = "0.23"
 # Cast verifier: raw-SPKI handshake signature checks (rustls' own webpki, same version).
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
+# Cast media JSON for messages `rust_cast` has no builder for (metadata `QUEUE_UPDATE`).
+serde_json = "1"
 # Vendored fork (LGPL-3.0-or-later): hard-stop aborts live RTSP/AP2 session tasks.
 # See vendor/shairplay/PLAYONAIR.md. Version pins lockfile/deny (path alone is `*`).
 shairplay = { path = "vendor/shairplay", version = "0.7.0" }

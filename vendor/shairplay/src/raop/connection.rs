@@ -1,8 +1,10 @@
 //! Per-connection state and RTSP request handling.
 
 use super::handlers;
+use super::remote::{self, MediaRemoteCommand, SenderVersion};
 use super::rtsp;
 use super::types::*;
+use crate::error::RemoteError;
 use crate::net::server::{ConnectionHandler, HttpdCallbacks};
 use crate::proto::http::{HttpRequest, HttpResponse};
 use std::net::SocketAddr;
@@ -12,6 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimum AirPlay volume in dB (`GET_PARAMETER` / `SET_PARAMETER`). Mute floor.
 pub(crate) const AIRPLAY_VOLUME_DB_MIN: f32 = -144.0;
+
+/// Volume changes smaller than this (dB) are not reported back to the sender.
+const VOLUME_REPORT_EPSILON_DB: f32 = 0.05;
 
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
@@ -59,6 +64,11 @@ pub(crate) struct RaopShared {
     /// Hosts may set this from the physical sink so the iOS slider matches device volume
     /// instead of always advertising max (`0.0`).
     pub(crate) reported_volume_db: std::sync::Mutex<f32>,
+    /// Open event channels by owning connection id, oldest first. Receiver-initiated
+    /// commands go to the active-audio owner's channel, else the newest.
+    pub(crate) event_senders: std::sync::Mutex<Vec<(u64, crate::raop::event_channel::EventSender)>>,
+    /// PTP follower acquired by [`crate::RaopServer::start`] (shared per process for fixed ports).
+    pub(crate) ptp: std::sync::Mutex<Option<Arc<crate::net::ptp::PtpService>>>,
 }
 
 impl RaopShared {
@@ -75,6 +85,15 @@ impl RaopShared {
         }
     }
 
+    /// Clock of the running PTP follower, if the server started one.
+    pub(crate) fn ptp_clock(&self) -> Option<crate::net::ptp::PtpClock> {
+        self.ptp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|service| service.clock().clone())
+    }
+
     /// Track a detached task on the **global** list for [`Self::hard_stop_sessions`].
     /// Prefer [`handlers::RaopConnection::register_session_task`], which dual-tracks
     /// onto the connection-local list for scoped TEARDOWN.
@@ -89,8 +108,7 @@ impl RaopShared {
     ///
     /// Order is load-bearing: the active-audio stop handle must run **before**
     /// aborting tasks. Buffered playout registers a synchronous stop that sets
-    /// `stopped` and notifies the delivery condvar; if the async command task is
-    /// aborted first, `PlayoutCommand::Stop` is never polled and delivery wedges.
+    /// `stopped` and wakes the delivery thread and reader before the reader task is aborted.
     ///
     /// Detach-only: no joins or sleeps. Used by TEARDOWN so a stale RC connection
     /// cannot murder a live audio session on another connection.
@@ -108,6 +126,74 @@ impl RaopShared {
         for handle in owned_tasks.drain(..) {
             handle.abort();
         }
+        self.unregister_event_sender(owner_id);
+    }
+
+    /// Track the event channel opened by connection `owner_id` (replaces an earlier one).
+    pub(crate) fn register_event_sender(&self, owner_id: u64, sender: crate::raop::event_channel::EventSender) {
+        let mut senders = self.event_senders.lock().unwrap_or_else(PoisonError::into_inner);
+        senders.retain(|(id, _)| *id != owner_id);
+        senders.push((owner_id, sender));
+    }
+
+    /// Forget the event channel of connection `owner_id` (TEARDOWN or disconnect).
+    pub(crate) fn unregister_event_sender(&self, owner_id: u64) {
+        self.event_senders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(id, _)| *id != owner_id);
+    }
+
+    /// Event channel for receiver-initiated commands: the one opened by the connection that
+    /// owns active audio, else the newest (the remote-control-only connection).
+    fn command_event_sender(&self) -> Option<crate::raop::event_channel::EventSender> {
+        let audio_owner = self
+            .active_audio
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(id, _)| *id);
+        let senders = self.event_senders.lock().unwrap_or_else(PoisonError::into_inner);
+        audio_owner
+            .and_then(|owner| senders.iter().find(|(id, _)| *id == owner))
+            .or_else(|| senders.last())
+            .map(|(_, sender)| sender.clone())
+    }
+
+    /// Ask the sender to perform `command` (`sendMediaRemoteCommand`).
+    pub(crate) fn send_media_remote_command(&self, command: MediaRemoteCommand) -> Result<(), RemoteError> {
+        let sender = self.command_event_sender().ok_or(RemoteError::NoEventChannel)?;
+        sender.send_command(&remote::media_remote_command_body(command))?;
+        tracing::info!(code = command.code(), "Sent media remote command to sender");
+        Ok(())
+    }
+
+    /// Record a local volume change and report it to the sender with `dvlc`.
+    ///
+    /// Updates the `GET_PARAMETER volume` value. Sends nothing when the value equals the
+    /// last reported one (so a sender's own `SET_PARAMETER volume` is never echoed back).
+    pub(crate) fn report_volume(&self, slider: f32, muted: bool) -> Result<(), RemoteError> {
+        let volume_db = if muted {
+            AIRPLAY_VOLUME_DB_MIN
+        } else {
+            remote::slider_to_db(slider)
+        };
+        {
+            let mut reported = self.reported_volume_db.lock().unwrap_or_else(PoisonError::into_inner);
+            if (*reported - volume_db).abs() < VOLUME_REPORT_EPSILON_DB {
+                return Ok(());
+            }
+            *reported = volume_db;
+        }
+        let sender = self.command_event_sender().ok_or(RemoteError::NoEventChannel)?;
+        if let Some(version) = sender.sender_version()
+            && version < remote::DVLC_MIN_SENDER_VERSION
+        {
+            return Err(RemoteError::SenderTooOld(version.to_string()));
+        }
+        sender.send_command(&remote::volume_report_body(slider, muted))?;
+        tracing::debug!(slider, muted, volume_db, "Reported volume to sender (dvlc)");
+        Ok(())
     }
 
     /// Stop active audio and abort **all** registered AP2 session tasks.
@@ -123,6 +209,11 @@ impl RaopShared {
         for handle in tasks.drain(..) {
             handle.abort();
         }
+        drop(tasks);
+        self.event_senders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -154,6 +245,7 @@ struct RaopConnectionHandler {
 
 impl Drop for RaopConnectionHandler {
     fn drop(&mut self) {
+        self.conn.shared.unregister_event_sender(self.conn.connection_id);
         self.conn.shared.handler.on_client_disconnected(&self.remote_addr);
     }
 }
@@ -170,6 +262,12 @@ impl ConnectionHandler for RaopConnectionHandler {
             tracing::debug!(elapsed_ms, method, url, "RTSP request");
         } else {
             tracing::info!(elapsed_ms, method, url, "RTSP request");
+        }
+        if self.conn.sender_version.is_none()
+            && let Some(version) = request.header("User-Agent").and_then(SenderVersion::from_user_agent)
+        {
+            tracing::debug!(%version, "AirPlay sender version");
+            self.conn.sender_version = Some(version);
         }
         let resp = rtsp::dispatch(&mut self.conn, request);
 
@@ -252,6 +350,8 @@ pub(crate) fn test_shared(handler: Arc<dyn AudioHandler>) -> Arc<RaopShared> {
         #[cfg(feature = "hls")]
         hls_handler: None,
         reported_volume_db: std::sync::Mutex::new(0.0),
+        event_senders: std::sync::Mutex::new(Vec::new()),
+        ptp: std::sync::Mutex::new(None),
     })
 }
 
@@ -464,5 +564,105 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_none()
         );
+    }
+
+    fn decode_command(message: &[u8]) -> (String, plist::Dictionary) {
+        let split = message.windows(4).position(|w| w == b"\r\n\r\n").expect("header end") + 4;
+        let head = String::from_utf8(message[..split].to_vec()).expect("ascii head");
+        let body: plist::Value = plist::from_bytes(&message[split..]).expect("plist body");
+        (head, body.into_dictionary().expect("dict"))
+    }
+
+    fn register(
+        shared: &RaopShared,
+        owner: u64,
+        version: Option<SenderVersion>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.register_event_sender(owner, crate::raop::event_channel::EventSender::new(tx, version));
+        rx
+    }
+
+    #[test]
+    fn media_remote_command_goes_to_active_audio_owner_with_rising_cseq() {
+        let shared = test_shared();
+        let mut audio_rx = register(&shared, 1, None);
+        let mut rc_rx = register(&shared, 2, None);
+        shared.set_active_audio(1, Box::new(|| {}));
+
+        shared.send_media_remote_command(MediaRemoteCommand::Pause).unwrap();
+        shared.send_media_remote_command(MediaRemoteCommand::Play).unwrap();
+
+        let (head, body) = decode_command(&audio_rx.try_recv().unwrap());
+        assert!(head.starts_with("POST /command RTSP/1.0\r\n"), "{head}");
+        assert!(head.contains("\r\nCSeq: 1\r\n"), "{head}");
+        assert_eq!(body.get("value").and_then(plist::Value::as_string), Some("paus"));
+        let (head, body) = decode_command(&audio_rx.try_recv().unwrap());
+        assert!(head.contains("\r\nCSeq: 2\r\n"), "{head}");
+        assert_eq!(body.get("value").and_then(plist::Value::as_string), Some("play"));
+        assert!(
+            rc_rx.try_recv().is_err(),
+            "RC channel must not get audio-owner commands"
+        );
+    }
+
+    #[test]
+    fn media_remote_command_without_audio_uses_newest_and_errors_when_none() {
+        let shared = test_shared();
+        assert!(matches!(
+            shared.send_media_remote_command(MediaRemoteCommand::Pause),
+            Err(RemoteError::NoEventChannel)
+        ));
+        let mut old_rx = register(&shared, 1, None);
+        let mut new_rx = register(&shared, 2, None);
+        shared.send_media_remote_command(MediaRemoteCommand::Pause).unwrap();
+        assert!(new_rx.try_recv().is_ok());
+        assert!(old_rx.try_recv().is_err());
+
+        // Teardown of connection 2 unregisters its channel.
+        shared.stop_connection_sessions(2, &mut Vec::new());
+        shared.send_media_remote_command(MediaRemoteCommand::Pause).unwrap();
+        assert!(old_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn report_volume_sends_dvlc_once_and_never_echoes_sender_volume() {
+        let shared = test_shared();
+        let mut rx = register(&shared, 1, Some(SenderVersion([860, 7, 1])));
+
+        shared.report_volume(0.5, false).unwrap();
+        let (_, body) = decode_command(&rx.try_recv().unwrap());
+        assert_eq!(body.get("value").and_then(plist::Value::as_string), Some("dvlc"));
+        assert_eq!(body.get("volume").and_then(plist::Value::as_real), Some(0.5));
+        assert_eq!(body.get("isMuted").and_then(plist::Value::as_boolean), Some(false));
+        assert!((*shared.reported_volume_db.lock().unwrap() - -15.0).abs() < 0.001);
+
+        // Same value again: no report.
+        shared.report_volume(0.5, false).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        // Sender set -6 dB (SET_PARAMETER); the device then settles on the same level.
+        *shared.reported_volume_db.lock().unwrap() = -6.0;
+        shared.report_volume(0.8, false).unwrap();
+        assert!(rx.try_recv().is_err(), "echo of the sender's own volume");
+
+        // Mute reports -144 with isMuted.
+        shared.report_volume(0.8, true).unwrap();
+        let (_, body) = decode_command(&rx.try_recv().unwrap());
+        assert_eq!(body.get("isMuted").and_then(plist::Value::as_boolean), Some(true));
+        assert!((*shared.reported_volume_db.lock().unwrap() - AIRPLAY_VOLUME_DB_MIN).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn report_volume_refuses_pre_dvlc_sender() {
+        let shared = test_shared();
+        let mut rx = register(&shared, 1, Some(SenderVersion([354, 54, 5])));
+        assert!(matches!(
+            shared.report_volume(0.3, false),
+            Err(RemoteError::SenderTooOld(_))
+        ));
+        assert!(rx.try_recv().is_err());
+        // GET_PARAMETER still reflects the device volume.
+        assert!((*shared.reported_volume_db.lock().unwrap() - -21.0).abs() < 0.001);
     }
 }

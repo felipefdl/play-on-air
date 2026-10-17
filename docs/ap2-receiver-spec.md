@@ -190,17 +190,18 @@ the 2 length bytes. Connection type `APAP` uses a 4-byte big-endian length that 
 Buffered RTP sequence numbers are compared modulo 2^24 everywhere (low 24 bits). Confidence: High
 for framing, High for 24-bit comparison.
 
-### What the fork assumes
+### What the fork does
 
-| Topic | Fork today | Apple |
+| Topic | Fork | Apple |
 |---|---|---|
-| Anchor time | Network time parsed but dropped; anchor uses local receipt time (`vendor/shairplay/src/raop/handlers_ap2.rs:849-865`, `vendor/shairplay/src/raop/buffered_audio.rs:552-556`) | Network time on the PTP timeline maps to host time; RTP offsets from the anchor set each sample's time |
-| Start alignment | Nudges anchor to earliest buffered frame minus 100 ms and purges frames more than 2 s behind (`buffered_audio.rs:268-322`, constants at `buffered_audio.rs:50-67`) | No nudge; anchor honored as sent; frames before the playhead are pruned |
-| Rate 0 | Pause, buffer kept (`buffered_audio.rs:275-278`) | Same, plus anchor cleared |
-| Non-0/1 rates | `rate & 1` treated as play (`handlers_ap2.rs:853`) | Rejected with an error status |
-| Buffer depth | 60 s target, 50 s resume, 180 s backstop that drops newest (`buffered_audio.rs:33-48`, `221-229`) | 120 s high water, no drops, TCP back-pressure only |
-| `audioBufferSize` | Fixed 1 MiB (`handlers_ap2.rs:710`) | 120 s times max bytes per second of the supported formats |
-| Response | Empty (`handlers_ap2.rs:867`) | `firstAvailableSampleTS`, optional `renderStartNetworkTime*`, `status` on error |
+| Anchor time | Locked PTP timeline of a session peer maps network time to local monotonic time (`vendor/shairplay/src/net/ptp.rs`); unlocked or foreign timeline uses the pinned receipt-time fallback (`buffered_audio.rs`, `Playout::resolve_anchor`) | Network time on the PTP timeline maps to host time; unlocked anchors are rejected |
+| Release | Packet handed to the host at presentation minus `Audio-Latency` (the Cast cushion), on a 64-bit RTP timeline | Renderer presents at `H(anchor) + (r - anchor_rtp) / rate`, compensating device latency |
+| Start alignment | No nudge; packets whose end is behind the playhead are pruned; 30 ms fade-in per anchor | Same |
+| Rate 0 | Stop, buffer kept, anchor cleared | Same |
+| Non-0/1 rates | Plist `status` -6705 | Same |
+| Buffer depth | 120 s high water (resume below 119 s), reader suspends TCP reads, nothing dropped | 120 s high water, no drops, TCP back-pressure only |
+| `audioBufferSize` | 120 s x 192000 B/s (PCM bound of 48 kHz 16-bit stereo; AAC per-format bit rates unknown) | 120 s times max bytes per second of the supported formats |
+| Response | `firstAvailableSampleTS` when audio is buffered, `status` on error; no receiver-chosen anchor | `firstAvailableSampleTS`, optional `renderStartNetworkTime*`, `status` on error |
 
 ## 2. FLUSHBUFFERED
 
@@ -269,15 +270,15 @@ handling; the sender then sends SETRATEANCHORTIME with an anchor on the new epoc
 flush the existing anchor stays valid, so the replacement audio must continue the old RTP epoch.
 Confidence: Medium (`[INFERENCE]` that senders follow this, from the receiver's state handling).
 
-### What the fork assumes
+### What the fork does
 
-- Missing `flushFromSeq` defaults to 0 and both bounds are inclusive; timestamps are preferred over
-  sequence numbers when both exist (`vendor/shairplay/src/raop/handlers_ap2.rs:896-912`,
-  `vendor/shairplay/src/raop/buffered_audio.rs:169-171`, `332-337`).
-- A flush-all does not stop playback; it arms a deferred re-anchor on the first post-flush packet
-  (`buffered_audio.rs:355-363`, `393-408`, `416-435`).
-- The playout map is keyed by RTP timestamp, so sequence-based rules cannot be applied today.
-- Response is empty (`handlers_ap2.rs:923`).
+- Follows the rules above (`vendor/shairplay/src/raop/buffered_audio.rs`, `Playout::flush` /
+  `Playout::admit`): 24-bit modulo compare, flush-all without `flushFromSeq` (or `flushFromTS`),
+  range flush otherwise, from inclusive / until exclusive, rules retired at `flushUntilSeq + 20`.
+  Flush-all stops playback and resets anchor and RTP epoch; range flush keeps playing, trims from
+  `flushFromTS` to the end and continues the epoch from the cut.
+- Missing `flushUntilSeq` answers plist `status` -6705. A successful flush answers empty (no
+  `RTP-Info`).
 
 ## 3. PTP clock
 
@@ -337,15 +338,18 @@ and were not analyzed.
   messages on UDP 319/320 during a session to this Mac (needs root for `tcpdump`), or extract
   `IOgPTPPlugin` from the kernelcache and read its announce construction.
 
-### What the fork assumes
+### What the fork does
 
-- PTP is only drained; no clock is disciplined (`vendor/shairplay/src/net/ptp.rs:139-201`).
-- SETPEERS is logged and ignored; SETPEERSX is not handled
-  (`vendor/shairplay/src/raop/handlers_ap2.rs:871-885`).
-- SETUP returns `timingPeerInfo` with only the local IP as `Addresses` and `ID`
-  (`handlers_ap2.rs:466-474`), which matches the key shape Apple uses.
-- The network time to nanosecond conversion matches Apple's (top 32 bits of the fraction,
-  `handlers_ap2.rs:849-851`), but the result is unused.
+- Passive PTP follower (`vendor/shairplay/src/net/ptp.rs`): per grandmaster clock identity,
+  offset from Sync/Follow_Up through a minimum-delay window filter; it never transmits, so it
+  does not take part in master election. Ports default to 319/320 and are shared per process.
+- SETUP `timingPeerInfo` adds and `timingPeerList` / SETPEERS / SETPEERSX replace the session
+  peer set; SETPEERS is ignored unless SETUP negotiated PTP. Responses stay empty (the local peer
+  info never changes), and no `updateTimingPeerInfo` event is sent.
+- SETUP returns `timingPeerInfo` with only the local IP as `Addresses` and `ID`, which matches the
+  key shape Apple uses.
+- Before lock, on another timeline, or when the ports cannot be bound, anchors use the pinned
+  receipt-time fallback instead of being rejected (PlayOnAir must play on such hosts).
 
 ## 4. Advertising
 
@@ -353,10 +357,10 @@ and were not analyzed.
 
 | Field | Mac (receiver) | Apple TV | Sonos Era 100 | Fork (no PIN) |
 |---|---|---|---|---|
-| features | `0x38174FDE4A7FCFD5` | `0x3C177FDE4A7FDFD5` | `0x0801C340445F8A00` | `0x0001C340405D4A00` |
+| features | `0x38174FDE4A7FCFD5` | `0x3C177FDE4A7FDFD5` | `0x0801C340445F8A00` | `0x0001C340405FCA00` |
 | featuresEx (`fex`) | `1c9/St5PFzg2IYxA` | `1d9/St5/Fzw4oY7cDg` | `AIpfREDDAQgQIQ` | absent |
-| statusFlags | `0x204` | `0x18644` | `0x4` | `0x4` / `0x204` / `0x604` |
-| volumeControlType | 4 | 4 | 3 | absent |
+| statusFlags | `0x204` | `0x18644` | `0x4` | `0x4` / `0x204` / `0x604` (`+0x80` with a password) |
+| volumeControlType | 4 | 4 | 3 | 3 |
 
 `fex` is base64 of the full little-endian feature bit array; its first 8 bytes equal `features`.
 Extended bits (64 and up) observed: Mac 65, 66, 68, 69, 72, 77, 82, 83, 87, 94; Sonos 68, 72, 77.
@@ -422,20 +426,22 @@ Audio format indices (bit `n` of a `supportedFormats` mask is index `n`;
 
 ### Diff against the fork
 
-- `/info` (`vendor/shairplay/src/raop/handlers_ap2.rs:184-251`): `pk` is a hex string, Apple sends
-  plist data (the SDK receiver omits it). Missing: `featuresEx`, `volumeControlType`,
-  `supportedAudioFormatsExtended`, `keepAliveSendStatsAsBody`, `initialVolume`, `txtAirPlay`.
-- `_airplay._tcp` (`AirPlayServiceInfo::new_airplay2`, `vendor/shairplay/src/net/mdns.rs:95-112`):
-  sends `vv=2` (Apple: 0 or 1), `btaddr=00:00:00:00:00:00`, `osvers`, `fv`; omits `fex`, `rsf`,
-  `psi`.
-- `_raop._tcp` (`mdns.rs:76-93`): `cn=0,1` is narrower than Apple's `0,1,2,3`; `tp=TCP,UDP` where
-  Apple sends `UDP`; extra `pw`, `fv`, `ov`.
-- `updateInfo` (`handlers_ap2.rs:269-302`): the fork sends a five-key dictionary at SETUP. Apple
-  sends `{type: "updateInfo", value: <the full /info dictionary plus session info>}` when system
-  info changes (`____NotifySessionsSystemInfoChange_block_invoke`, `0x229fc00f0`).
-- `features.rs:133-142` says bits 15, 17, 52 and 59 to 61 break discovery. The Sonos SDK receiver
-  on the same network advertises 15, 17 and 59 and is discovered by iOS, so those notes describe a
-  failed combination, not a rule. Retest before relying on them.
+The fork now follows this section (`build_info_dict` in `vendor/shairplay/src/raop/handlers_ap2.rs`,
+`airplay_txt` and `AirPlayServiceInfo::new` in `vendor/shairplay/src/net/mdns.rs`,
+`ap2_status_flags` in `vendor/shairplay/src/raop/config.rs`). Remaining differences, on purpose:
+
+- `/info` omits `featuresEx` (until extended bit 72 exists), `psi`, `osBuildVersion`,
+  `playbackCapabilities`, `senderAddress`, and the screen keys. `supportedFormats` has only
+  `audioStream` (ALAC 18 to 21) and `bufferStream` (AAC-LC 22, 23); `supportedAudioFormatsExtended`
+  is `{bufferStream: [22, 23]}`.
+- `_airplay._tcp` uses the Sonos SDK key set: no `fex`, `psi`, `act`, `at`, `vv`, `btaddr`,
+  `osvers`; `rsf=0x0`; `gid` equals `pi`; `deviceid` is lowercase hex.
+- `_raop._tcp` keeps `cn=0,1` (the realtime path decodes PCM and ALAC only, as the SDK receiver
+  advertises) and `fv`; it sends `tp=UDP` and no `pw` or `ov`.
+- `updateInfo` carries the full `/info` dictionary but is still sent once at SETUP, not on
+  system info changes.
+- Bits 15 and 17 are set; bits 52 and 59 to 61 stay off (no protocol path). The exact mask still
+  needs an iPhone discovery retest.
 
 ### Recommended audio-only mask
 
@@ -458,7 +464,7 @@ Keep the tested base and add metadata bits only once their handlers exist:
 | 50, 52, 59, 60, 61 | no | bplist now-playing, SETPEERSX, stream-connections SETUP, media data control, RFC 2198. Each implies a protocol path the fork lacks. |
 | 0 to 8, 10, 33 to 35, 39, 42, 49 | no | Video, photo, screen. |
 
-Resulting masks: base `0x0001C340405D4A00` (current), with metadata `0x0001C340405FCA00`. Keep `fex`
+Resulting masks: base `0x0001C340405D4A00` (previous), with metadata `0x0001C340405FCA00` (adopted). Keep `fex`
 unadvertised until extended bit 72 (APAP framing) is implemented. Advertise
 `volumeControlType = 3` (absolute, receiver-side hardware volume, as the SDK receiver does,
 because the Cast device applies volume) and `supportedAudioFormatsExtended = {bufferStream: [22]}`

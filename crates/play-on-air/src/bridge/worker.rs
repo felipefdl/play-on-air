@@ -97,7 +97,8 @@ const fn event_device_id(event: &AirPlaySessionEvent) -> &str {
     | AirPlaySessionEvent::Paused { device_id }
     | AirPlaySessionEvent::Resumed { device_id }
     | AirPlaySessionEvent::Flushed { device_id }
-    | AirPlaySessionEvent::Volume { device_id, .. } => device_id.as_str(),
+    | AirPlaySessionEvent::Volume { device_id, .. }
+    | AirPlaySessionEvent::NowPlaying { device_id, .. } => device_id.as_str(),
   }
 }
 
@@ -150,6 +151,9 @@ async fn device_worker_loop(
       },
       AirPlaySessionEvent::Volume { device_id: event_device, volume_db } => {
         bridge.handle_volume(&event_device, volume_db).await;
+      },
+      AirPlaySessionEvent::NowPlaying { device_id: event_device, now_playing } => {
+        bridge.handle_now_playing(&event_device, &now_playing);
       },
     }
   }

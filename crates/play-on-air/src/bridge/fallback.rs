@@ -231,7 +231,7 @@ impl Bridge {
         let (cancel, task) = spawn_rollover_reload_loop(
           session.device_id.clone(),
           session.stream_url.clone(),
-          session.cast_name.clone(),
+          Arc::clone(&session.track),
           Arc::clone(&session.pool),
           session.media.rollover_signal(),
           Arc::clone(&session.session_alive),

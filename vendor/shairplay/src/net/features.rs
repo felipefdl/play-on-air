@@ -117,29 +117,25 @@ pub(crate) fn features_from(flags: &[AirPlayFeature]) -> u64 {
 
 /// Features for an audio-only AirPlay 2 receiver.
 ///
-/// Features for an audio-only AirPlay 2 receiver.
+/// Bitmask: `0x0001C340405FCA00`, the spec section 4 "recommended audio-only mask with
+/// metadata": the shairport-sync base `0x0001C340405D4A00` (iOS 18 verified 2026-04-04)
+/// plus bit 15 (artwork) and bit 17 (DAAP now-playing), whose `SET_PARAMETER` handlers
+/// exist and feed the Cast media metadata.
 ///
-/// Known-good bitmask: `0x0001C340405D4A00` (matches shairport-sync).
-/// Tested working with iOS 18 on 2026-04-04.
+/// # What is known about extra bits
 ///
-/// # Warning
-///
-/// Do NOT add bits without testing on a real iPhone. Extra bits (e.g.
-/// `SupportsAirPlayVideoV2`, `SupportsVolume`, `Authentication1`) cause
-/// the iPhone to expect capabilities we don't implement, resulting in
-/// the device being hidden from AirPlay discovery or immediate TEARDOWN
-/// after SETUP.
-///
-/// Bits that were tested and MUST NOT be set for audio-only:
-/// - bit 15 (MetadataArtwork) — causes discovery failure
-/// - bit 17 (MetadataNowPlayingDaap) — causes discovery failure
-/// - bit 23 (Authentication1/RSA) — causes discovery failure
-/// - bit 27 (SupportsLegacyPairing) — causes discovery failure
-/// - bit 32 (SupportsVolume) — causes discovery failure
-/// - bit 49 (SupportsAirPlayVideoV2) — causes immediate TEARDOWN
-/// - bit 50 (MetadataNowPlayingBplist) — causes discovery failure
-/// - bit 52 (SupportsSetPeersExtendedMessage) — causes discovery failure
-/// - bit 59/60/61 (AudioStreamConn/MediaDataCtrl/Rfc2198) — causes discovery failure
+/// Each bit promises a protocol path; only set bits whose path the fork implements.
+/// - Bits 15, 17 and 59 to 61 were recorded as hiding the receiver from iOS discovery,
+///   but only as part of one failed combination. The Sonos SDK receiver on the same
+///   network advertises 15, 17 and 59 and is discovered, so 15 and 17 alone are not a
+///   discovery problem (spec section 4). The exact mask still needs an iPhone retest.
+/// - Bit 49 (`SupportsAirPlayVideoV2`) caused immediate TEARDOWN after SETUP.
+/// - Bits 23, 27, 32 were recorded hidden in the same older combination; Apple sets 27
+///   only for legacy pairing, which the fork does not implement.
+/// - Bits 50, 52, 59, 60, 61 (bplist now-playing, SETPEERSX, stream-connection SETUP,
+///   media data control, RFC 2198) each imply a protocol path the fork lacks.
+/// - Bit 47 (transient pairing) is set as the Sonos SDK receiver does; Apple's own
+///   receivers never set it because they never use transient pairing.
 pub fn receiver_features() -> u64 {
     receiver_features_for_pairing(false)
 }
@@ -153,8 +149,6 @@ pub(crate) fn receiver_features_for_pairing(requires_pin_pairing: bool) -> u64 {
     #[cfg(not(feature = "video"))]
     use AirPlayFeature::*;
 
-    // Known-good bitmask: 0x0001C340405D4A00
-    // Verified with iOS 18 + shairport-sync reference.
     // Each bit is annotated with its position for easy cross-referencing
     // with https://emanuelecozzi.net/docs/airplay2/features/
     // When video is enabled, use UxPlay's proven feature set (0x527FFEE6).
@@ -197,7 +191,9 @@ pub(crate) fn receiver_features_for_pairing(requires_pin_pairing: bool) -> u64 {
             SupportsAirPlayAudio,                  // bit 9
             AudioRedundant,                        // bit 11
             Authentication4,                       // bit 14 — FairPlay
+            MetadataArtwork,                       // bit 15
             MetadataProgress,                      // bit 16
+            MetadataNowPlayingDaap,                // bit 17
             AudioFormats0,                         // bit 18
             AudioFormats1,                         // bit 19
             HasUnifiedAdvertiserInfo,              // bit 30
@@ -242,9 +238,10 @@ mod tests {
     #[cfg(not(feature = "video"))]
     fn audio_receiver_has_required_bits() {
         let f = receiver_features();
-        // Pin the exact known-good value (matches shairport-sync, iOS 18 verified).
-        assert_eq!(f, 0x0001_C340_405D_4A00, "audio receiver features drifted");
-        // Core AP2 requirements (from shairport-sync)
+        // Pin the spec section 4 audio-only mask with metadata bits 15 and 17.
+        assert_eq!(f, 0x0001_C340_405F_CA00, "audio receiver features drifted");
+        assert!(f & (1 << 15) != 0, "MetadataArtwork");
+        assert!(f & (1 << 17) != 0, "MetadataNowPlayingDaap");
         assert!(f & (1 << 9) != 0, "SupportsAirPlayAudio");
         assert!(f & (1 << 11) != 0, "AudioRedundant");
         assert!(f & (1 << 40) != 0, "SupportsBufferedAudio");
@@ -259,7 +256,7 @@ mod tests {
     #[cfg(not(feature = "video"))]
     fn pin_pairing_clears_transient_bit() {
         let f = receiver_features_for_pairing(true);
-        assert_eq!(f, 0x0001_4340_405D_4A00, "PIN pairing features drifted");
+        assert_eq!(f, 0x0001_4340_405F_CA00, "PIN pairing features drifted");
         assert!(f & (1 << 46) != 0, "SupportsHKPairing");
         assert!(f & (1 << 48) != 0, "SupportsCoreUtilsPairing");
         assert_eq!(f & (1 << 47), 0, "transient pairing bit must be off");

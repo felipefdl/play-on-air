@@ -25,7 +25,9 @@ use crate::error::{Error, Result};
 use crate::net::CastRelayShutdown;
 use crate::registry::Device;
 
-use super::{ActiveCastSession, MediaLoadRequest, media_session_id_from_status, volume_level_clamped};
+use super::{
+  ActiveCastSession, CastTrack, MEDIA_NAMESPACE, MediaLoadRequest, media_session_from_status, volume_level_clamped,
+};
 
 /// Map Cast `Volume` from `get_status` to linear `0.0..=1.0` (muted → `0.0`).
 fn volume_from_cast_status(volume: rust_cast::channels::receiver::Volume) -> f32 {
@@ -35,8 +37,121 @@ fn volume_from_cast_status(volume: rust_cast::channels::receiver::Volume) -> f32
   volume_level_clamped(volume.level.unwrap_or(0.0))
 }
 
+/// A change on the Cast device that we did not command (touch controls, voice, Google Home app).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastRemoteEvent {
+  /// Registry device id of the Cast receiver.
+  pub device_id: String,
+  /// What changed.
+  pub kind: CastRemoteKind,
+}
+
+/// Kind of [`CastRemoteEvent`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CastRemoteKind {
+  /// Our live media session went to PAUSED without a PAUSE from us.
+  Paused,
+  /// Our live media session went to PLAYING without a PLAY or LOAD from us.
+  Played,
+  /// Receiver volume or mute changed without a volume command from us.
+  Volume {
+    /// Receiver level `0.0..=1.0`.
+    level: f32,
+    /// Receiver mute flag.
+    muted: bool,
+  },
+}
+
+/// After our own PAUSE / PLAY / LOAD / volume command, statuses are not attributed to the
+/// user for this long: the device can still broadcast a status from before our command.
+const OWN_COMMAND_SETTLE: Duration = Duration::from_millis(1_500);
+
+/// Volume differences below this are the same level (Cast reports floats with noise).
+const VOLUME_MATCH_EPSILON: f32 = 0.005;
+
+/// Player state we commanded last (only PLAYING / PAUSED are attributable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayerIntent {
+  Playing,
+  Paused,
+}
+
+/// Separates user-initiated Cast changes from echoes of our own commands.
+///
+/// Player state: only while our media session is live (an intent is set on LOAD / PLAY /
+/// PAUSE and cleared when the session ends). Volume: always, against the last level we set
+/// or observed. Within [`OWN_COMMAND_SETTLE`] of our own command, observations are ignored
+/// entirely; a real user change in that window is still caught by the next status after it.
+#[derive(Debug, Default)]
+struct RemoteTracker {
+  intent: Option<PlayerIntent>,
+  player_settle_until: Option<Instant>,
+  volume: Option<(f32, bool)>,
+  volume_settle_until: Option<Instant>,
+}
+
+impl RemoteTracker {
+  /// We are about to command `intent` (LOAD and PLAY → playing, PAUSE → paused).
+  fn expect_player(&mut self, intent: PlayerIntent, now: Instant) {
+    self.intent = Some(intent);
+    self.player_settle_until = Some(now + OWN_COMMAND_SETTLE);
+  }
+
+  /// Our media session ended: nothing to attribute any more.
+  const fn clear_player(&mut self) {
+    self.intent = None;
+    self.player_settle_until = None;
+  }
+
+  /// A status for our media session reported `state`.
+  fn observe_player(&mut self, state: rust_cast::channels::media::PlayerState, now: Instant) -> Option<CastRemoteKind> {
+    use rust_cast::channels::media::PlayerState;
+    let observed = match state {
+      PlayerState::Playing => PlayerIntent::Playing,
+      PlayerState::Paused => PlayerIntent::Paused,
+      PlayerState::Idle | PlayerState::Buffering => return None,
+    };
+    let expected = self.intent?;
+    if self.player_settle_until.is_some_and(|until| now < until) || observed == expected {
+      return None;
+    }
+    self.intent = Some(observed);
+    Some(match observed {
+      PlayerIntent::Playing => CastRemoteKind::Played,
+      PlayerIntent::Paused => CastRemoteKind::Paused,
+    })
+  }
+
+  /// We are about to set the receiver level.
+  fn expect_volume_command(&mut self, now: Instant) {
+    self.volume_settle_until = Some(now + OWN_COMMAND_SETTLE);
+  }
+
+  /// Level we set or read ourselves: the new baseline, never reported.
+  const fn note_volume(&mut self, level: f32, muted: bool) {
+    self.volume = Some((volume_level_clamped(level), muted));
+  }
+
+  /// A receiver status reported `level` / `muted`.
+  fn observe_volume(&mut self, reported_level: f32, muted: bool, now: Instant) -> Option<CastRemoteKind> {
+    if self.volume_settle_until.is_some_and(|until| now < until) {
+      return None;
+    }
+    let level = volume_level_clamped(reported_level);
+    let previous = self.volume.replace((level, muted))?;
+    if (previous.0 - level).abs() < VOLUME_MATCH_EPSILON && previous.1 == muted {
+      return None;
+    }
+    Some(CastRemoteKind::Volume { level, muted })
+  }
+}
+
 /// Heartbeat / PING cadence on the warm control-plane connection.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Idle drain cadence while our media session is live, so touch / voice pause on the
+/// device reaches the sender within half a second (ownership probes keep the heartbeat cadence).
+const ACTIVE_DRAIN_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Wall-clock wait for load / stop / pause / play worker replies.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
@@ -339,8 +454,17 @@ enum CastWorkerCmd {
   /// Lets probes stand down immediately so a missing media session is not declared
   /// as "another app took the receiver" after our own teardown.
   SessionEnded,
+  /// Replace the now-playing metadata of the live media (no reply; latest wins).
+  UpdateMetadata { track: CastTrack },
   /// Exit the worker loop and drop the Cast device.
   Shutdown,
+}
+
+/// App-facing notification channels handed to each worker thread.
+struct WorkerNotify {
+  ownership_lost: Option<UnboundedSender<String>>,
+  media_recovered: Option<UnboundedSender<String>>,
+  remote_events: Option<UnboundedSender<CastRemoteEvent>>,
 }
 
 /// Handle to a live worker (command channel + join handle).
@@ -373,6 +497,8 @@ pub struct CastPool {
   ownership_lost: Option<UnboundedSender<String>>,
   /// Notifies when an internal re-LOAD recovered media after recoverable IDLE.
   media_recovered: Option<UnboundedSender<String>>,
+  /// Notifies user-initiated play / pause / volume changes on the Cast device.
+  remote_events: Option<UnboundedSender<CastRemoteEvent>>,
 }
 
 impl Default for CastPool {
@@ -387,6 +513,7 @@ impl std::fmt::Debug for CastPool {
       .field("workers", &self.workers.lock().len())
       .field("ownership_watch", &self.ownership_lost.is_some())
       .field("media_recovered_watch", &self.media_recovered.is_some())
+      .field("remote_events_watch", &self.remote_events.is_some())
       .finish()
   }
 }
@@ -402,6 +529,7 @@ impl CastPool {
       workers: Arc::new(Mutex::new(HashMap::new())),
       ownership_lost,
       media_recovered: None,
+      remote_events: None,
     }
   }
 
@@ -409,6 +537,15 @@ impl CastPool {
   #[must_use]
   pub fn with_media_recovered(mut self, media_recovered: UnboundedSender<String>) -> Self {
     self.media_recovered = Some(media_recovered);
+    self
+  }
+
+  /// Attach a channel for user-initiated play / pause / volume changes on Cast devices.
+  ///
+  /// Workers report only changes they did not command themselves (see `RemoteTracker`).
+  #[must_use]
+  pub fn with_remote_events(mut self, remote_events: UnboundedSender<CastRemoteEvent>) -> Self {
+    self.remote_events = Some(remote_events);
     self
   }
 
@@ -445,8 +582,11 @@ impl CastPool {
     let host = device.host.clone();
     let hostname = device.hostname.clone();
     let port = device.port;
-    let ownership_lost = self.ownership_lost.clone();
-    let media_recovered = self.media_recovered.clone();
+    let notify = WorkerNotify {
+      ownership_lost: self.ownership_lost.clone(),
+      media_recovered: self.media_recovered.clone(),
+      remote_events: self.remote_events.clone(),
+    };
     let relay_slot: SharedRelaySlot = Arc::new(StdMutex::new(None));
     let relay_slot_worker = Arc::clone(&relay_slot);
     let reachable = Arc::new(AtomicBool::new(false));
@@ -465,8 +605,7 @@ impl CastPool {
           hostname,
           port,
           cmd_rx,
-          ownership_lost,
-          media_recovered,
+          notify,
           relay_slot_worker,
           reachable_worker,
           terminal_failed_worker,
@@ -730,6 +869,21 @@ impl CastPool {
     }
   }
 
+  /// Replace the now-playing metadata shown for the live media on `device_id`.
+  ///
+  /// Fire-and-forget. The worker sends a `QUEUE_UPDATE` for the playing queue item (no
+  /// re-LOAD, so audio is not interrupted) and remembers the track for later re-LOADs.
+  pub fn update_metadata(&self, device_id: &str, track: CastTrack) {
+    match self.cmd_tx(device_id) {
+      Ok(tx) => {
+        if tx.send(CastWorkerCmd::UpdateMetadata { track }).is_err() {
+          tracing::debug!(%device_id, "update_metadata: worker gone");
+        }
+      },
+      Err(err) => tracing::debug!(%device_id, error = %err, "update_metadata: no worker"),
+    }
+  }
+
   fn cmd_tx(&self, device_id: &str) -> Result<mpsc::Sender<CastWorkerCmd>> {
     let guard = self.workers.lock();
     guard
@@ -763,6 +917,12 @@ struct WorkerState {
   ownership_lost: Option<UnboundedSender<String>>,
   /// App channel for internal media recovery events.
   media_recovered: Option<UnboundedSender<String>>,
+  /// App channel for user-initiated play / pause / volume changes.
+  remote_events: Option<UnboundedSender<CastRemoteEvent>>,
+  /// Attributes Cast status changes to the user vs our own commands.
+  remote: RemoteTracker,
+  /// Next ownership probe (heartbeat cadence even when the drain runs faster).
+  next_probe_at: Instant,
   /// Shared relay shutdown slot (pool `remove` force-closes).
   relay_slot: SharedRelaySlot,
   /// Last successful LOAD request (for internal re-LOAD recovery).
@@ -813,8 +973,7 @@ fn worker_main(
   hostname: String,
   port: u16,
   cmd_rx: mpsc::Receiver<CastWorkerCmd>,
-  ownership_lost: Option<UnboundedSender<String>>,
-  media_recovered: Option<UnboundedSender<String>>,
+  notify: WorkerNotify,
   relay_slot: SharedRelaySlot,
   reachable_flag: Arc<AtomicBool>,
   terminal_flag: Arc<AtomicBool>,
@@ -831,8 +990,11 @@ fn worker_main(
     active_since: None,
     ownership_loss_streak: 0,
     buffering_streak: 0,
-    ownership_lost,
-    media_recovered,
+    ownership_lost: notify.ownership_lost,
+    media_recovered: notify.media_recovered,
+    remote_events: notify.remote_events,
+    remote: RemoteTracker::default(),
+    next_probe_at: now,
     relay_slot,
     last_load: None,
     last_load_at: None,
@@ -986,6 +1148,21 @@ fn worker_main(
           "Cast session ended by bridge; ownership probe stand-down"
         );
       },
+      CastWorkerCmd::UpdateMetadata { track } => {
+        // Latest wins: a newer queued update supersedes this one.
+        let mut latest = track;
+        loop {
+          match cmd_rx.try_recv() {
+            Ok(CastWorkerCmd::UpdateMetadata { track: newer }) => latest = newer,
+            Ok(other) => {
+              pending = Some(other);
+              break;
+            },
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+          }
+        }
+        state.with_hard_deadline(|s| s.handle_update_metadata(latest));
+      },
     }
   }
 }
@@ -1017,6 +1194,9 @@ impl WorkerState {
     let mut wait = HEARTBEAT_INTERVAL;
     if self.device.is_some() {
       wait = wait.min(self.next_ping_at.saturating_duration_since(now));
+      if self.active.is_some() {
+        wait = wait.min(ACTIVE_DRAIN_INTERVAL);
+      }
     } else {
       wait = wait.min(self.next_reconnect_at.saturating_duration_since(now));
     }
@@ -1053,7 +1233,10 @@ impl WorkerState {
       self.heartbeat_ping();
     }
 
-    self.check_ownership();
+    if Instant::now() >= self.next_probe_at {
+      self.next_probe_at = Instant::now() + HEARTBEAT_INTERVAL;
+      self.check_ownership();
+    }
   }
 
   fn drop_device(&mut self) {
@@ -1072,6 +1255,7 @@ impl WorkerState {
     self.ownership_loss_streak = 0;
     self.buffering_streak = 0;
     self.reload_attempted = false;
+    self.remote.clear_player();
   }
 
   fn set_active_session(&mut self, session: ActiveCastSession) {
@@ -1080,8 +1264,82 @@ impl WorkerState {
     self.ownership_loss_streak = 0;
     self.buffering_streak = 0;
     self.reload_attempted = false;
+    self.remote.expect_player(PlayerIntent::Playing, Instant::now());
     // New LOAD re-enables ownership probes (bridge end flag must not stick).
     self.ownership_stand_down.store(false, Ordering::Release);
+  }
+
+  /// Attribute a media status entry for our session; report a user play / pause.
+  fn observe_media_entry(&mut self, entry: &rust_cast::channels::media::StatusEntry) {
+    if self
+      .active
+      .as_ref()
+      .is_none_or(|s| s.media_session_id != entry.media_session_id)
+    {
+      return;
+    }
+    if let Some(kind) = self.remote.observe_player(entry.player_state, Instant::now()) {
+      self.emit_remote(kind);
+    }
+  }
+
+  /// Attribute a receiver volume; report a user volume / mute change.
+  fn observe_receiver_volume(&mut self, volume: rust_cast::channels::receiver::Volume) {
+    let (Some(level), muted) = (volume.level, volume.muted.unwrap_or(false)) else {
+      return;
+    };
+    if let Some(kind) = self.remote.observe_volume(level, muted, Instant::now()) {
+      self.emit_remote(kind);
+    }
+  }
+
+  fn emit_remote(&self, kind: CastRemoteKind) {
+    tracing::info!(device_id = %self.device_id, ?kind, "Cast change not commanded by us (user / other sender)");
+    if let Some(tx) = &self.remote_events
+      && tx.send(CastRemoteEvent { device_id: self.device_id.clone(), kind }).is_err()
+    {
+      tracing::debug!(device_id = %self.device_id, "remote-events channel closed");
+    }
+  }
+
+  /// Send the new now-playing metadata as a `QUEUE_UPDATE` of the playing item.
+  fn handle_update_metadata(&mut self, track: CastTrack) {
+    let Some(load) = self.last_load.as_mut() else {
+      return;
+    };
+    if load.track == track {
+      return;
+    }
+    load.track = track;
+    let Some(session) = &self.active else {
+      return;
+    };
+    let Some(item_id) = session.queue_item_id else {
+      tracing::debug!(
+        device_id = %self.device_id,
+        "Cast LOAD reported no queue item id; metadata applies on the next LOAD"
+      );
+      return;
+    };
+    let (Some(device), Some(request)) = (self.device.as_ref(), self.last_load.as_ref()) else {
+      return;
+    };
+    let media_session_id = session.media_session_id;
+    let request_id = device.message_manager.generate_request_id().get();
+    let body = request.queue_update_payload(request_id, media_session_id, item_id);
+    let message = rust_cast::message_manager::CastMessage {
+      namespace: MEDIA_NAMESPACE.to_owned(),
+      source: "sender-0".to_owned(),
+      destination: session.transport_id.clone(),
+      payload: rust_cast::message_manager::CastMessagePayload::String(body.to_string()),
+    };
+    // The MEDIA_STATUS reply is left for the idle drain (it also feeds play/pause attribution).
+    match device.message_manager.send(message) {
+      Ok(()) => {
+        tracing::debug!(device_id = %self.device_id, media_session_id, item_id, "Cast metadata QUEUE_UPDATE sent");
+      },
+      Err(err) => tracing::debug!(device_id = %self.device_id, error = %err, "Cast metadata QUEUE_UPDATE failed"),
+    }
   }
 
   /// Run `op` under a hard deadline: if still running after [`WORKER_OP_DEADLINE`],
@@ -1345,13 +1603,17 @@ impl WorkerState {
   /// so an empty socket cannot block for the full command I/O timeout. RAII restores
   /// the command timeout even if the drain exits early.
   fn drain_unsolicited(&mut self) {
-    let parse_warn = {
+    let (parse_warn, media_entry, receiver_volume) = {
       let Some(device) = self.device.as_ref() else {
         return;
       };
       // Binds timeout for the duration of this block (including all receive calls).
       let _timeout_guard = device.begin_short_read(DRAIN_READ_TIMEOUT);
       let mut parse_warn: Option<String> = None;
+      // Latest status wins: earlier ones in the same drain are superseded.
+      let our_session = self.active.as_ref().map(|s| s.media_session_id);
+      let mut media_entry = None;
+      let mut receiver_volume = None;
 
       for _ in 0..UNSOLICITED_DRAIN_LIMIT {
         match device.receive() {
@@ -1364,8 +1626,15 @@ impl WorkerState {
               break;
             }
           },
-          Ok(rust_cast::ChannelMessage::Media(media_msg)) => {
-            tracing::debug!(device_id = %self.device_id, ?media_msg, "Cast unsolicited media message");
+          Ok(rust_cast::ChannelMessage::Media(rust_cast::channels::media::MediaResponse::Status(status))) => {
+            tracing::debug!(device_id = %self.device_id, ?status, "Cast unsolicited media status");
+            if let Some(entry) = status.entries.into_iter().find(|e| Some(e.media_session_id) == our_session) {
+              media_entry = Some(entry);
+            }
+          },
+          Ok(rust_cast::ChannelMessage::Receiver(rust_cast::channels::receiver::ReceiverResponse::Status(status))) => {
+            tracing::debug!(device_id = %self.device_id, volume = ?status.volume, "Cast unsolicited receiver status");
+            receiver_volume = Some(status.volume);
           },
           Ok(other) => {
             tracing::debug!(device_id = %self.device_id, msg = ?other, "Cast unsolicited message drained");
@@ -1399,10 +1668,16 @@ impl WorkerState {
           },
         }
       }
-      parse_warn
+      (parse_warn, media_entry, receiver_volume)
     };
     if let Some(msg) = parse_warn {
       self.warn_parse_once(&msg);
+    }
+    if let Some(entry) = media_entry {
+      self.observe_media_entry(&entry);
+    }
+    if let Some(volume) = receiver_volume {
+      self.observe_receiver_volume(volume);
     }
   }
 
@@ -1561,6 +1836,7 @@ impl WorkerState {
           listed,
           "Cast ownership receiver status"
         );
+        self.observe_receiver_volume(status.volume);
         listed
       },
       Err(err) => {
@@ -1625,6 +1901,7 @@ impl WorkerState {
             buffering,
             "Cast ownership media status"
           );
+          self.observe_media_entry(e);
           MediaProbe {
             session_present: Some(true),
             idle_reason,
@@ -1824,8 +2101,7 @@ impl WorkerState {
       .load(app.transport_id.as_str(), app.session_id.as_str(), media)
       .map_err(|err| Error::Cast(format!("warm media load: {err}")))?;
 
-    let media_session_id = media_session_id_from_status(&status)?;
-    Ok(ActiveCastSession::new(app.transport_id, media_session_id))
+    media_session_from_status(app.transport_id, &status)
   }
 
   fn handle_set_volume(&mut self, level: f32) -> Result<()> {
@@ -1833,18 +2109,21 @@ impl WorkerState {
     if self.device.is_none() {
       self.ensure_connected(true)?;
     }
-    let first_err = {
+    self.remote.expect_volume_command(Instant::now());
+    let first = {
       let device = self
         .device
         .as_ref()
         .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
-      match device.receiver.set_volume(clamped) {
-        Ok(volume) => {
-          tracing::debug!(device_id = %self.device_id, ?volume, "warm Cast volume set");
-          return Ok(());
-        },
-        Err(err) => err,
-      }
+      device.receiver.set_volume(clamped)
+    };
+    let first_err = match first {
+      Ok(volume) => {
+        tracing::debug!(device_id = %self.device_id, ?volume, "warm Cast volume set");
+        self.note_own_volume(volume, clamped);
+        return Ok(());
+      },
+      Err(err) => err,
     };
     tracing::warn!(
       device_id = %self.device_id,
@@ -1867,7 +2146,15 @@ impl WorkerState {
       .set_volume(clamped)
       .map_err(|e| Error::Cast(format!("warm set volume: {e}")))?;
     tracing::debug!(device_id = %self.device_id, ?volume, "warm Cast volume set after reconnect");
+    self.note_own_volume(volume, clamped);
     Ok(())
+  }
+
+  /// Baseline for user-change attribution after our own volume command.
+  fn note_own_volume(&mut self, volume: rust_cast::channels::receiver::Volume, requested: f32) {
+    self
+      .remote
+      .note_volume(volume.level.unwrap_or(requested), volume.muted.unwrap_or(false));
   }
 
   /// Read linear volume from `receiver.get_status()` (muted → `0.0`). Retries once on failure.
@@ -1881,7 +2168,12 @@ impl WorkerState {
         .as_ref()
         .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
       match device.receiver.get_status() {
-        Ok(status) => return Ok(volume_from_cast_status(status.volume)),
+        Ok(status) => {
+          self
+            .remote
+            .note_volume(status.volume.level.unwrap_or(0.0), status.volume.muted.unwrap_or(false));
+          return Ok(volume_from_cast_status(status.volume));
+        },
         Err(err) => err,
       }
     };
@@ -1905,6 +2197,9 @@ impl WorkerState {
       .receiver
       .get_status()
       .map_err(|e| Error::Cast(format!("warm get volume: {e}")))?;
+    self
+      .remote
+      .note_volume(status.volume.level.unwrap_or(0.0), status.volume.muted.unwrap_or(false));
     Ok(volume_from_cast_status(status.volume))
   }
 
@@ -1959,6 +2254,7 @@ impl WorkerState {
     else {
       return Err(Error::Cast("no active session".to_owned()));
     };
+    self.remote.expect_player(PlayerIntent::Paused, Instant::now());
     let Some(device) = self.device.as_ref() else {
       return Err(Error::Cast("no active session".to_owned()));
     };
@@ -1995,6 +2291,7 @@ impl WorkerState {
     else {
       return Err(Error::Cast("no active session".to_owned()));
     };
+    self.remote.expect_player(PlayerIntent::Playing, Instant::now());
     let Some(device) = self.device.as_ref() else {
       return Err(Error::Cast("no active session".to_owned()));
     };
@@ -2254,6 +2551,93 @@ mod tests {
   use super::*;
   use crate::cast::CastStreamKind;
   use std::time::Instant;
+
+  mod remote_tracker {
+    use super::super::{CastRemoteKind, OWN_COMMAND_SETTLE, PlayerIntent, RemoteTracker};
+    use rust_cast::channels::media::PlayerState;
+    use std::time::{Duration, Instant};
+
+    fn after_settle(t: Instant) -> Instant {
+      t + OWN_COMMAND_SETTLE + Duration::from_millis(1)
+    }
+
+    #[test]
+    fn own_pause_and_play_are_not_reported() {
+      let t0 = Instant::now();
+      let mut tracker = RemoteTracker::default();
+      tracker.expect_player(PlayerIntent::Playing, t0);
+      assert_eq!(tracker.observe_player(PlayerState::Buffering, t0), None);
+      assert_eq!(tracker.observe_player(PlayerState::Playing, after_settle(t0)), None);
+
+      let t1 = after_settle(t0);
+      tracker.expect_player(PlayerIntent::Paused, t1);
+      assert_eq!(tracker.observe_player(PlayerState::Paused, t1), None, "echo of our PAUSE");
+      assert_eq!(tracker.observe_player(PlayerState::Paused, after_settle(t1)), None);
+    }
+
+    #[test]
+    fn device_pause_then_play_reported_once_each() {
+      let t0 = Instant::now();
+      let mut tracker = RemoteTracker::default();
+      tracker.expect_player(PlayerIntent::Playing, t0);
+      let t1 = after_settle(t0);
+      assert_eq!(tracker.observe_player(PlayerState::Paused, t1), Some(CastRemoteKind::Paused));
+      assert_eq!(tracker.observe_player(PlayerState::Paused, t1), None, "reported once");
+      assert_eq!(tracker.observe_player(PlayerState::Playing, t1), Some(CastRemoteKind::Played));
+      assert_eq!(tracker.observe_player(PlayerState::Idle, t1), None);
+    }
+
+    #[test]
+    fn stale_status_inside_settle_window_is_ignored_then_caught() {
+      let t0 = Instant::now();
+      let mut tracker = RemoteTracker::default();
+      tracker.expect_player(PlayerIntent::Playing, t0);
+      let t1 = after_settle(t0);
+      tracker.expect_player(PlayerIntent::Paused, t1);
+      // A PLAYING broadcast sent before our PAUSE took effect.
+      assert_eq!(tracker.observe_player(PlayerState::Playing, t1), None);
+      // If the device really is playing after the window, the user resumed it.
+      assert_eq!(
+        tracker.observe_player(PlayerState::Playing, after_settle(t1)),
+        Some(CastRemoteKind::Played)
+      );
+    }
+
+    #[test]
+    fn no_player_reports_without_live_session() {
+      let t0 = Instant::now();
+      let mut tracker = RemoteTracker::default();
+      assert_eq!(tracker.observe_player(PlayerState::Paused, t0), None);
+      tracker.expect_player(PlayerIntent::Playing, t0);
+      tracker.clear_player();
+      assert_eq!(tracker.observe_player(PlayerState::Paused, after_settle(t0)), None);
+    }
+
+    #[test]
+    fn volume_echo_suppressed_and_user_change_reported() {
+      let t0 = Instant::now();
+      let mut tracker = RemoteTracker::default();
+      // First observation is only a baseline.
+      assert_eq!(tracker.observe_volume(0.4, false, t0), None);
+      // Our own set: baseline moves, broadcasts of it (and stale ones in the window) are quiet.
+      tracker.expect_volume_command(t0);
+      tracker.note_volume(0.7, false);
+      assert_eq!(tracker.observe_volume(0.4, false, t0), None, "stale pre-command status");
+      let t1 = after_settle(t0);
+      assert_eq!(tracker.observe_volume(0.700_1, false, t1), None, "echo of our level");
+      // Device buttons.
+      assert_eq!(
+        tracker.observe_volume(0.8, false, t1),
+        Some(CastRemoteKind::Volume { level: 0.8, muted: false })
+      );
+      // Mute from the Google Home app.
+      assert_eq!(
+        tracker.observe_volume(0.8, true, t1),
+        Some(CastRemoteKind::Volume { level: 0.8, muted: true })
+      );
+      assert_eq!(tracker.observe_volume(0.8, true, t1), None);
+    }
+  }
 
   fn sample_device(id: &str) -> Device {
     Device {

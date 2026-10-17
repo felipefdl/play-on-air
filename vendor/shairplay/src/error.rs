@@ -24,6 +24,30 @@ pub enum ShairplayError {
     /// Audio codec error.
     #[error("codec error: {0}")]
     Codec(#[from] CodecError),
+
+    /// Receiver-to-sender reverse control could not be delivered.
+    #[error("remote control error: {0}")]
+    Remote(#[from] RemoteError),
+}
+
+/// Why a receiver-initiated event (`POST /command` on the event channel) was not sent.
+#[derive(Debug, Error)]
+pub enum RemoteError {
+    /// No connected sender has an open event channel.
+    #[error("no AirPlay sender event channel is open")]
+    NoEventChannel,
+
+    /// The sender's event channel closed before the message was queued.
+    #[error("AirPlay sender event channel closed")]
+    ChannelClosed,
+
+    /// The sender is too old for this message (it expects DACP, which this fork does not speak).
+    #[error("AirPlay sender version {0} predates event-channel volume reports")]
+    SenderTooOld(String),
+
+    /// The message body could not be encoded.
+    #[error("encoding event-channel command failed: {0}")]
+    Encode(String),
 }
 
 /// Errors from the AirPlay server and session handling.

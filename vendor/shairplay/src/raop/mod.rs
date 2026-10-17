@@ -5,7 +5,7 @@ pub use crate::proto::dmap::TrackMetadata;
 pub mod audio_pipeline;
 #[cfg(feature = "video")]
 pub mod buffer;
-pub mod buffered_audio;
+pub(crate) mod buffered_audio;
 pub(crate) mod event_channel;
 pub(crate) mod handlers;
 pub(crate) mod handlers_ap2;
@@ -16,6 +16,7 @@ pub mod hls;
 #[cfg(feature = "video")]
 pub(crate) mod ntp;
 pub(crate) mod realtime_audio;
+pub(crate) mod remote;
 #[cfg(feature = "video")]
 pub(crate) mod rtp;
 mod rtsp;
@@ -34,6 +35,7 @@ pub(crate) const MAX_PASSWORD_LEN: usize = 64;
 pub(crate) const MAX_NONCE_LEN: usize = 32;
 
 mod types;
+pub use remote::MediaRemoteCommand;
 pub use types::*;
 
 mod connection;

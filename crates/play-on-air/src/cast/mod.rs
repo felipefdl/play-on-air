@@ -7,9 +7,9 @@
 mod pool;
 mod tls;
 
-pub use pool::CastPool;
+pub use pool::{CastPool, CastRemoteEvent, CastRemoteKind};
 
-use rust_cast::channels::media::{Media, Metadata, MusicTrackMediaMetadata, Status, StreamType};
+use rust_cast::channels::media::{Image, Media, Metadata, MusicTrackMediaMetadata, Status, StreamType};
 
 use crate::error::{Error, Result};
 
@@ -41,6 +41,65 @@ impl CastStreamKind {
       Self::Live => StreamType::Live,
     }
   }
+
+  /// Cast wire name (`BUFFERED` / `LIVE`).
+  const fn wire_name(self) -> &'static str {
+    match self {
+      Self::Buffered => "BUFFERED",
+      Self::Live => "LIVE",
+    }
+  }
+}
+
+/// Now-playing track shown on the Cast device (`MusicTrackMediaMetadata`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CastTrack {
+  /// Track title.
+  pub title: Option<String>,
+  /// Track artist.
+  pub artist: Option<String>,
+  /// Album name.
+  pub album: Option<String>,
+  /// Artwork URL on our media server (`/artwork/<id>`).
+  pub image_url: Option<String>,
+}
+
+impl CastTrack {
+  const fn is_empty(&self) -> bool {
+    self.title.is_none() && self.artist.is_none() && self.album.is_none() && self.image_url.is_none()
+  }
+
+  fn to_metadata(&self) -> Option<Metadata> {
+    if self.is_empty() {
+      return None;
+    }
+    Some(Metadata::MusicTrack(MusicTrackMediaMetadata {
+      title: self.title.clone(),
+      artist: self.artist.clone(),
+      album_name: self.album.clone(),
+      album_artist: None,
+      composer: None,
+      track_number: None,
+      disc_number: None,
+      images: self.image_url.iter().map(|url| Image::new(url.clone())).collect(),
+      release_date: None,
+    }))
+  }
+
+  /// Wire `MusicTrackMediaMetadata` (`metadataType` 3) as JSON.
+  fn to_json(&self) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    drop(metadata.insert("metadataType".to_owned(), serde_json::Value::from(3)));
+    for (key, field) in [("title", &self.title), ("artist", &self.artist), ("albumName", &self.album)] {
+      if let Some(value) = field {
+        drop(metadata.insert(key.to_owned(), serde_json::Value::from(value.as_str())));
+      }
+    }
+    if let Some(url) = &self.image_url {
+      drop(metadata.insert("images".to_owned(), serde_json::json!([{ "url": url }])));
+    }
+    serde_json::Value::Object(metadata)
+  }
 }
 
 /// Clamp a Cast volume level into the valid `0.0..=1.0` range.
@@ -63,8 +122,8 @@ pub struct MediaLoadRequest {
   pub content_type: String,
   /// Stream type for the player.
   pub stream_kind: CastStreamKind,
-  /// Optional track title shown on the sink UI.
-  pub title: Option<String>,
+  /// Now-playing metadata shown on the sink UI.
+  pub track: CastTrack,
 }
 
 impl MediaLoadRequest {
@@ -74,7 +133,7 @@ impl MediaLoadRequest {
       content_url: url.into(),
       content_type: CONTENT_TYPE_FLAC.to_owned(),
       stream_kind: kind,
-      title: None,
+      track: CastTrack::default(),
     }
   }
 
@@ -84,38 +143,48 @@ impl MediaLoadRequest {
       content_url: url.into(),
       content_type: CONTENT_TYPE_WAV.to_owned(),
       stream_kind: kind,
-      title: None,
+      track: CastTrack::default(),
     }
   }
 
-  /// Attach a display title.
-  pub fn with_title(mut self, title: impl Into<String>) -> Self {
-    self.title = Some(title.into());
+  /// Attach now-playing metadata.
+  #[must_use]
+  pub fn with_track(mut self, track: CastTrack) -> Self {
+    self.track = track;
     self
   }
 
   /// Convert to `rust_cast` [`Media`] for wire send.
   pub fn to_media(&self) -> Media {
-    let metadata = self.title.as_ref().map(|title| {
-      Metadata::MusicTrack(MusicTrackMediaMetadata {
-        title: Some(title.clone()),
-        artist: None,
-        album_name: None,
-        album_artist: None,
-        composer: None,
-        track_number: None,
-        disc_number: None,
-        images: vec![],
-        release_date: None,
-      })
-    });
     Media {
       content_id: self.content_url.clone(),
       stream_type: self.stream_kind.to_stream_type(),
       content_type: self.content_type.clone(),
-      metadata,
+      metadata: self.track.to_metadata(),
       duration: None,
     }
+  }
+
+  /// `QUEUE_UPDATE` that replaces the metadata of the playing queue item in place.
+  ///
+  /// The Default Media Receiver has no other sender message that changes metadata of
+  /// loaded media; updating the current item keeps the same `contentId`, so the live
+  /// stream is not re-fetched (a re-LOAD would drop Cast's buffer and gap the audio).
+  pub fn queue_update_payload(&self, request_id: u32, media_session_id: i32, item_id: i32) -> serde_json::Value {
+    serde_json::json!({
+      "type": "QUEUE_UPDATE",
+      "requestId": request_id,
+      "mediaSessionId": media_session_id,
+      "items": [{
+        "itemId": item_id,
+        "media": {
+          "contentId": self.content_url,
+          "streamType": self.stream_kind.wire_name(),
+          "contentType": self.content_type,
+          "metadata": self.track.to_json(),
+        },
+      }],
+    })
   }
 }
 
@@ -126,6 +195,8 @@ pub struct MediaSessionRef {
   pub transport_id: String,
   /// Media session id returned by LOAD/STATUS.
   pub media_session_id: i32,
+  /// Queue item id of the loaded media (target of metadata `QUEUE_UPDATE`), if reported.
+  pub queue_item_id: Option<i32>,
 }
 
 impl MediaSessionRef {
@@ -134,6 +205,7 @@ impl MediaSessionRef {
     Self {
       transport_id: transport_id.into(),
       media_session_id,
+      queue_item_id: None,
     }
   }
 }
@@ -141,10 +213,14 @@ impl MediaSessionRef {
 /// Active Cast media session after a successful LOAD.
 pub type ActiveCastSession = MediaSessionRef;
 
-/// Extract media session id from a LOAD/STATUS response.
-pub fn media_session_id_from_status(status: &Status) -> Result<i32> {
+/// Extract the media session (and its current queue item) from a LOAD/STATUS response.
+pub fn media_session_from_status(transport_id: impl Into<String>, status: &Status) -> Result<MediaSessionRef> {
   if let Some(entry) = status.entries.first() {
-    return Ok(entry.media_session_id);
+    return Ok(MediaSessionRef {
+      transport_id: transport_id.into(),
+      media_session_id: entry.media_session_id,
+      queue_item_id: entry.current_item_id.map(i32::from),
+    });
   }
   Err(Error::Cast("LOAD status had no media session entries".to_owned()))
 }
@@ -154,14 +230,65 @@ mod tests {
   use super::*;
   use rust_cast::channels::media::{Media, StreamType};
 
+  fn track() -> CastTrack {
+    CastTrack {
+      title: Some("Song".to_owned()),
+      artist: Some("Band".to_owned()),
+      album: Some("Record".to_owned()),
+      image_url: Some("http://192.168.1.2:8090/artwork/7".to_owned()),
+    }
+  }
+
   #[test]
-  fn builds_flac_live_payload() {
-    let req = MediaLoadRequest::flac("http://192.168.1.2:8090/x.flac", CastStreamKind::Live).with_title("Nest");
+  fn builds_flac_live_payload_with_music_metadata() {
+    let req = MediaLoadRequest::flac("http://192.168.1.2:8090/x.flac", CastStreamKind::Live).with_track(track());
     let media: Media = req.to_media();
     assert_eq!(media.content_id, "http://192.168.1.2:8090/x.flac");
     assert_eq!(media.content_type, CONTENT_TYPE_FLAC);
     assert!(matches!(media.stream_type, StreamType::Live));
-    assert!(media.metadata.is_some());
+    let Some(Metadata::MusicTrack(meta)) = media.metadata else {
+      panic!("expected MusicTrack metadata");
+    };
+    assert_eq!(meta.title.as_deref(), Some("Song"));
+    assert_eq!(meta.artist.as_deref(), Some("Band"));
+    assert_eq!(meta.album_name.as_deref(), Some("Record"));
+    assert_eq!(meta.images.len(), 1);
+    assert_eq!(meta.images[0].url, "http://192.168.1.2:8090/artwork/7");
+  }
+
+  #[test]
+  fn empty_track_sends_no_metadata() {
+    let media = MediaLoadRequest::flac("http://h/x", CastStreamKind::Live).to_media();
+    assert!(media.metadata.is_none());
+  }
+
+  #[test]
+  fn queue_update_replaces_current_item_metadata() {
+    let req = MediaLoadRequest::flac("http://192.168.1.2:8090/stream", CastStreamKind::Live).with_track(track());
+    let payload = req.queue_update_payload(9, 4, 1);
+    assert_eq!(
+      payload,
+      serde_json::json!({
+        "type": "QUEUE_UPDATE",
+        "requestId": 9,
+        "mediaSessionId": 4,
+        "items": [{
+          "itemId": 1,
+          "media": {
+            "contentId": "http://192.168.1.2:8090/stream",
+            "streamType": "LIVE",
+            "contentType": "audio/flac",
+            "metadata": {
+              "metadataType": 3,
+              "title": "Song",
+              "artist": "Band",
+              "albumName": "Record",
+              "images": [{ "url": "http://192.168.1.2:8090/artwork/7" }],
+            },
+          },
+        }],
+      })
+    );
   }
 
   #[test]
@@ -180,7 +307,7 @@ mod tests {
   }
 
   #[test]
-  fn media_session_id_from_status_reads_first_entry() {
+  fn media_session_from_status_reads_first_entry() {
     use rust_cast::channels::media::{PlayerState, StatusEntry};
     let status = Status {
       request_id: 1,
@@ -188,7 +315,7 @@ mod tests {
         media_session_id: 42,
         playback_rate: 1.0,
         player_state: PlayerState::Playing,
-        current_item_id: None,
+        current_item_id: Some(3),
         loading_item_id: None,
         preloaded_item_id: None,
         idle_reason: None,
@@ -198,12 +325,15 @@ mod tests {
         supported_media_commands: 0,
       }],
     };
-    assert_eq!(media_session_id_from_status(&status).unwrap(), 42);
+    let session = media_session_from_status("t-1", &status).unwrap();
+    assert_eq!(session.transport_id, "t-1");
+    assert_eq!(session.media_session_id, 42);
+    assert_eq!(session.queue_item_id, Some(3));
   }
 
   #[test]
-  fn media_session_id_from_empty_status_errors() {
+  fn media_session_from_empty_status_errors() {
     let status = Status { request_id: 1, entries: vec![] };
-    drop(media_session_id_from_status(&status).unwrap_err());
+    drop(media_session_from_status("t", &status).unwrap_err());
   }
 }

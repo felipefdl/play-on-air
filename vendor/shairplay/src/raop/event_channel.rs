@@ -3,46 +3,55 @@
 //! After initial SETUP, the client connects to the event TCP port.
 //! All traffic is encrypted with ChaCha20-Poly1305 using HKDF-derived keys.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::crypto::chacha_transport::EncryptedChannel;
-use crate::error::NetworkError;
+use crate::error::RemoteError;
+use crate::raop::remote::{SenderVersion, encode_command_request};
 
 /// Cap on ciphertext accumulated before a full AEAD frame can be decrypted.
 /// Prevents a stuck/malicious peer from growing `encrypted_buf` without bound.
 const MAX_ENCRYPTED_BUF: usize = 1024 * 1024;
 
-/// Handle for sending commands through the event channel.
+/// Receiver-to-sender handle for one connection's event channel.
+///
+/// Holding it keeps the outbound mpsc open for the connection's lifetime. The SETUP-time
+/// `updateInfo` goes straight through the raw channel with CSeq 0; [`Self::send_command`]
+/// numbers later commands from 1.
 #[derive(Clone)]
 pub(crate) struct EventSender {
-    // Load-bearing AND the outbound channel: holding this keeps the mpsc open for
-    // the connection's lifetime (stored in `RaopConnection::event_sender`), and
-    // `send()` pushes events through it. Currently unwired beyond the initial
-    // `updateInfo` queued at SETUP — see AP2-STATUS.md.
-    #[allow(dead_code)]
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    next_cseq: Arc<AtomicU32>,
+    /// Client version of the sender that opened the channel (`User-Agent`), if known.
+    sender_version: Option<SenderVersion>,
 }
 
 impl EventSender {
-    /// Create from an existing channel sender.
-    pub(crate) fn from_tx(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
-        Self { tx }
+    /// Wrap the outbound channel of an event-channel task.
+    pub(crate) fn new(tx: mpsc::UnboundedSender<Vec<u8>>, sender_version: Option<SenderVersion>) -> Self {
+        Self {
+            tx,
+            next_cseq: Arc::new(AtomicU32::new(1)),
+            sender_version,
+        }
     }
 
-    /// Push an event to the controller over the encrypted AP2 event channel.
-    ///
-    /// Scaffolding for receiver-initiated outbound events (volume, now-playing,
-    /// progress). Today only the initial `updateInfo` is sent at SETUP time via
-    /// the raw channel sender; wiring this on receiver-side state changes would
-    /// enable fuller AP2 event reporting. Unwired — see AP2-STATUS.md.
-    #[allow(dead_code)] // unwired outbound-event API — see AP2-STATUS.md
-    pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), NetworkError> {
-        self.tx
-            .send(data)
-            .map_err(|_| NetworkError::Mdns("event channel closed".into()))
+    /// Sender client version, if its `User-Agent` was seen before SETUP.
+    pub(crate) const fn sender_version(&self) -> Option<SenderVersion> {
+        self.sender_version
+    }
+
+    /// Queue `POST /command` with `body` as a binary plist.
+    pub(crate) fn send_command(&self, body: &plist::Dictionary) -> Result<(), RemoteError> {
+        let cseq = self.next_cseq.fetch_add(1, Ordering::Relaxed);
+        let message = encode_command_request(cseq, body)?;
+        self.tx.send(message).map_err(|_closed| RemoteError::ChannelClosed)
     }
 }
 
@@ -85,7 +94,13 @@ impl EventChannel {
                                 Ok((plain, consumed)) => {
                                     if consumed > 0 { encrypted_buf.drain(..consumed); }
                                     if !plain.is_empty() {
-                                        debug!(len = plain.len(), "Event channel message received");
+                                        // Sender replies to our POST /command (e.g. `RTSP/1.0 200 OK`).
+                                        let first_line = plain.split(|b| *b == b'\r').next().unwrap_or_default();
+                                        debug!(
+                                            len = plain.len(),
+                                            reply = %String::from_utf8_lossy(first_line),
+                                            "Event channel message received"
+                                        );
                                     }
                                 }
                                 Err(e) => {

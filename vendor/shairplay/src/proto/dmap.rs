@@ -3,39 +3,60 @@
 //! Parses the binary TLV format used by AirPlay for track metadata.
 //! Format: 4-byte ASCII tag + 4-byte BE length + data.
 
-/// Parsed track metadata from DMAP.
-#[derive(Debug, Clone, Default)]
+/// Now-playing track metadata, from a DMAP `mlit` (SET_PARAMETER
+/// `application/x-dmap-tagged`) or an `updateMRNowPlayingInfo` command.
+///
+/// Every field is optional: senders omit what they do not know, and an
+/// `updateMRNowPlayingInfo` with `mergePolicy = update` carries only changed keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackMetadata {
-    /// Track title (`minm`).
+    /// Track title (`minm` / `title`).
     pub title: Option<String>,
-    /// Artist name (`asar`).
+    /// Artist name (`asar` / `artist`).
     pub artist: Option<String>,
-    /// Album name (`asal`).
+    /// Album name (`asal` / `album`).
     pub album: Option<String>,
     /// Genre (`asgn`).
     pub genre: Option<String>,
-    /// Duration in milliseconds (`astm`).
+    /// Composer (`ascp`).
+    pub composer: Option<String>,
+    /// Duration in milliseconds (`astm` / `duration`).
     pub duration_ms: Option<u32>,
-    /// Track number (`astn`).
+    /// Track number (`astn` / `trackNumber`).
     pub track_number: Option<u16>,
-    /// Disc number (`asdk`).
+    /// Track count (`astc` / `totalTracks`).
+    pub track_count: Option<u16>,
+    /// Disc number (`asdn`).
     pub disc_number: Option<u16>,
+    /// Disc count (`asdc`).
+    pub disc_count: Option<u16>,
+    /// Whether the item is a stream (`asdk` = 1).
+    pub is_stream: Option<bool>,
+    /// Sender item id (`miid`).
+    pub item_id: Option<u32>,
+    /// Persistent item id (`mper`).
+    pub persistent_id: Option<u64>,
 }
 
 impl TrackMetadata {
-    /// Parse DMAP binary data into structured metadata.
+    /// Parse a DMAP `mlit` container into structured metadata.
+    ///
+    /// Unknown tags are skipped; a truncated or over-long item ends the parse with
+    /// whatever was read before it.
     pub(crate) fn from_dmap(data: &[u8]) -> Self {
         let mut meta = Self::default();
-        let mut pos = 8; // skip mlit header
-        while pos + 8 <= data.len() {
-            let tag = &data[pos..pos + 4];
-            let len = u32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize;
-            pos += 8;
-            if pos + len > data.len() {
+        // Skip the 8-byte `mlit` container header.
+        let mut rest = data.get(8..).unwrap_or_default();
+        while let Some((tag, len_bytes, tail)) = rest
+            .split_first_chunk::<4>()
+            .and_then(|(tag, tail)| tail.split_first_chunk::<4>().map(|(len, tail)| (tag, len, tail)))
+        {
+            let len = u32::from_be_bytes(*len_bytes) as usize;
+            let Some((chunk, after)) = tail.split_at_checked(len) else {
                 break;
-            }
-            let chunk = &data[pos..pos + len];
+            };
             let as_str = || std::str::from_utf8(chunk).ok().map(String::from);
+            let as_u64 = || chunk.try_into().ok().map(u64::from_be_bytes);
             let as_u32 = || chunk.try_into().ok().map(u32::from_be_bytes);
             let as_u16 = || chunk.try_into().ok().map(u16::from_be_bytes);
             match tag {
@@ -43,17 +64,45 @@ impl TrackMetadata {
                 b"asar" => meta.artist = as_str(),
                 b"asal" => meta.album = as_str(),
                 b"asgn" => meta.genre = as_str(),
+                b"ascp" => meta.composer = as_str(),
                 b"astm" => meta.duration_ms = as_u32(),
                 b"astn" => meta.track_number = as_u16(),
-                b"asdk" => meta.disc_number = as_u16(),
+                b"astc" => meta.track_count = as_u16(),
+                b"asdn" => meta.disc_number = as_u16(),
+                b"asdc" => meta.disc_count = as_u16(),
+                b"asdk" => meta.is_stream = chunk.first().map(|kind| *kind == 1),
+                b"miid" => meta.item_id = as_u32(),
+                b"mper" => meta.persistent_id = as_u64(),
                 _ => {
                     tracing::trace!(tag = %String::from_utf8_lossy(tag), len, "DMAP: unknown tag");
                 }
             }
-            pos += len;
+            rest = after;
         }
         tracing::debug!(?meta, "Track metadata parsed");
         meta
+    }
+
+    /// Overlay every field `update` carries onto `self` (`mergePolicy = update`).
+    pub(crate) fn merge(&mut self, update: Self) {
+        fn take<T>(slot: &mut Option<T>, value: Option<T>) {
+            if value.is_some() {
+                *slot = value;
+            }
+        }
+        take(&mut self.title, update.title);
+        take(&mut self.artist, update.artist);
+        take(&mut self.album, update.album);
+        take(&mut self.genre, update.genre);
+        take(&mut self.composer, update.composer);
+        take(&mut self.duration_ms, update.duration_ms);
+        take(&mut self.track_number, update.track_number);
+        take(&mut self.track_count, update.track_count);
+        take(&mut self.disc_number, update.disc_number);
+        take(&mut self.disc_count, update.disc_count);
+        take(&mut self.is_stream, update.is_stream);
+        take(&mut self.item_id, update.item_id);
+        take(&mut self.persistent_id, update.persistent_id);
     }
 }
 
@@ -77,6 +126,58 @@ mod tests {
         assert_eq!(meta.artist.as_deref(), Some("Queen"));
         assert_eq!(meta.album.as_deref(), Some("A Night at the Opera"));
         assert_eq!(meta.genre.as_deref(), Some("Rock"));
+    }
+
+    fn item(tag: &[u8; 4], value: &[u8]) -> Vec<u8> {
+        let mut out = tag.to_vec();
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// Spec 5 tag set: composer, counts, disc number (`asdn`, not `asdk`), stream flag, ids.
+    #[test]
+    fn dmap_parse_spec_tags() {
+        let items = [
+            item(b"ascp", b"Mercury"),
+            item(b"astm", &354_000_u32.to_be_bytes()),
+            item(b"astn", &11_u16.to_be_bytes()),
+            item(b"astc", &12_u16.to_be_bytes()),
+            item(b"asdn", &1_u16.to_be_bytes()),
+            item(b"asdc", &2_u16.to_be_bytes()),
+            item(b"asdk", &[1]),
+            item(b"miid", &77_u32.to_be_bytes()),
+            item(b"mper", &0x0102_0304_0506_0708_u64.to_be_bytes()),
+        ]
+        .concat();
+        let data = item(b"mlit", &items);
+        let meta = TrackMetadata::from_dmap(&data);
+        assert_eq!(meta.composer.as_deref(), Some("Mercury"));
+        assert_eq!(meta.duration_ms, Some(354_000));
+        assert_eq!(meta.track_number, Some(11));
+        assert_eq!(meta.track_count, Some(12));
+        assert_eq!(meta.disc_number, Some(1));
+        assert_eq!(meta.disc_count, Some(2));
+        assert_eq!(meta.is_stream, Some(true));
+        assert_eq!(meta.item_id, Some(77));
+        assert_eq!(meta.persistent_id, Some(0x0102_0304_0506_0708));
+    }
+
+    #[test]
+    fn merge_overlays_present_fields_only() {
+        let mut base = TrackMetadata {
+            title: Some("Old".into()),
+            artist: Some("Band".into()),
+            ..TrackMetadata::default()
+        };
+        base.merge(TrackMetadata {
+            title: Some("New".into()),
+            album: Some("Record".into()),
+            ..TrackMetadata::default()
+        });
+        assert_eq!(base.title.as_deref(), Some("New"));
+        assert_eq!(base.artist.as_deref(), Some("Band"));
+        assert_eq!(base.album.as_deref(), Some("Record"));
     }
 
     #[test]

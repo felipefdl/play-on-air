@@ -10,7 +10,7 @@ use tokio::time::sleep;
 
 use crate::airplay::{AirPlayManager, AirPlaySessionEvent, cast_linear_to_airplay_db};
 use crate::bridge::{Bridge, SHUTDOWN_TIMEOUT as BRIDGE_SHUTDOWN_TIMEOUT};
-use crate::cast::CastPool;
+use crate::cast::{CastPool, CastRemoteEvent};
 use crate::config::Config;
 use crate::discover::Discovery;
 use crate::error::Result;
@@ -72,16 +72,16 @@ impl App {
     let registry = Arc::clone(&self.registry);
     let config = self.config;
 
-    // Bind AP2 PTP (319/320) once before any RaopServer starts.
-    crate::net::ensure_global_ptp_sink();
-    // Give the sink thread a beat to bind before AirPlay ads race it.
-    sleep(Duration::from_millis(50)).await;
-
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
     let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();
     let (media_recovered_tx, mut media_recovered_rx) = mpsc::unbounded_channel::<String>();
+    let (cast_remote_tx, mut cast_remote_rx) = mpsc::unbounded_channel::<CastRemoteEvent>();
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
-    let cast_pool = Arc::new(CastPool::new(Some(ownership_tx)).with_media_recovered(media_recovered_tx));
+    let cast_pool = Arc::new(
+      CastPool::new(Some(ownership_tx))
+        .with_media_recovered(media_recovered_tx)
+        .with_remote_events(cast_remote_tx),
+    );
     let bridge =
       Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)).with_airplay(Arc::clone(&airplay)));
 
@@ -121,6 +121,14 @@ impl App {
       }
     });
 
+    // Play / pause / volume changed on the Cast device (not by us) → AirPlay sender.
+    let remote_bridge = Arc::clone(&bridge);
+    let cast_remote_watch = tokio::spawn(async move {
+      while let Some(event) = cast_remote_rx.recv().await {
+        remote_bridge.on_cast_remote(&event);
+      }
+    });
+
     let maintain = spawn_supervised_maintain(
       Arc::clone(&registry),
       config,
@@ -150,6 +158,8 @@ impl App {
     await_aborted_task(ownership_watch, "ownership watch").await;
     media_recovered_watch.abort();
     await_aborted_task(media_recovered_watch, "media recovered watch").await;
+    cast_remote_watch.abort();
+    await_aborted_task(cast_remote_watch, "cast remote watch").await;
     shutdown_cast_pool(&cast_pool).await;
     Ok(())
   }
@@ -810,7 +820,7 @@ mod tests {
     let app = App::new(Config::default());
     let (tx, rx) = watch::channel(false);
     let signal = tokio::spawn(async move {
-      // Let App::run pass the PTP settle sleep and spawn tasks.
+      // Let App::run spawn its tasks before signaling shutdown.
       sleep(Duration::from_millis(80)).await;
       tx.send(true).expect("shutdown watch open");
     });

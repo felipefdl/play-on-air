@@ -8,11 +8,15 @@ use tokio::net::TcpStream;
 
 use shairplay::{AudioFormat, AudioHandler, AudioSession, RaopServer, TrackMetadata};
 
+type Coverart = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+type Progress = Arc<Mutex<Vec<(u32, u32, u32)>>>;
+
 struct TestHandler {
     inits: Arc<Mutex<Vec<AudioFormat>>>,
     volumes: Arc<Mutex<Vec<f32>>>,
     metadata: Arc<Mutex<Vec<TrackMetadata>>>,
-    coverart: Arc<Mutex<Vec<Vec<u8>>>>,
+    coverart: Coverart,
+    progress: Progress,
 }
 
 struct TestSession;
@@ -28,8 +32,14 @@ impl AudioHandler for TestHandler {
     fn on_metadata(&self, metadata: &TrackMetadata) {
         self.metadata.lock().unwrap().push(metadata.clone());
     }
-    fn on_coverart(&self, data: &[u8]) {
-        self.coverart.lock().unwrap().push(data.to_vec());
+    fn on_coverart(&self, mime_type: &str, data: &[u8]) {
+        self.coverart
+            .lock()
+            .unwrap()
+            .push((mime_type.to_owned(), data.to_vec()));
+    }
+    fn on_progress(&self, start: u32, current: u32, end: u32) {
+        self.progress.lock().unwrap().push((start, current, end));
     }
 }
 
@@ -40,7 +50,8 @@ impl AudioSession for TestSession {
 struct TestState {
     volumes: Arc<Mutex<Vec<f32>>>,
     metadata: Arc<Mutex<Vec<TrackMetadata>>>,
-    coverart: Arc<Mutex<Vec<Vec<u8>>>>,
+    coverart: Coverart,
+    progress: Progress,
 }
 
 async fn start_server() -> (RaopServer, u16, TestState) {
@@ -48,16 +59,19 @@ async fn start_server() -> (RaopServer, u16, TestState) {
     let volumes = Arc::new(Mutex::new(Vec::new()));
     let metadata = Arc::new(Mutex::new(Vec::new()));
     let coverart = Arc::new(Mutex::new(Vec::new()));
+    let progress = Arc::new(Mutex::new(Vec::new()));
     let handler = Arc::new(TestHandler {
         inits: inits.clone(),
         volumes: volumes.clone(),
         metadata: metadata.clone(),
         coverart: coverart.clone(),
+        progress: progress.clone(),
     });
     let mut server = RaopServer::builder()
         .name("IntegrationTest")
         .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         .port(0)
+        .advertise(false)
         .build(handler)
         .unwrap();
     server.start().await.unwrap();
@@ -66,6 +80,7 @@ async fn start_server() -> (RaopServer, u16, TestState) {
         volumes,
         metadata,
         coverart,
+        progress,
     };
     (server, port, state)
 }
@@ -83,6 +98,7 @@ fn empty_handler() -> Arc<TestHandler> {
         volumes: Arc::new(Mutex::new(Vec::new())),
         metadata: Arc::new(Mutex::new(Vec::new())),
         coverart: Arc::new(Mutex::new(Vec::new())),
+        progress: Arc::new(Mutex::new(Vec::new())),
     })
 }
 
@@ -267,6 +283,7 @@ async fn unauthorized_without_password_header() {
         .name("AuthTest")
         .hwaddr([0xAA; 6])
         .port(0)
+        .advertise(false)
         .password("secret123")
         .build(empty_handler())
         .unwrap();
@@ -389,7 +406,7 @@ mod ap2_tests {
         let expected_features = if cfg!(feature = "video") {
             "0x527FFEE6,0x0"
         } else {
-            "0x405D4A00,0x14340"
+            "0x405FCA00,0x14340"
         };
         assert_eq!(raop("ft"), Some(expected_features));
         assert_eq!(raop("sf"), Some("0x204"));
@@ -405,6 +422,7 @@ mod ap2_tests {
             .name("PinStartTest")
             .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
             .port(0)
+            .advertise(false)
             .pin("1234")
             .build(handler)
             .unwrap();
@@ -610,6 +628,50 @@ mod ap2_tests {
         assert_eq!(name_val, "IntegrationTest");
         assert_eq!(mac_val, "00:11:22:33:44:55");
         assert_eq!(pi_val.len(), 36);
+
+        // Spec section 4 audio-only key set.
+        let pk = dict
+            .get("pk")
+            .and_then(plist::Value::as_data)
+            .expect("pk must be plist data");
+        assert_eq!(pk.len(), 32, "pk is the raw Ed25519 public key");
+        let int = |key: &str| dict.get(key).and_then(plist::Value::as_unsigned_integer);
+        assert_eq!(int("volumeControlType"), Some(3));
+        assert_eq!(int("statusFlags"), Some(0x4));
+        assert_eq!(
+            dict.get("keepAliveSendStatsAsBody").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        let formats = dict
+            .get("supportedFormats")
+            .and_then(plist::Value::as_dictionary)
+            .unwrap();
+        assert_eq!(
+            formats.get("bufferStream").and_then(plist::Value::as_unsigned_integer),
+            Some((1 << 22) | (1 << 23)),
+            "buffered path decodes AAC-LC 44.1/48 kHz only"
+        );
+        let extended = dict
+            .get("supportedAudioFormatsExtended")
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|d| d.get("bufferStream"))
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let extended: Vec<u64> = extended.iter().filter_map(plist::Value::as_unsigned_integer).collect();
+        assert_eq!(extended, [22, 23]);
+        assert!(
+            !dict.contains_key("featuresEx"),
+            "no extended bits until APAP framing exists"
+        );
+        let txt = dict.get("txtAirPlay").and_then(plist::Value::as_data).unwrap();
+        let txt = String::from_utf8_lossy(txt);
+        let features = int("features").unwrap();
+        let lo = features & 0xFFFF_FFFF;
+        let hi = features >> 32;
+        assert!(
+            txt.contains(&format!("features=0x{lo:X},0x{hi:X}")),
+            "txtAirPlay mirrors the mDNS record"
+        );
 
         server.stop().await;
     }
@@ -869,14 +931,15 @@ async fn set_parameter_coverart_calls_handler() {
     let (mut server, port, state) = start_server().await;
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
 
-    let jpeg = b"\xff\xd8\xff\xe0fake-jpeg-data";
+    // Any image/* type is artwork (Apple stores the MIME type alongside the bytes).
+    let webp = b"RIFF\x00\x00\x00\x00WEBPfake";
     let header = format!(
-        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: image/webp\r\nContent-Length: {}\r\n\r\n",
         port,
-        jpeg.len()
+        webp.len()
     );
     stream.write_all(header.as_bytes()).await.unwrap();
-    stream.write_all(jpeg).await.unwrap();
+    stream.write_all(webp).await.unwrap();
     let mut buf = vec![0u8; 4096];
     let n = stream.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
@@ -885,8 +948,33 @@ async fn set_parameter_coverart_calls_handler() {
     {
         let art = state.coverart.lock().unwrap();
         assert_eq!(art.len(), 1);
-        assert_eq!(&art[0], jpeg);
+        assert_eq!(art[0].0, "image/webp");
+        assert_eq!(art[0].1, webp);
     }
+
+    server.stop().await;
+}
+
+/// Every `text/parameters` line is applied, not only the first.
+#[tokio::test]
+#[serial]
+async fn set_parameter_reads_every_text_line() {
+    let (mut server, port, state) = start_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+
+    let body = "progress: 1000/45100/9000000\r\nvolume: -12.5\r\n";
+    let req = format!(
+        "SET_PARAMETER rtsp://127.0.0.1/{port} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = send_rtsp(&mut stream, &req).await;
+    assert!(resp.contains("200 OK"));
+
+    assert_eq!(*state.progress.lock().unwrap(), vec![(1000, 45_100, 9_000_000)]);
+    let volumes = state.volumes.lock().unwrap().clone();
+    assert_eq!(volumes.len(), 1);
+    assert!((volumes[0] - -12.5).abs() < 0.001);
+    assert!((server.reported_volume_db() - -12.5).abs() < 0.001);
 
     server.stop().await;
 }

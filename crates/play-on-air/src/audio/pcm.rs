@@ -107,35 +107,6 @@ impl PcmRing {
     take_frames
   }
 
-  /// Copy up to `frame_count` frames as interleaved i16 without consuming the ring.
-  ///
-  /// Used for FLAC quality-path snapshots while live WAV continues streaming.
-  pub fn copy_i16(&self, frame_count: usize, out: &mut Vec<i16>) -> usize {
-    let ch = usize::from(self.channels);
-    let need = frame_count.saturating_mul(ch);
-    out.clear();
-    out.reserve(need);
-
-    let guard = self.buf.lock();
-    let available_frames = guard.len() / ch;
-    let take_frames = frame_count.min(available_frames);
-    let take_samples = take_frames.saturating_mul(ch);
-
-    let (first, second) = guard.as_slices();
-    let first_take = take_samples.min(first.len());
-    for &sample in first.iter().take(first_take) {
-      out.push(f32_to_i16(sample));
-    }
-    let second_take = take_samples.saturating_sub(first_take);
-    if second_take > 0 {
-      for &sample in second.iter().take(second_take) {
-        out.push(f32_to_i16(sample));
-      }
-    }
-    drop(guard);
-    take_frames
-  }
-
   /// Number of complete frames currently buffered.
   pub fn available_frames(&self) -> usize {
     let guard = self.buf.lock();

@@ -1,6 +1,7 @@
 //! AirPlay 2 server builder and lifecycle.
 
 use super::connection::RaopShared;
+use super::remote::MediaRemoteCommand;
 use super::types::*;
 use crate::error::{ServerError, ShairplayError};
 use crate::net::mdns::{AirPlayServiceInfo, MdnsService};
@@ -65,6 +66,10 @@ pub struct RaopServerBuilder {
     /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
     audio_latency_samples: u32,
     pin: Option<String>,
+    /// Register `_raop` / `_airplay` mDNS services on start.
+    advertise: bool,
+    /// UDP `(event, general)` ports of the PTP follower.
+    ptp_ports: (u16, u16),
     #[cfg(feature = "video")]
     video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
     #[cfg(feature = "hls")]
@@ -91,6 +96,11 @@ impl RaopServerBuilder {
             output_max_channels: None,
             audio_latency_samples: DEFAULT_AUDIO_LATENCY_SAMPLES,
             pin: None,
+            advertise: true,
+            ptp_ports: (
+                crate::net::ptp::DEFAULT_PTP_EVENT_PORT,
+                crate::net::ptp::DEFAULT_PTP_GENERAL_PORT,
+            ),
             #[cfg(feature = "video")]
             video_handler: None,
             #[cfg(feature = "hls")]
@@ -170,6 +180,27 @@ impl RaopServerBuilder {
         self
     }
 
+    /// Register the `_raop._tcp` / `_airplay._tcp` mDNS services on [`RaopServer::start`].
+    ///
+    /// Default: `true`. Pass `false` for in-process tests that drive the RTSP
+    /// port directly and must not touch the network beyond localhost.
+    pub fn advertise(mut self, advertise: bool) -> Self {
+        self.advertise = advertise;
+        self
+    }
+
+    /// UDP ports of the PTP follower that maps buffered-audio anchors to local time.
+    ///
+    /// Default: 319 (event) and 320 (general). Servers in one process configured with the
+    /// same fixed ports share one follower. `0` binds an ephemeral port (tests); read it back
+    /// with [`RaopServer::ptp_ports`]. If binding fails (another PTP stack owns the ports, or
+    /// no privilege for ports below 1024), buffered audio still plays on the unlocked anchor
+    /// fallback.
+    pub fn ptp_ports(mut self, event: u16, general: u16) -> Self {
+        self.ptp_ports = (event, general);
+        self
+    }
+
     #[cfg(feature = "video")]
     /// Set a video handler for screen mirroring (experimental).
     pub fn video_handler(mut self, handler: Arc<dyn crate::raop::video::VideoHandler>) -> Self {
@@ -243,6 +274,8 @@ impl RaopServerBuilder {
             #[cfg(feature = "hls")]
             hls_handler: self.hls_handler,
             reported_volume_db: std::sync::Mutex::new(0.0),
+            event_senders: std::sync::Mutex::new(Vec::new()),
+            ptp: std::sync::Mutex::new(None),
         });
 
         let mut httpd = HttpServer::new(shared.clone(), self.max_clients);
@@ -255,7 +288,8 @@ impl RaopServerBuilder {
             bind: self.bind,
             name: self.name,
             hwaddr,
-            ptp_aborts: Vec::new(),
+            advertise: self.advertise,
+            ptp_ports: self.ptp_ports,
         })
     }
 }
@@ -280,8 +314,10 @@ pub struct RaopServer {
     bind: BindConfig,
     name: String,
     hwaddr: Vec<u8>,
-    /// PTP drain tasks on UDP 319/320 — aborted in [`Self::stop`] so ports free.
-    ptp_aborts: Vec<tokio::task::AbortHandle>,
+    /// Register mDNS services on start (see [`RaopServerBuilder::advertise`]).
+    advertise: bool,
+    /// Configured PTP follower ports (see [`RaopServerBuilder::ptp_ports`]).
+    ptp_ports: (u16, u16),
 }
 
 impl RaopServer {
@@ -306,22 +342,54 @@ impl RaopServer {
         self.shared.reported_volume_db.lock().map(|guard| *guard).unwrap_or(0.0)
     }
 
-    /// Start the server: bind ports, register mDNS services, begin accepting connections.
+    /// Ask the connected sender to perform a playback command (`play`, `paus`, …).
     ///
-    /// mDNS registration is skipped when the `CI` environment variable is set
-    /// (Bonjour/Avahi is typically unavailable on CI runners).
+    /// Sent as `POST /command` `sendMediaRemoteCommand` on the event channel of the
+    /// connection that owns active audio (else the newest sender). For commands where
+    /// [`MediaRemoteCommand::pauses_locally`] is true, the host should pause its own output
+    /// before calling this, as Apple's receiver does.
+    pub fn send_media_remote_command(&self, command: MediaRemoteCommand) -> Result<(), ShairplayError> {
+        Ok(self.shared.send_media_remote_command(command)?)
+    }
+
+    /// Report a local volume change (iOS slider position `0..=1`, plus mute) to the sender.
+    ///
+    /// Also sets the `GET_PARAMETER volume` value (slider mapped linearly onto `-30..=0` dB,
+    /// `-144` when muted). Sends `dvlc` only when the value differs from the last reported
+    /// or sender-set one, so a sender's own volume change is never echoed back. Senders
+    /// older than 354.54.6 expect DACP and get [`RemoteError::SenderTooOld`](crate::error::RemoteError::SenderTooOld).
+    pub fn report_volume(&self, slider: f32, muted: bool) -> Result<(), ShairplayError> {
+        Ok(self.shared.report_volume(slider, muted)?)
+    }
+
+    /// Bound PTP follower `(event, general)` ports while running; `None` before
+    /// [`Self::start`], after [`Self::stop`], or when binding failed.
+    pub fn ptp_ports(&self) -> Option<(u16, u16)> {
+        self.shared
+            .ptp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|service| service.ports())
+    }
+
+    /// Start the server: bind ports, register mDNS services (unless disabled with
+    /// [`RaopServerBuilder::advertise`]), begin accepting connections.
     pub async fn start(&mut self) -> Result<(), ShairplayError> {
         let _actual_port = self.httpd.start(self.bind.port).await?;
 
-        // AirPlay 2 PTP sink: accept the sender's clock on 319/320 so it doesn't
-        // stall the buffered-audio start. No-op if the ports can't be bound.
-        // Drop any prior sink first so restart does not fight ghost sockets.
-        for h in self.ptp_aborts.drain(..) {
-            h.abort();
-        }
-        self.ptp_aborts = crate::net::ptp::spawn_ptp_sink().await;
+        // PTP follower: maps SETRATEANCHORTIME network times to local time. It also keeps the
+        // sender from seeing ICMP port-unreachable for its PTP traffic, which stalls the
+        // buffered-audio start. Bind failure leaves buffered audio on the unlocked fallback.
+        let (event, general) = self.ptp_ports;
+        let service = crate::net::ptp::acquire(event, general);
+        *self
+            .shared
+            .ptp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(service);
 
-        if std::env::var("CI").is_err() {
+        if self.advertise {
             let info = self.service_info();
             let mut mdns = MdnsService::new()?;
             mdns.register_raop(&info)?;
@@ -343,11 +411,14 @@ impl RaopServer {
     /// accept-loop stop leaves accepted RTSP/event/audio TCP streams open.
     pub async fn stop(&mut self) {
         self.shared.hard_stop_sessions();
-        for h in self.ptp_aborts.drain(..) {
-            h.abort();
-        }
-        // Let aborted UDP tasks drop sockets before a following start rebinds.
-        tokio::task::yield_now().await;
+        // Release this server's PTP follower handle; the sockets close with the last handle.
+        let service = self
+            .shared
+            .ptp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(service);
         if let Some(mut mdns) = self.mdns.take() {
             mdns.unregister_raop();
             mdns.unregister_airplay();

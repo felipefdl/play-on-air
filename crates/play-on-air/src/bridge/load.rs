@@ -7,7 +7,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-use crate::cast::{CastPool, CastStreamKind, MediaLoadRequest};
+use crate::cast::{CastPool, CastStreamKind, CastTrack, MediaLoadRequest};
 use crate::error::{Error, Result};
 use crate::media::RolloverSignal;
 
@@ -111,7 +111,7 @@ async fn join_prior_inflight_load(inflight_load: &Mutex<Option<tokio::task::Join
 pub(super) fn spawn_rollover_reload_loop(
   device_id: String,
   stream_url: String,
-  cast_name: String,
+  track: Arc<Mutex<CastTrack>>,
   pool: Arc<CastPool>,
   rollover: Arc<RolloverSignal>,
   session_alive: Arc<AtomicBool>,
@@ -139,7 +139,7 @@ pub(super) fn spawn_rollover_reload_loop(
           let load_pool = Arc::clone(&pool);
           let id = device_id.clone();
           let url = stream_url.clone();
-          let title = cast_name.clone();
+          let load_track = track.lock().clone();
           let last_volume = *last_volume_linear.lock();
           let alive = Arc::clone(&session_alive);
           let late_stop = Arc::clone(&late_stop_allowed);
@@ -166,7 +166,7 @@ pub(super) fn spawn_rollover_reload_loop(
               let result = cast_load_media(
                 &load_pool,
                 &id,
-                MediaLoadRequest::wav(url, CastStreamKind::Buffered).with_title(title),
+                MediaLoadRequest::wav(url, CastStreamKind::Buffered).with_track(load_track),
                 LoadVolumePolicy::Rollover { last_volume },
               );
               // Late LOAD after full end: STOP so playback cannot revive against a dead HTTP server.
@@ -299,7 +299,7 @@ impl Bridge {
         EgressKind::FlacLive => MediaLoadRequest::flac(session.stream_url.clone(), CastStreamKind::Live),
         EgressKind::WavBuffered => MediaLoadRequest::wav(session.stream_url.clone(), CastStreamKind::Buffered),
       }
-      .with_title(session.cast_name.clone());
+      .with_track(session.track.lock().clone());
       let last_volume = *session.last_volume_linear.lock();
       let plan = (
         Arc::clone(&session.pool),
@@ -643,7 +643,7 @@ mod tests {
         cast_load_media(
           &load_pool,
           "missing-device",
-          MediaLoadRequest::wav("http://127.0.0.1:9/stream".to_owned(), CastStreamKind::Buffered).with_title("test"),
+          MediaLoadRequest::wav("http://127.0.0.1:9/stream".to_owned(), CastStreamKind::Buffered),
           LoadVolumePolicy::Rollover { last_volume: None },
         )
       })

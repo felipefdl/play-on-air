@@ -36,11 +36,14 @@ pub trait AudioHandler: Send + Sync + 'static {
 
     /// Volume change in dB (0.0 = max, -144.0 = mute).
     fn on_volume(&self, _volume: f32) {}
-    /// Track metadata (parsed from DMAP).
+    /// Track metadata (DMAP SET_PARAMETER, or the merged `updateMRNowPlayingInfo` state).
     fn on_metadata(&self, _metadata: &crate::proto::dmap::TrackMetadata) {}
-    /// Album artwork (JPEG or PNG).
-    fn on_coverart(&self, _coverart: &[u8]) {}
-    /// Playback progress (start, current, end in RTP timestamps at 44100 Hz).
+    /// Album artwork from SET_PARAMETER `image/*` or `updateMRNowPlayingInfo`
+    /// `artworkData`. `mime_type` is the sender's type (for example `image/jpeg`).
+    fn on_coverart(&self, _mime_type: &str, _coverart: &[u8]) {}
+    /// Playback progress as RTP timestamps (start, current, end) at the stream sample rate.
+    ///
+    /// Elapsed is `(current - start) / rate` and duration `(end - start) / rate`.
     fn on_progress(&self, _start: u32, _current: u32, _end: u32) {}
 
     // --- Connection lifecycle ---

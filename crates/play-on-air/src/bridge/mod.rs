@@ -11,7 +11,8 @@
 //!
 //! Module map: `worker` (event routing + shutdown drain), `start` (prebuffer, initial LOAD),
 //! `playback` (pause / resume / flush / volume), `load` (re-LOAD coordination), `stall`
-//! (watchdog), `fallback` (FLAC → WAV), `teardown` (session end), `state` (slots + session).
+//! (watchdog), `fallback` (FLAC → WAV), `teardown` (session end), `state` (slots + session),
+//! `remote` (now-playing metadata to Cast, Cast-side play / pause / volume to the sender).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use self::state::{DeviceSlot, DeviceState};
 mod fallback;
 mod load;
 mod playback;
+mod remote;
 mod stall;
 mod start;
 mod state;

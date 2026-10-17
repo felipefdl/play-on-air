@@ -17,41 +17,51 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 5. Reported volume: `RaopShared` stores the dB returned by `GET_PARAMETER volume` (default `0.0`);
    `SET_PARAMETER` updates it; `RaopServer::set_reported_volume_db` / `reported_volume_db` let the host
    seed the value from Chromecast so the iOS slider matches device level.
-6. Buffered delivery: drop old `AudioSession` before `audio_init` on format change; run `audio_init`
-   outside the playout mutex (avoids Drop clearing the new ring).
-7. `AudioSession::on_rate` / `on_flush` for AP2 buffered SetRate/FLUSHBUFFERED; delivery drains
-   pending flags so pause/flush reach the host while rate is 0.
-8. Buffered playout: `PlayoutStop` sync stop + receive-task Drop cleanup so hard-stop before task
-   abort unblocks the delivery thread (async `PlayoutCommand::Stop` alone was abort-unsafe).
+6. Buffered delivery: drop old `AudioSession` before `audio_init` on output format change; run
+   `audio_init` outside the playout mutex (avoids Drop clearing the new ring). The session is
+   created at the first released packet (decode runs on the delivery thread).
+7. `AudioSession::on_rate` / `on_flush` for AP2 buffered SETRATEANCHORTIME / FLUSHBUFFERED, queued
+   in order and delivered by the delivery thread, also while stopped.
+8. Buffered playout: `PlayoutHandle::stop` is a synchronous stop that wakes the delivery thread and
+   the suspended reader, and the reader task's Drop guard calls it, so hard-stop before task abort
+   never wedges delivery. RTSP handlers drive playout through the same handle synchronously (no
+   command task), which lets SETRATEANCHORTIME answer `firstAvailableSampleTS` / `status`.
 9. TEARDOWN calls `hard_stop_sessions()` (clears active_audio, aborts session tasks including
-   realtime) and takes `playout_cmd` instead of a best-effort async Stop.
-10. Playout anchors/scheduling use `mono_now_ns()` (`Instant`); wall `now_ns()` remains for PTP only.
-11. Delivery caps due AAC packets per tick (`MAX_FRAMES_PER_TICK`) so catch-up cannot flood the host ring.
-12. Playout RTP math uses `source_sample_rate`; FLUSHBUFFERED range compare is wrap-safe. Buffered map
-    uses **read-driven flow control** (target ~60 s / resume ~50 s hysteresis, aligned with advertised
-    `audioBufferSize = 0x100000`): when full, the receive loop stops reading TCP so the kernel window
-    paces iOS. Delivery/`notify_all` after consume, flush, and stop unpark the waiter. Drop-oldest was
-    removed — it punched holes at the playhead. Pathological backstop only: refuse **newest** past 3×
-    target (~180 s).
+   realtime) and drops the connection's `playout` handle.
+10. Playout scheduling and PTP offsets use one clock, `mono_now_ns()` (`Instant`).
+11. **Buffered playout timing follows `docs/ap2-receiver-spec.md` section 1.** RTP timestamps are
+    extended to 64 bits (queue keys, so order is wrap-safe). Sample `r` is presented at
+    `H(anchor) + (r - anchorRtp) / rate`; a packet is released to the host at presentation minus
+    the advertised `Audio-Latency` (PlayOnAir's Cast cushion), never on arrival. Packets whose end is
+    behind the playhead are pruned (anchor in the past joins mid-stream). Rate must be 0 or 1
+    (else plist `status` -6705); rate 0 stops, keeps the buffer and clears the anchor; each anchor
+    start fades in over 30 ms. Packets are queued compressed and decoded at release.
+12. **Back-pressure, not drops.** The reader suspends TCP reads once 120 s of audio is queued and
+    resumes below 119 s; nothing is dropped for being early. SETUP `audioBufferSize` is computed:
+    120 s x 192000 B/s (48 kHz 16-bit stereo PCM bound of the accepted formats).
 13. Playout mutex/condvar locks use `unwrap_or_else(PoisonError::into_inner)` (poison-proof).
 14. Realtime type 96: RTP seq reorder window (drop dups, silence for aged gaps; ALAC in order only).
     Decode failure fills the same silence length as a Lost packet (keeps PCM clock length).
 15. RTSP `process_connection` read timeout (45s) so half-open iOS sockets release the connection semaphore; accept loop prunes finished `conn_aborts`.
 16. Configurable `Audio-Latency` RECORD header (`RaopServerBuilder::audio_latency_samples`, default 96000 = 2s@48k).
 17. Event channel: 1 MB ciphertext cap, disconnect on decrypt error, exit when command sender closes.
-18. PTP sink abort handles stored and aborted in `RaopServer::stop` (avoids EADDRINUSE on restart).
-19. FLUSHBUFFERED: parse `flushFromTS` / `flushUntilTS` (RTP timestamps) for map trim + epoch purge;
-    while playing, arm a pending re-anchor resolved on the first post-flush packet that survives epoch
-    enforcement (100 ms lead), instead of anchoring to `flushUntilTS` (wrong when Apple re-keys the
-    RTP epoch on track skip — cross-epoch wrap-safe compare would firehose the whole prebuffer).
-    If an old-epoch straggler claims that pending first, the next insert that collapses the map onto
-    a new epoch (`epoch_dropped > 0`, survivor epoch-far from the current anchor) re-anchors with
-    the same lead even when pending is already clear. Wire SETRATEANCHORTIME clears pending /
-    overrides. Fixes ~30 s silence on same-epoch skip without SETRATE.
-20. SETRATEANCHORTIME (SetRate rate!=0): purge buffered frames more than 2 s of source samples behind
-    the wire RTP anchor before the earliest-frame 100 ms lead nudge. Wire anchor is authoritative;
-    prevents one stray pre-seek packet from dragging playout tens/hundreds of seconds into the past
-    after scrub.
+18. **PTP follower** (`net::ptp`, spec section 3) replaces the drain-only sink: passive, per
+    grandmaster clock identity, offset from two-step Sync/Follow_Up (or one-step Sync) through a
+    16-sample minimum-delay filter with 3-sample step confirmation; locked after 4 samples, stale
+    after 3 s. SETUP `timingPeerInfo` adds and `timingPeerList` / SETPEERS (strings) / SETPEERSX
+    (peer dictionaries) replace the session peer set; only timelines from session peers map
+    anchors. Ports come from `RaopServerBuilder::ptp_ports` (default 319/320, `0` = ephemeral,
+    readback `RaopServer::ptp_ports`); fixed ports are bound once per process and shared by every
+    server. Bind failure logs one warning and playback uses the unlocked fallback (item 20).
+19. **FLUSHBUFFERED follows spec section 2.** 24-bit modulo sequence compare. No `flushFromSeq`
+    (or no `flushFromTS`): flush-all stops playback, discards the queue, resets anchor and RTP
+    epoch, and drops incoming seq before `flushUntilSeq` (exclusive). Range flush keeps playing,
+    trims the queue from `flushFromTS` to the end, and drops seq in `[flushFromSeq, flushUntilSeq)`.
+    Rules retire at `flushUntilSeq + 20`. Missing `flushUntilSeq` answers `status` -6705.
+20. **Unlocked anchor fallback** (deviation, below). When the PTP follower cannot map an anchor,
+    the first anchor on a timeline is mapped to "release on receipt" (`H = receipt +
+    Audio-Latency`) and that offset is pinned for later anchors on the same timeline; it re-pins
+    when an anchor lands more than 1 s from release-on-receipt. Warns once per stream.
 21. **AirPlay 2 only — AirPlay 1 stack removed** (AGENTS.md "AP2 only"). Deleted: `airport.key` and
     `crypto::rsa` (Apple-Challenge / `Apple-Response`, `rsaaeskey`), `crypto::pairing` + `crypto::aes`
     (legacy Ed25519 pair-setup/verify fallback), `proto::sdp` + ANNOUNCE, `Transport`-header SETUP,
@@ -63,13 +73,37 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
     RUSTSEC-2023-0071 ignore in the root `deny.toml` / `.cargo/audit.toml`). `handlers_ap1.rs` became
     `handlers.rs` (connection state + shared handlers). ANNOUNCE and unpaired plist-less SETUP now
     return 404; non-TLV pair-setup/verify get an empty 200.
+22. **Advertising follows the Apple receiver spec** (`docs/ap2-receiver-spec.md` section 4).
+    Features `0x0001C340405FCA00` (adds bit 15 artwork and bit 17 DAAP now-playing to the
+    shairport-sync base; the old "bits 15/17 break discovery" note described one failed combination,
+    and the Sonos SDK receiver advertises both). `GET /info` sends `pk` as 32-byte data plus
+    `keepAliveSendStatsAsBody`, `supportedFormats` (`audioStream` ALAC 18-21, `bufferStream` AAC-LC
+    22-23), `supportedAudioFormatsExtended = {bufferStream: [22, 23]}`, `volumeControlType = 3`
+    (Cast applies volume), `initialVolume` (the reported dB), and `txtAirPlay`; the SETUP-time
+    `updateInfo` value is the same dictionary. TXT: `_airplay._tcp` matches the Sonos SDK key set
+    (adds `rsf=0x0`; drops `vv=2`, `btaddr`, `osvers`), `_raop._tcp` sends `tp=UDP` and drops `pw`/`ov`.
+    A password sets statusFlags bit 7 instead of `pw=true`.
+23. `RaopServerBuilder::advertise(bool)` (default `true`) decides whether `start()` registers the
+    mDNS services. It replaces the old "skip mDNS when the `CI` env var is set" check; in-process
+    tests (vendor `tests/integration.rs`, PlayOnAir `tests/e2e_buffered`) pass `false`.
+24. **Reverse control and now-playing** (`docs/ap2-receiver-spec.md` sections 5 and 6, module
+    `raop::remote`). `RaopServer::send_media_remote_command(MediaRemoteCommand)` and
+    `RaopServer::report_volume(slider, muted)` send `POST /command` (binary plist, CSeq from 1)
+    on the event channel of the active-audio connection, else the newest; `RaopShared` keeps the
+    event senders per connection (unregistered on TEARDOWN / disconnect / hard stop). `dvlc` is
+    gated on the sender's `User-Agent: AirPlay/x.y.z` ≥ 354.54.6 and skipped when equal to the
+    current reported volume. SET_PARAMETER reads every `text/parameters` line and any `image/*`
+    type; `AudioHandler::on_coverart` gets the MIME type. DMAP reads the spec tag set (`asdn` is
+    the disc number; `asdk` the stream flag). `POST /command` `updateMRNowPlayingInfo` is merged
+    per connection (`mergePolicy`) and surfaced through `on_metadata` / `on_coverart`.
+    `AudioHandler::on_progress` timestamps are at the stream sample rate.
 
 ### AirPlay 2 dependencies kept
 
 - **fp-setup / FairPlay M1/M2** (`crypto::fairplay`): the AP2 feature set advertises
   `Authentication4` (bit 14), so iOS runs fp-setup before SETUP.
-- **HTTP Digest auth** (`password`), `_raop._tcp` TXT base fields (`cn`, `da`, `et=0,3,5`, `tp`,
-  `md`, `vn=65537`): published by AirPlay 2 receivers (shairport-sync parity).
+- **HTTP Digest auth** (`password`, advertised as statusFlags bit 7), `_raop._tcp` TXT base fields
+  (`cn`, `da`, `et=0,3,5`, `tp=UDP`, `md`, `vn=65537`): published by AirPlay 2 receivers.
 - **Plain RTSP `FLUSH`**: acknowledged (200) for AP2 senders; it only flushes legacy video RTP.
 
 ### `video` feature boundary (not removed)
@@ -83,6 +117,11 @@ removing video is out of scope.
 
 ### Accepted deviations
 
-- **Buffered `BTreeMap<u32, …>` RTP key order:** keys are raw `u32` RTP timestamps. Across a wrap, `BTreeMap` order is not wrap-aware (high keys sort after low keys). The ~60 s target depth (and 3× newest-drop backstop) keeps the live span ≪ 2^32 samples, so wrap-within-map does not occur for normal sessions. Revisit only if multi-hour sessions keep a map that can span a wrap.
+- **Unlocked anchors still play:** Apple's receiver rejects SETRATEANCHORTIME until its PTP clock
+  is locked on the anchor's grandmaster. PlayOnAir must play on hosts where 319/320 are taken
+  (macOS with AirPlay Receiver on, non-root CI) and before lock, so it uses the item 20 fallback.
+  Pacing stays real time; only the absolute start offset can differ from the sender's intent
+  (bounded by 1 s after the first anchor). The PTP follower never transmits and does not take part
+  in master election.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

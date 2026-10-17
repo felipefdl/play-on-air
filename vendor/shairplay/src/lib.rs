@@ -13,7 +13,8 @@
 `shairplay` provides an AirPlay 2 server that receives audio streams from Apple
 devices on the local network: HomeKit/SRP pairing, encrypted RTSP, buffered AAC
 and realtime ALAC, decoded to f32 PCM. The AirPlay 1 stack (RSA, legacy pairing,
-ANNOUNCE/SDP, DACP) is not part of this fork.
+ANNOUNCE/SDP, DACP) is not part of this fork; reverse control uses the AirPlay 2
+event channel ([`RaopServer::send_media_remote_command`], [`RaopServer::report_volume`]).
 
 # Quick Start
 
@@ -85,6 +86,6 @@ pub use raop::hls::{HlsHandler, HlsSession};
 #[cfg(feature = "video")]
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 pub use raop::{
-    AudioCodec, AudioFormat, AudioHandler, AudioSession, MemoryPairingStore, PairingStore, RaopServer,
-    RaopServerBuilder, TrackMetadata,
+    AudioCodec, AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, MemoryPairingStore, PairingStore,
+    RaopServer, RaopServerBuilder, TrackMetadata,
 };

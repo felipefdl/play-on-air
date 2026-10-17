@@ -1,7 +1,7 @@
 //! Lossless FLAC encode for Cast HTTP media egress.
 //!
-//! Offline snapshot encode ([`encode_pcm_i16_to_flac`]) and the live streaming encoder
-//! ([`LiveFlacEncoder`]: STREAMINFO header, then one fixed-size FLAC frame per PCM block).
+//! The live streaming encoder ([`LiveFlacEncoder`]: STREAMINFO header, then one fixed-size
+//! FLAC frame per PCM block).
 
 use std::fmt;
 
@@ -29,46 +29,7 @@ pub const FLAC_BLOCK_SIZE: usize = 2048;
 /// still shared, so a replacement arena is the same size as the first one.
 pub(crate) const LIVE_ARENA_BYTES: usize = 64 * 1024;
 
-/// Encode interleaved little-endian-order i16 PCM to a complete FLAC bitstream.
-///
-/// `samples` is interleaved: `[L0, R0, L1, R1, …]` for stereo.
-/// `channels` must be ≥ 1. `sample_rate` is in Hz (e.g. 44100).
-pub fn encode_pcm_i16_to_flac(samples: &[i16], channels: u16, sample_rate: u32) -> Result<Vec<u8>> {
-  if channels == 0 {
-    return Err(Error::Audio("channels must be at least 1".to_owned()));
-  }
-  if sample_rate == 0 {
-    return Err(Error::Audio("sample_rate must be non-zero".to_owned()));
-  }
-
-  let ch = usize::from(channels);
-  if !samples.len().is_multiple_of(ch) {
-    return Err(Error::Audio(format!(
-      "sample count {} is not a multiple of channels {channels}",
-      samples.len()
-    )));
-  }
-
-  // flacenc expects interleaved i32 samples in i16 range.
-  let i32_samples: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
-
-  let bits_per_sample = 16_usize;
-  let encoder_config = verified_encoder_config()?;
-
-  let source = flacenc::source::MemSource::from_samples(&i32_samples, ch, bits_per_sample, sample_rate as usize);
-
-  let flac_stream = flacenc::encode_with_fixed_block_size(&encoder_config, source, encoder_config.block_size)
-    .map_err(|err| Error::Audio(format!("FLAC encode failed: {err}")))?;
-
-  let mut sink = ByteSink::new();
-  flac_stream
-    .write(&mut sink)
-    .map_err(|err| Error::Audio(format!("FLAC bitstream write failed: {err}")))?;
-
-  Ok(sink.as_slice().to_vec())
-}
-
-/// Default verified encoder config for offline and live encode paths.
+/// Default verified encoder config for the live encoder.
 fn verified_encoder_config() -> Result<Verified<config::Encoder>> {
   config::Encoder::default()
     .into_verified()
@@ -216,19 +177,6 @@ impl LiveFlacEncoder {
 mod tests {
   use super::*;
 
-  /// Distinct L/R pattern so a channel swap fails bit-exact checks.
-  fn stereo_distinct_i16(frames: usize) -> Vec<i16> {
-    let mut out = Vec::with_capacity(frames.saturating_mul(2));
-    for n in 0..frames {
-      // L rises slowly; R is a fixed negative constant — never equal after swap.
-      let phase = i32::try_from(n % 3_000).unwrap_or(0);
-      let left = i16::try_from(phase - 1_500).unwrap_or(0);
-      out.push(left);
-      out.push(-12_000);
-    }
-    out
-  }
-
   /// Hard-to-compress stereo PCM (LCG noise, independent channels) so frames approach verbatim
   /// size and a run of them overflows one output arena.
   fn stereo_noise_i16(frames: usize, seed: u32) -> Vec<i16> {
@@ -239,51 +187,6 @@ mod tests {
       out.push((state >> 16) as i16);
     }
     out
-  }
-
-  #[test]
-  fn encode_stereo_roundtrip_claxon() {
-    let sample_rate = 44_100_u32;
-    let channels = 2_u16;
-    let pcm = stereo_distinct_i16(4096);
-    let flac = encode_pcm_i16_to_flac(&pcm, channels, sample_rate).expect("encode");
-    assert!(flac.len() > 42, "FLAC should be non-trivial");
-    // fLaC magic
-    assert_eq!(&flac[0..4], b"fLaC");
-
-    let cursor = std::io::Cursor::new(&flac);
-    let mut reader = claxon::FlacReader::new(cursor).expect("claxon open");
-    let info = reader.streaminfo();
-    assert_eq!(info.sample_rate, sample_rate);
-    assert_eq!(info.channels, u32::from(channels));
-
-    let decoded: Vec<i32> = reader.samples().map(|r| r.expect("sample")).collect();
-    assert_eq!(decoded.len(), pcm.len());
-    for (i, (&orig, &dec)) in pcm.iter().zip(decoded.iter()).enumerate() {
-      assert_eq!(i32::from(orig), dec, "mismatch at sample {i}");
-    }
-    // Explicit L/R check: even = L pattern, odd = R constant.
-    assert_ne!(decoded[0], decoded[1], "L/R must differ so swap is detectable");
-    for frame in 0..4096 {
-      let left = decoded[frame * 2];
-      let right = decoded[frame * 2 + 1];
-      assert_eq!(right, i32::from(-12_000_i16), "R channel swapped or corrupted at frame {frame}");
-      let phase = i32::try_from(frame % 3_000).unwrap_or(0);
-      let expected_l = i32::from(i16::try_from(phase - 1_500).unwrap_or(0));
-      assert_eq!(left, expected_l, "L channel mismatch at frame {frame}");
-    }
-  }
-
-  #[test]
-  fn reject_zero_channels() {
-    let err = encode_pcm_i16_to_flac(&[0], 0, 44_100).unwrap_err();
-    assert!(matches!(err, Error::Audio(_)));
-  }
-
-  #[test]
-  fn reject_bad_alignment() {
-    let err = encode_pcm_i16_to_flac(&[0, 1, 2], 2, 44_100).unwrap_err();
-    assert!(matches!(err, Error::Audio(_)));
   }
 
   #[test]

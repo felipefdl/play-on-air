@@ -53,32 +53,6 @@ pub fn wav_header(channels: u16, sample_rate: u32, data_len: u32) -> Result<[u8;
   Ok(h)
 }
 
-/// Encode a complete finite WAV file (header + interleaved i16 PCM body).
-pub fn encode_pcm_i16_to_wav(samples: &[i16], channels: u16, sample_rate: u32) -> Result<Vec<u8>> {
-  let ch = usize::from(channels.max(1));
-  if channels == 0 {
-    return Err(Error::Audio("channels must be at least 1".to_owned()));
-  }
-  if !samples.len().is_multiple_of(ch) {
-    return Err(Error::Audio(format!(
-      "sample count {} is not a multiple of channels {channels}",
-      samples.len()
-    )));
-  }
-
-  let data_len_usize = samples.len().saturating_mul(2);
-  let data_len =
-    u32::try_from(data_len_usize).map_err(|_overflow| Error::Audio("WAV data length exceeds u32".to_owned()))?;
-
-  let header = wav_header(channels, sample_rate, data_len)?;
-  let mut out = Vec::with_capacity(44 + data_len_usize);
-  out.extend_from_slice(&header);
-  for &s in samples {
-    out.extend_from_slice(&s.to_le_bytes());
-  }
-  Ok(out)
-}
-
 /// Continuous-stream header using a large data size so players keep reading.
 pub fn continuous_wav_header(channels: u16, sample_rate: u32) -> Result<[u8; 44]> {
   // ~2 GiB payload placeholder; many players stream until connection close.
@@ -114,18 +88,5 @@ mod tests {
     assert_eq!(u16::from_le_bytes([h[22], h[23]]), 2);
     // sample rate
     assert_eq!(u32::from_le_bytes([h[24], h[25], h[26], h[27]]), 44_100);
-  }
-
-  #[test]
-  fn encode_roundtrip_hound() {
-    let samples: Vec<i16> = (0..256).map(|i| (i * 100) as i16).collect();
-    let wav = encode_pcm_i16_to_wav(&samples, 1, 16_000).expect("encode");
-    let cursor = std::io::Cursor::new(&wav);
-    let mut reader = hound::WavReader::new(cursor).expect("hound");
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1);
-    assert_eq!(spec.sample_rate, 16_000);
-    let decoded: Vec<i16> = reader.samples::<i16>().map(|s| s.expect("s")).collect();
-    assert_eq!(decoded, samples);
   }
 }

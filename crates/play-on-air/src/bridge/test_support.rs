@@ -50,6 +50,7 @@ pub(super) fn test_playing_session(
     session_alive: Arc::new(AtomicBool::new(true)),
     late_stop_allowed: Arc::new(AtomicBool::new(true)),
     last_volume_linear: Arc::new(Mutex::new(None)),
+    track: Arc::new(Mutex::new(crate::cast::CastTrack::default())),
     inflight_load: Arc::new(Mutex::new(None)),
     reload_flight: Arc::new(tokio::sync::Mutex::new(())),
   }

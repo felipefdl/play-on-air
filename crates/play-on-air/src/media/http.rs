@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -28,7 +28,9 @@ use crate::error::{Error, Result};
 // ── Live stream pacing / cushion constants ──────────────────────────────────
 //
 // Three layers keep Nest from underrunning:
-// 1. Bridge prebuffer (~0.5 s real PCM) before Cast LOAD — first real chunks.
+// 1. Bridge prebuffer (one FLAC block of real PCM) before Cast LOAD: audio is flowing. The
+//    AirPlay producer is paced on the sender timeline (real time), so PCM that accumulates
+//    while Cast LOADs is the only backlog.
 // 2. Silence preroll (~2 s) at body start, unpaced — Cast-side cushion; counts
 //    toward `frames_emitted` so the pacer starts ~LIVE_LEAD ahead.
 // 3. LIVE_LEAD (~2 s) steady-state pace cap — Nest may not pull further ahead.
@@ -126,6 +128,20 @@ impl RolloverSignal {
   }
 }
 
+/// Largest artwork image served (bigger sender images are dropped at ingest).
+pub const MAX_ARTWORK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Album artwork served at `/artwork/<id>`; a new image gets a new id, so Cast refetches.
+#[derive(Debug)]
+pub struct Artwork {
+  /// Process-unique id used in the URL.
+  pub id: u64,
+  /// MIME type from the sender (for example `image/jpeg`).
+  pub content_type: String,
+  /// Image bytes (at most [`MAX_ARTWORK_BYTES`]).
+  pub body: Bytes,
+}
+
 #[derive(Clone)]
 struct AppState {
   content: Arc<RwLock<MediaContent>>,
@@ -145,6 +161,8 @@ struct AppState {
   last_body_write: Arc<RwLock<Option<Instant>>>,
   /// Notifies the bridge when a `LiveWav` body ends for Content-Length rollover.
   rollover: Arc<RolloverSignal>,
+  /// Current now-playing artwork (only this id is served).
+  artwork: Arc<RwLock<Option<Arc<Artwork>>>>,
 }
 
 /// Running media server handle with public base URL.
@@ -162,6 +180,7 @@ pub struct MediaServerHandle {
   bytes_served: Arc<AtomicU64>,
   last_body_write: Arc<RwLock<Option<Instant>>>,
   rollover: Arc<RolloverSignal>,
+  artwork: Arc<RwLock<Option<Arc<Artwork>>>>,
   shutdown_tx: Option<oneshot::Sender<()>>,
   serve_task: tokio::task::JoinHandle<()>,
 }
@@ -175,6 +194,16 @@ impl MediaServerHandle {
   /// Replace the body served at `/stream`.
   pub fn set_content(&self, content: MediaContent) {
     *self.content.write() = content;
+  }
+
+  /// Serve `artwork` at [`Self::artwork_url`] (`None` stops serving any artwork).
+  pub fn set_artwork(&self, artwork: Option<Arc<Artwork>>) {
+    *self.artwork.write() = artwork;
+  }
+
+  /// URL Cast fetches `artwork` from.
+  pub fn artwork_url(&self, artwork: &Artwork) -> String {
+    format!("{}/artwork/{}", self.base_url, artwork.id)
   }
 
   /// Actively end in-flight LiveWav/LiveFlac bodies and refuse new pulls.
@@ -272,6 +301,7 @@ impl MediaServer {
     let bytes_served = Arc::new(AtomicU64::new(0));
     let last_body_write = Arc::new(RwLock::new(None));
     let rollover = Arc::new(RolloverSignal::default());
+    let artwork = Arc::new(RwLock::new(None));
     let state = AppState {
       content: Arc::clone(&content),
       live_generation: Arc::clone(&live_generation),
@@ -279,10 +309,12 @@ impl MediaServer {
       bytes_served: Arc::clone(&bytes_served),
       last_body_write: Arc::clone(&last_body_write),
       rollover: Arc::clone(&rollover),
+      artwork: Arc::clone(&artwork),
     };
 
     let app = Router::new()
       .route("/stream", get(serve_stream).head(serve_stream_head))
+      .route("/artwork/{id}", get(serve_artwork))
       .route("/health", get(|| async { StatusCode::OK }))
       .with_state(state);
 
@@ -315,10 +347,28 @@ impl MediaServer {
       bytes_served,
       last_body_write,
       rollover,
+      artwork,
       shutdown_tx: Some(shutdown_tx),
       serve_task,
     })
   }
+}
+
+/// GET `/artwork/{id}` — the current artwork when `id` matches, else 404.
+async fn serve_artwork(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
+  let Some(artwork) = state.artwork.read().clone().filter(|art| art.id == id) else {
+    return StatusCode::NOT_FOUND.into_response();
+  };
+  let mut response = Body::from(artwork.body.clone()).into_response();
+  if let Ok(value) = artwork.content_type.parse() {
+    drop(response.headers_mut().insert(header::CONTENT_TYPE, value));
+  }
+  // Ids never get new content, so Cast may cache freely.
+  drop(response.headers_mut().insert(
+    header::CACHE_CONTROL,
+    header::HeaderValue::from_static("public, max-age=86400, immutable"),
+  ));
+  response
 }
 
 /// GET `/stream` — may supersede a prior live body (generation bump).
@@ -1379,6 +1429,46 @@ mod tests {
     }
     let text = String::from_utf8_lossy(&buf);
     assert!(text.starts_with("HTTP/1.1 404"), "got: {text}");
+    handle.shutdown();
+  }
+
+  /// Only the current artwork id is served, with its MIME type; stale ids 404.
+  #[tokio::test]
+  async fn artwork_route_serves_current_image_only() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    async fn get_raw(host_port: &str, path: &str) -> Vec<u8> {
+      let mut stream = TcpStream::connect(host_port).await.expect("connect");
+      let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+      stream.write_all(req.as_bytes()).await.expect("write");
+      let mut buf = Vec::new();
+      drop(stream.read_to_end(&mut buf).await);
+      buf
+    }
+
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    let host_port = format!("127.0.0.1:{}", handle.addr.port());
+    let art = Arc::new(Artwork {
+      id: 41,
+      content_type: "image/png".to_owned(),
+      body: Bytes::from_static(b"\x89PNG-art"),
+    });
+    assert_eq!(handle.artwork_url(&art), format!("{}/artwork/41", handle.base_url));
+    handle.set_artwork(Some(Arc::clone(&art)));
+
+    let ok = get_raw(&host_port, "/artwork/41").await;
+    let text = String::from_utf8_lossy(&ok);
+    assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
+    assert!(text.to_ascii_lowercase().contains("content-type: image/png"), "got: {text}");
+    assert!(ok.ends_with(b"\x89PNG-art"));
+
+    let stale = get_raw(&host_port, "/artwork/40").await;
+    assert!(String::from_utf8_lossy(&stale).starts_with("HTTP/1.1 404"));
+
+    handle.set_artwork(None);
+    let cleared = get_raw(&host_port, "/artwork/41").await;
+    assert!(String::from_utf8_lossy(&cleared).starts_with("HTTP/1.1 404"));
     handle.shutdown();
   }
 
