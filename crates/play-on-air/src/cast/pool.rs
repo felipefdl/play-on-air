@@ -123,14 +123,15 @@ pub(crate) fn classify_cast_probe_error(err: &rust_cast::errors::Error) -> Probe
 pub(crate) enum CastFailureClass {
   /// Retry with backoff; device may recover.
   Transient,
-  /// Permanent for this process (e.g. peer cert version webpki rejects).
+  /// Permanent for this process (e.g. no TLS version or cipher suite in common).
   Terminal,
 }
 
 /// Classify a pool-level Cast error string for terminal vs transient handling.
 ///
 /// Terminal failures hide the AirPlay advertisement and stop reconnect hammering.
-/// Do not switch TLS stacks here (architecture fork).
+/// Only deterministic TLS negotiation mismatches are terminal; certificate quirks
+/// (self-signed, X.509 v1) are accepted by the Cast verifier in `cast::tls`.
 #[must_use]
 pub(crate) fn classify_cast_control_error(err: &Error) -> CastFailureClass {
   classify_cast_control_message(&err.to_string())
@@ -139,12 +140,9 @@ pub(crate) fn classify_cast_control_error(err: &Error) -> CastFailureClass {
 /// Pure message classifier (unit-testable without building full [`Error`] variants).
 #[must_use]
 pub(crate) fn classify_cast_control_message(message: &str) -> CastFailureClass {
-  let lower = message.to_ascii_lowercase();
-  // rustls/webpki: `invalid peer certificate: Other(OtherError(UnsupportedCertVersion))`
-  if lower.contains("unsupportedcertversion")
-    || lower.contains("unsupported cert version")
-    || (lower.contains("invalid peer certificate") && lower.contains("certversion"))
-  {
+  // rustls `Error::PeerIncompatible`: `peer is incompatible: NoCipherSuitesInCommon` etc.
+  // The device's TLS stack cannot negotiate with ours; retrying cannot change that.
+  if message.contains("peer is incompatible") {
     CastFailureClass::Terminal
   } else {
     CastFailureClass::Transient
@@ -358,7 +356,7 @@ struct CastWorkerHandle {
   exiting: bool,
   /// Shared with the worker thread: last known Cast control-plane reachability.
   reachable: Arc<AtomicBool>,
-  /// Process-lifetime terminal Cast failure (e.g. `UnsupportedCertVersion`).
+  /// Process-lifetime terminal Cast failure (e.g. TLS negotiation impossible).
   terminal_failed: Arc<AtomicBool>,
   /// Bridge-initiated end: probes stand down even before the worker drains cmds.
   ownership_stand_down: Arc<AtomicBool>,
@@ -679,25 +677,31 @@ impl CastPool {
   }
 
   /// Best-effort media STOP with a wall-clock timeout; never tears down warm TCP.
-  pub fn stop_best_effort(&self, device_id: &str, timeout: Duration) {
+  ///
+  /// Returns `true` when the worker acknowledged STOP within `timeout`. Returns
+  /// `false` on missing worker, send failure, timeout, or disconnect so callers
+  /// (full teardown) can retry once.
+  pub fn stop_best_effort(&self, device_id: &str, timeout: Duration) -> bool {
     let Ok(tx) = self.cmd_tx(device_id) else {
-      return;
+      return false;
     };
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     if tx.send(CastWorkerCmd::StopBestEffort { reply: reply_tx }).is_err() {
-      return;
+      return false;
     }
     match reply_rx.recv_timeout(timeout) {
-      Ok(()) => {},
+      Ok(()) => true,
       Err(RecvTimeoutError::Timeout) => {
         tracing::warn!(
           %device_id,
           timeout_ms = timeout.as_millis(),
           "warm Cast STOP best-effort timed out"
         );
+        false
       },
       Err(RecvTimeoutError::Disconnected) => {
         tracing::debug!(%device_id, "warm Cast STOP best-effort: worker gone");
+        false
       },
     }
   }
@@ -2084,17 +2088,17 @@ impl Drop for ShortReadTimeout<'_> {
 }
 
 impl WarmCastDevice {
-  /// TLS connect to the localhost Cast relay without host verification (same posture as
-  /// `CastDevice::connect_without_host_verification`), keeping a dual-owned TCP clone.
+  /// TLS connect to the localhost Cast relay with the Cast verifier (any device
+  /// certificate, including X.509 v1; handshake signature still checked against its
+  /// key — see `cast::tls`), keeping a dual-owned TCP clone.
   fn connect_local_relay(relay_port: u16) -> std::result::Result<Self, String> {
-    use rust_cast::NoCertificateVerification;
     use rust_cast::channels::connection::ConnectionChannel;
     use rust_cast::channels::heartbeat::HeartbeatChannel;
     use rust_cast::channels::media::MediaChannel;
     use rust_cast::channels::receiver::ReceiverChannel;
     use rust_cast::message_manager::MessageManager;
     use rustls::pki_types::ServerName;
-    use rustls::{ClientConfig, ClientConnection, StreamOwned};
+    use rustls::{ClientConnection, StreamOwned};
     use std::net::TcpStream;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -2108,10 +2112,7 @@ impl WarmCastDevice {
       .map_err(|err| format!("set_write_timeout: {err}"))?;
     let tcp_for_timeout = tcp.try_clone().map_err(|err| format!("tcp try_clone: {err}"))?;
 
-    let config = ClientConfig::builder()
-      .dangerous()
-      .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-      .with_no_client_auth();
+    let config = super::tls::client_config().map_err(|err| format!("tls config: {err}"))?;
     let server_name = ServerName::try_from("127.0.0.1")
       .map_err(|err| format!("server name: {err}"))?
       .to_owned();
@@ -2258,6 +2259,7 @@ mod tests {
     Device {
       id: id.to_owned(),
       name: "Test Nest".to_owned(),
+      model: String::new(),
       host: "127.0.0.1".to_owned(),
       hostname: "test.local".to_owned(),
       // Discard port — connect fails fast; worker still starts and accepts Shutdown.
@@ -2622,7 +2624,7 @@ mod tests {
   #[test]
   fn stop_best_effort_without_worker_is_noop() {
     let pool = CastPool::new(None);
-    pool.stop_best_effort("no-such", Duration::from_millis(100));
+    assert!(!pool.stop_best_effort("no-such", Duration::from_millis(100)));
   }
 
   #[test]
@@ -2696,7 +2698,7 @@ mod tests {
     assert_eq!(pool.device_ids().len(), 1);
     pool.shutdown();
     wait_until_worker_gone(&pool, &device.id);
-    assert!(pool.device_ids().is_empty());
+    assert_eq!(pool.device_ids(), Vec::<String>::new());
   }
 
   #[test]
@@ -2754,17 +2756,28 @@ mod tests {
     );
   }
 
-  // --- B4: terminal Cast cert failures ---
+  // --- B4: terminal Cast TLS failures ---
 
   #[test]
-  fn unsupported_cert_version_is_terminal() {
+  fn tls_peer_incompatible_is_terminal() {
     let msg = "connect 192.168.1.206:8009 (via local relay 127.0.0.1:9): \
-      invalid peer certificate: Other(OtherError(UnsupportedCertVersion))";
+      warm connection channel: peer is incompatible: NoCipherSuitesInCommon";
     assert_eq!(classify_cast_control_message(msg), CastFailureClass::Terminal);
     assert_eq!(
       classify_cast_control_error(&Error::Cast(msg.to_owned())),
       CastFailureClass::Terminal
     );
+  }
+
+  #[test]
+  fn certificate_errors_are_transient() {
+    // Certificate problems must never hide a device for the process lifetime.
+    for msg in [
+      "warm connection channel: invalid peer certificate: Other(OtherError(UnsupportedCertVersion))",
+      "warm connection channel: invalid peer certificate: BadSignature",
+    ] {
+      assert_eq!(classify_cast_control_message(msg), CastFailureClass::Transient, "{msg}");
+    }
   }
 
   #[test]

@@ -1,9 +1,11 @@
 //! Google Cast control plane (media load + transport).
 //!
 //! Payload construction is unit-tested without a device. Live connect/load uses
-//! `rust_cast` via [`CastPool`] (warm per-device worker threads).
+//! `rust_cast` channels via [`CastPool`] (warm per-device worker threads) over a TLS
+//! client that accepts self-signed and X.509 v1 device certificates (`tls`).
 
 mod pool;
+mod tls;
 
 pub use pool::CastPool;
 
