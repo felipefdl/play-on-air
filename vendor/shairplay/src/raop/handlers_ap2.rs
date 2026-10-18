@@ -5,6 +5,7 @@ use crate::crypto::pairing_homekit::{self, PairVerifyServer, SrpServer};
 #[cfg(feature = "video")]
 use crate::error::CryptoError;
 use crate::error::{ProtocolError, ShairplayError};
+use crate::net::ptp::AnchorMapping;
 use crate::proto::http::{HttpRequest, HttpResponse};
 use crate::raop::buffered_audio::{AnchorTime, FlushRequest, SetRateRequest};
 #[cfg(feature = "video")]
@@ -865,24 +866,30 @@ fn plist_uint(dict: &plist::Dictionary, key: &str) -> Option<u64> {
 }
 
 /// `rtpTime` plus anchor time of a rate-1 SETRATEANCHORTIME, mapped through the PTP follower
-/// when this session's timeline is locked.
+/// when this session's timeline is locked, or deferred to the delivery thread while it locks.
 fn parse_anchor(conn: &RaopConnection, dict: &plist::Dictionary) -> Option<(u32, AnchorTime)> {
     let rtp = plist_uint(dict, "rtpTime")? as u32;
     let secs = plist_uint(dict, "networkTimeSecs")?;
     let frac = plist_uint(dict, "networkTimeFrac").unwrap_or(0);
     let timeline_id = plist_uint(dict, "networkTimeTimelineID")?;
     let network_ns = crate::net::ptp::network_time_ns(secs, frac);
-    let clock = conn.shared.ptp_clock();
-    let time = conn
-        .timing
-        .to_local_ns(clock.as_ref(), timeline_id, network_ns, crate::util::mono_now_ns())
-        .map_or(
-            AnchorTime::Network {
-                timeline_id,
-                ns: network_ns,
-            },
-            AnchorTime::Local,
-        );
+    let time = match conn.timing.map_anchor(
+        conn.shared.ptp_clock(),
+        timeline_id,
+        network_ns,
+        crate::util::mono_now_ns(),
+    ) {
+        AnchorMapping::Locked(local) => AnchorTime::Local(local),
+        AnchorMapping::Locking(mapper) => AnchorTime::Locking {
+            timeline_id,
+            ns: network_ns,
+            mapper,
+        },
+        AnchorMapping::Unavailable => AnchorTime::Network {
+            timeline_id,
+            ns: network_ns,
+        },
+    };
     tracing::debug!(rtp, timeline_id, network_ns, ?time, "SETRATEANCHORTIME anchor");
     Some((rtp, time))
 }

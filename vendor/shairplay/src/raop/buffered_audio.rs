@@ -26,14 +26,20 @@
 //!   once a packet at `flushUntilSeq + 20` or later arrives.
 //!
 //! Anchors normally arrive already mapped to a local instant through the PTP follower
-//! ([`crate::net::ptp`]). When the follower cannot provide that mapping (ports owned by another
-//! PTP stack, not yet locked, or a timeline that is not a session peer) the reference receiver
-//! refuses the anchor; PlayOnAir plays anyway with the **unlocked fallback**: the first anchor on
-//! a timeline is mapped so its sample is released on receipt (`H = receipt + L`), and that
-//! sender-clock to local-clock offset is kept for later anchors on the same timeline so their
-//! relative timing (pause/resume, seeks) stays correct. If a later anchor lands more than
-//! [`FALLBACK_MAX_SKEW_NS`] away from "release on receipt", the offset is re-pinned, which
-//! bounds the error to that skew. Pacing stays real time either way.
+//! ([`crate::net::ptp`]). An anchor on a timeline the follower is still **locking** (a fresh
+//! session-peer timeline without enough samples yet, typically right after a new grandmaster
+//! appears) is deferred: the RTSP handler answers at once, and the delivery thread holds release
+//! and re-maps the anchor every [`LOCK_POLL_NS`] until the timeline locks, for at most
+//! [`LOCK_WAIT_NS`] after receipt. When the follower cannot provide the mapping (ports owned by
+//! another PTP stack, no lock within the wait, or a timeline that is not a session peer) the
+//! reference receiver refuses the anchor; PlayOnAir plays anyway with the **unlocked
+//! fallback**: the first anchor on a timeline is mapped so its sample is released on receipt
+//! (`H = receipt + L`), and that sender-clock to local-clock offset is kept for later anchors on
+//! the same timeline so their relative timing (pause/resume, seeks) stays correct. If a later
+//! anchor lands more than [`FALLBACK_MAX_SKEW_NS`] away from "release on receipt", the offset is
+//! re-pinned, which bounds the error to that skew. The pinned offset is dropped as soon as an
+//! anchor maps through a locked timeline, so it never outlives the lock. Pacing stays real time
+//! either way.
 //!
 //! Packets are stored compressed (decrypted AAC) and decoded on the delivery thread at release,
 //! so 120 s of buffer costs a few MiB instead of tens of MiB of PCM.
@@ -49,6 +55,7 @@ use tracing::{debug, info, warn};
 
 use crate::codec::aac::{AacDecoder, AudioSsrc};
 use crate::error::{CodecError, NetworkError, ShairplayError};
+use crate::net::ptp::{PtpMapper, TimelineMapping};
 use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler, AudioSession};
 use crate::util::mono_now_ns;
@@ -71,6 +78,10 @@ const AAC_FRAME_SAMPLES: i128 = 1024;
 /// Unlocked fallback: re-pin the sender-clock offset when an anchor lands farther than this
 /// from "release on receipt".
 const FALLBACK_MAX_SKEW_NS: i128 = NS_PER_SEC;
+/// Longest an anchor on a locking PTP timeline waits for lock before the unlocked fallback.
+const LOCK_WAIT_NS: u64 = 1_000_000_000;
+/// Re-map interval for an anchor waiting on lock (Sync arrives about every 125 ms).
+const LOCK_POLL_NS: u64 = 20_000_000;
 /// RTP clock assumed until the first packet names its format.
 const DEFAULT_SOURCE_RATE: u32 = 44_100;
 /// Reference receiver error for an invalid `SETRATEANCHORTIME` / `FLUSHBUFFERED` parameter.
@@ -132,7 +143,7 @@ impl RtpExtender {
 }
 
 /// When the sender wants the anchor sample presented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum AnchorTime {
     /// Already mapped to a local monotonic instant through a locked PTP timeline.
     Local(u64),
@@ -143,10 +154,20 @@ pub(crate) enum AnchorTime {
         /// Network time in nanoseconds.
         ns: u64,
     },
+    /// Network time on a timeline the follower is locking: mapped on the delivery thread once
+    /// it locks, or by the unlocked fallback after [`LOCK_WAIT_NS`].
+    Locking {
+        /// `networkTimeTimelineID`.
+        timeline_id: u64,
+        /// Network time in nanoseconds.
+        ns: u64,
+        /// The session's view of the follower.
+        mapper: PtpMapper,
+    },
 }
 
 /// Parsed `SETRATEANCHORTIME` request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SetRateRequest {
     /// `rate` as sent (only 0 and 1 are valid).
     pub(crate) rate: u64,
@@ -222,6 +243,17 @@ struct FallbackPin {
     offset_ns: i128,
 }
 
+/// An anchor waiting for its PTP timeline to lock.
+#[derive(Debug)]
+struct PendingAnchor {
+    rtp: u64,
+    timeline_id: u64,
+    ns: u64,
+    /// Local instant the anchor was received (fallback base and wait start).
+    receipt_ns: u64,
+    mapper: PtpMapper,
+}
+
 /// A packet due for the host.
 #[derive(Debug)]
 pub(crate) struct Released {
@@ -251,6 +283,8 @@ pub(crate) struct Playout {
     rtp: RtpExtender,
     /// Present only while rate is 1.
     anchor: Option<Anchor>,
+    /// Rate-1 anchor waiting for its PTP timeline to lock (release held meanwhile).
+    pending: Option<PendingAnchor>,
     source_rate: u32,
     latency_samples: u32,
     flush_rules: Vec<FlushRule>,
@@ -265,6 +299,7 @@ impl Playout {
             queue: BTreeMap::new(),
             rtp: RtpExtender::default(),
             anchor: None,
+            pending: None,
             source_rate: DEFAULT_SOURCE_RATE,
             latency_samples,
             flush_rules: Vec::new(),
@@ -335,34 +370,100 @@ impl Playout {
         match request.rate {
             0 => {
                 self.anchor = None;
+                self.pending = None;
                 self.fade_next = false;
                 info!(buffered_ms = self.buffered_ns() / 1_000_000, "Playout stopped (rate 0)");
             }
             1 => {
                 let (rtp, time) = request.anchor.ok_or(PlayoutError::MissingAnchor)?;
                 let rtp = self.rtp.extend(rtp);
-                let local_ns = self.resolve_anchor(time, now_ns);
-                self.anchor = Some(Anchor { rtp, local_ns });
+                self.anchor = None;
+                self.pending = None;
                 self.fade_next = true;
-                info!(
-                    anchor_rtp = rtp as u32,
-                    lead_ms = (local_ns - i128::from(now_ns)) / 1_000_000,
-                    buffered_ms = self.buffered_ns() / 1_000_000,
-                    "Playout anchored (rate 1)"
-                );
+                match time {
+                    AnchorTime::Local(local) => {
+                        self.drop_fallback_pin();
+                        self.start(rtp, i128::from(local), now_ns);
+                    }
+                    AnchorTime::Network { timeline_id, ns } => {
+                        let local_ns = self.fallback(timeline_id, ns, now_ns);
+                        self.start(rtp, local_ns, now_ns);
+                    }
+                    AnchorTime::Locking {
+                        timeline_id,
+                        ns,
+                        mapper,
+                    } => {
+                        info!(
+                            anchor_rtp = rtp as u32,
+                            timeline_id = format_args!("{timeline_id:#018x}"),
+                            max_wait_ms = LOCK_WAIT_NS / 1_000_000,
+                            "PTP locking on the anchor timeline; playout deferred until lock"
+                        );
+                        self.pending = Some(PendingAnchor {
+                            rtp,
+                            timeline_id,
+                            ns,
+                            receipt_ns: now_ns,
+                            mapper,
+                        });
+                    }
+                }
             }
             other => return Err(PlayoutError::InvalidRate(other)),
         }
         Ok(self.first_available())
     }
 
-    fn resolve_anchor(&mut self, time: AnchorTime, now_ns: u64) -> i128 {
-        let (timeline_id, ns) = match time {
-            AnchorTime::Local(local) => return i128::from(local),
-            AnchorTime::Network { timeline_id, ns } => (timeline_id, ns),
+    fn start(&mut self, rtp: u64, local_ns: i128, now_ns: u64) {
+        self.anchor = Some(Anchor { rtp, local_ns });
+        info!(
+            anchor_rtp = rtp as u32,
+            lead_ms = (local_ns - i128::from(now_ns)) / 1_000_000,
+            buffered_ms = self.buffered_ns() / 1_000_000,
+            "Playout anchored (rate 1)"
+        );
+    }
+
+    /// A locked timeline now maps anchors: the unlocked offset must not be reused.
+    fn drop_fallback_pin(&mut self) {
+        if let Some(pin) = self.fallback_pin.take() {
+            info!(
+                timeline_id = format_args!("{:#018x}", pin.timeline_id),
+                "PTP locked; unlocked anchor fallback dropped"
+            );
+        }
+    }
+
+    /// Map a deferred anchor at `now_ns`: through PTP once locked, through the unlocked
+    /// fallback (based on its receipt time) when the wait expires or lock is no longer coming.
+    /// Returns the next instant to retry while still waiting.
+    fn resolve_pending(&mut self, pending: PendingAnchor, now_ns: u64) -> Option<u64> {
+        let deadline = pending.receipt_ns.saturating_add(LOCK_WAIT_NS);
+        let waited_ms = now_ns.saturating_sub(pending.receipt_ns) / 1_000_000;
+        let local_ns = match pending.mapper.map(pending.timeline_id, pending.ns, now_ns) {
+            TimelineMapping::Locked(local) => {
+                debug!(waited_ms, "Deferred anchor mapped through PTP");
+                self.drop_fallback_pin();
+                i128::from(local)
+            }
+            TimelineMapping::Locking if now_ns < deadline => {
+                self.pending = Some(pending);
+                return Some(now_ns.saturating_add(LOCK_POLL_NS).min(deadline));
+            }
+            TimelineMapping::Locking | TimelineMapping::Unavailable => {
+                debug!(waited_ms, "PTP did not lock for the deferred anchor");
+                self.fallback(pending.timeline_id, pending.ns, pending.receipt_ns)
+            }
         };
+        self.start(pending.rtp, local_ns, now_ns);
+        None
+    }
+
+    /// Unlocked fallback for an anchor received at `receipt_ns`.
+    fn fallback(&mut self, timeline_id: u64, ns: u64, receipt_ns: u64) -> i128 {
         // Release-on-receipt target for the anchor sample.
-        let target = i128::from(now_ns) + self.latency_ns();
+        let target = i128::from(receipt_ns) + self.latency_ns();
         if let Some(pin) = self.fallback_pin
             && pin.timeline_id == timeline_id
         {
@@ -406,6 +507,7 @@ impl Playout {
                 let discarded = self.queue.len();
                 self.queue.clear();
                 self.anchor = None;
+                self.pending = None;
                 self.fade_next = false;
                 self.rtp = RtpExtender::default();
                 self.flush_rules.clear();
@@ -417,6 +519,11 @@ impl Playout {
 
     /// Next packet due at `now_ns`, pruning packets already behind the playhead.
     pub(crate) fn poll(&mut self, now_ns: u64) -> Poll {
+        if let Some(pending) = self.pending.take()
+            && let Some(retry) = self.resolve_pending(pending, now_ns)
+        {
+            return Poll::Wait(retry);
+        }
         let Some(anchor) = self.anchor else {
             return Poll::Idle;
         };
@@ -503,9 +610,10 @@ pub(crate) struct PlayoutHandle {
 impl PlayoutHandle {
     /// Apply SETRATEANCHORTIME; returns `firstAvailableSampleTS`.
     pub(crate) fn set_rate(&self, request: SetRateRequest) -> Result<Option<u32>, PlayoutError> {
+        let rate = request.rate;
         let mut state = self.shared.lock();
         let reply = state.playout.set_rate(request, mono_now_ns())?;
-        if let Ok(rate) = u32::try_from(request.rate) {
+        if let Ok(rate) = u32::try_from(rate) {
             state.events.push(HostEvent::Rate(rate));
         }
         drop(state);
@@ -868,7 +976,10 @@ fn delivery_loop(shared: &Shared, mut output: Output) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
+    use crate::net::ptp::PtpClock;
 
     const SR: u32 = 44_100;
     const FRAME: u32 = 1024;
@@ -1177,6 +1288,155 @@ mod tests {
             last = Some(r.rtp);
         }
         assert_eq!(last, Some(20 * FRAME));
+        match p.poll(at) {
+            Poll::Wait(until) => assert_eq!(until, at + frame_ns(u64::from(FRAME))),
+            other => panic!("expected wait, got {other:?}"),
+        }
+    }
+
+    const GM: u64 = 0xC06C_0CEF_CF00_0008;
+    /// Sender clock = local monotonic clock + this.
+    const PTP_OFFSET: u64 = 1_000_000 * S;
+
+    fn ptp_peer() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))
+    }
+
+    /// One Sync sample on `GM` received at local `rx_ns`.
+    fn sync_sample(clock: &PtpClock, rx_ns: u64) {
+        clock.add_sample(GM, ptp_peer(), (rx_ns + PTP_OFFSET) as i64, rx_ns);
+    }
+
+    fn locking(rtp: u32, ns: u64, clock: &PtpClock) -> SetRateRequest {
+        SetRateRequest {
+            rate: 1,
+            anchor: Some((
+                rtp,
+                AnchorTime::Locking {
+                    timeline_id: GM,
+                    ns,
+                    mapper: PtpMapper::new(clock.clone(), vec![ptp_peer()]),
+                },
+            )),
+        }
+    }
+
+    /// The live log: the first anchor came before any Sync (unlocked fallback pinned), the
+    /// next one 200 ms after a new grandmaster appeared. That anchor holds release until the
+    /// timeline locks, then maps through PTP and drops the fallback offset.
+    #[test]
+    fn anchor_on_locking_timeline_waits_for_lock_and_maps_through_ptp() {
+        let mut p = Playout::new(LATENCY);
+        fill(&mut p, 1, 0, 400);
+        let early = SetRateRequest {
+            rate: 1,
+            anchor: Some((
+                0,
+                AnchorTime::Network {
+                    timeline_id: GM,
+                    ns: PTP_OFFSET + 5 * S,
+                },
+            )),
+        };
+        p.set_rate(early, 4 * S).unwrap();
+        assert!(p.fallback_pin.is_some(), "no timeline yet: fallback pinned");
+        p.set_rate(SetRateRequest { rate: 0, anchor: None }, 5 * S).unwrap();
+
+        let clock = PtpClock::new();
+        sync_sample(&clock, 6 * S);
+        let at = 6 * S + 200_000_000;
+        // The sender wants rtp 0 presented at local 9 s.
+        p.set_rate(locking(0, PTP_OFFSET + 9 * S, &clock), at).unwrap();
+        match p.poll(at) {
+            Poll::Wait(until) => assert_eq!(until, at + LOCK_POLL_NS, "re-map soon"),
+            other => panic!("expected the lock wait, got {other:?}"),
+        }
+        assert!(p.anchor.is_none(), "release held while locking");
+
+        for i in 1..4 {
+            sync_sample(&clock, 6 * S + i * 125_000_000);
+        }
+        match p.poll(6 * S + 400_000_000) {
+            Poll::Wait(until) => assert_eq!(until, 7 * S, "PTP-mapped presentation minus latency"),
+            other => panic!("expected the PTP-mapped wait, got {other:?}"),
+        }
+        assert!(p.fallback_pin.is_none(), "lock drops the fallback offset");
+        let Poll::Release(first) = p.poll(7 * S) else {
+            panic!("anchor sample due at its PTP time minus latency");
+        };
+        assert_eq!(first.rtp, 0);
+        assert!(first.fade_in, "deferred anchor start still fades in");
+    }
+
+    /// A timeline that keeps locking past the bounded wait falls back to release on receipt,
+    /// based on the anchor's receipt time.
+    #[test]
+    fn anchor_on_locking_timeline_falls_back_after_bounded_wait() {
+        let mut p = Playout::new(LATENCY);
+        fill(&mut p, 1, 0, 400);
+        let clock = PtpClock::new();
+        sync_sample(&clock, S);
+        let receipt = S + 100_000_000;
+        let ns = PTP_OFFSET + 50 * S;
+        p.set_rate(locking(0, ns, &clock), receipt).unwrap();
+        match p.poll(receipt) {
+            Poll::Wait(until) => assert_eq!(until, receipt + LOCK_POLL_NS),
+            other => panic!("expected the lock wait, got {other:?}"),
+        }
+        match p.poll(receipt + LOCK_WAIT_NS - 1) {
+            Poll::Wait(until) => assert_eq!(until, receipt + LOCK_WAIT_NS, "never past the bound"),
+            other => panic!("expected the bounded wait, got {other:?}"),
+        }
+        assert!(p.anchor.is_none());
+
+        assert_eq!(
+            release_rtp(p.poll(receipt + LOCK_WAIT_NS)),
+            0,
+            "fallback releases on receipt"
+        );
+        let pin = p.fallback_pin.expect("fallback pinned");
+        assert_eq!(pin.timeline_id, GM);
+        assert_eq!(
+            pin.offset_ns,
+            i128::from(ns) - i128::from(receipt) - 2 * NS_PER_SEC,
+            "pinned to receipt plus latency"
+        );
+    }
+
+    /// Once an anchor maps through a locked timeline, the fallback offset is gone: a later
+    /// unlocked anchor (lock lost) re-pins on its own receipt instead of reusing the old offset.
+    #[test]
+    fn fallback_offset_dropped_once_an_anchor_maps_through_ptp() {
+        let mut p = Playout::new(LATENCY);
+        fill(&mut p, 1, 0, 400);
+        let network = |rtp: u32, ns: u64| SetRateRequest {
+            rate: 1,
+            anchor: Some((rtp, AnchorTime::Network { timeline_id: GM, ns })),
+        };
+        let receipt = 7 * S;
+        p.set_rate(network(0, PTP_OFFSET), receipt).unwrap();
+        assert_eq!(release_rtp(p.poll(receipt)), 0);
+        assert!(p.fallback_pin.is_some());
+
+        p.set_rate(SetRateRequest { rate: 0, anchor: None }, 8 * S).unwrap();
+        p.set_rate(play(FRAME, 20 * S), 10 * S).unwrap();
+        assert!(p.fallback_pin.is_none(), "locked anchor drops the fallback offset");
+        match p.poll(10 * S) {
+            Poll::Wait(until) => assert_eq!(until, 18 * S),
+            other => panic!("expected the PTP wait, got {other:?}"),
+        }
+
+        // The old pin would map this anchor to 14.5 s (within the re-pin skew); a fresh pin
+        // presents it at receipt plus latency, 14 s.
+        p.set_rate(SetRateRequest { rate: 0, anchor: None }, 11 * S).unwrap();
+        let at = 12 * S;
+        p.set_rate(network(2 * FRAME, PTP_OFFSET + 5 * S + 500_000_000), at)
+            .unwrap();
+        let mut last = None;
+        while let Poll::Release(r) = p.poll(at) {
+            last = Some(r.rtp);
+        }
+        assert_eq!(last, Some(2 * FRAME));
         match p.poll(at) {
             Poll::Wait(until) => assert_eq!(until, at + frame_ns(u64::from(FRAME))),
             other => panic!("expected wait, got {other:?}"),

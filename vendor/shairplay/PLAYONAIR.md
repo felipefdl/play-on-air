@@ -58,10 +58,16 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
     epoch, and drops incoming seq before `flushUntilSeq` (exclusive). Range flush keeps playing,
     trims the queue from `flushFromTS` to the end, and drops seq in `[flushFromSeq, flushUntilSeq)`.
     Rules retire at `flushUntilSeq + 20`. Missing `flushUntilSeq` answers `status` -6705.
-20. **Unlocked anchor fallback** (deviation, below). When the PTP follower cannot map an anchor,
-    the first anchor on a timeline is mapped to "release on receipt" (`H = receipt +
-    Audio-Latency`) and that offset is pinned for later anchors on the same timeline; it re-pins
-    when an anchor lands more than 1 s from release-on-receipt. Warns once per stream.
+20. **Unlocked anchor fallback** (deviation, below). An anchor on a timeline the follower is
+    *locking* (fresh session-peer timeline with fewer than 4 samples, e.g. a grandmaster that
+    appeared just before the anchor) is deferred: the RTSP reply is immediate, the delivery thread
+    holds release and re-maps every 20 ms, and plays through PTP as soon as the timeline locks, at
+    most 1 s after receipt. Otherwise (unknown, foreign or stale timeline, no follower, or no lock
+    within 1 s) the first anchor on a timeline is mapped to "release on receipt" (`H = receipt +
+    Audio-Latency`, receipt being the SETRATEANCHORTIME arrival) and that offset is pinned for
+    later anchors on the same timeline; it re-pins when an anchor lands more than 1 s from
+    release-on-receipt. The pin is dropped as soon as any anchor maps through a locked timeline,
+    so later anchors never reuse a pre-lock offset. Warns once per stream.
 21. **AirPlay 2 only — AirPlay 1 stack removed** (AGENTS.md "AP2 only"). Deleted: `airport.key` and
     `crypto::rsa` (Apple-Challenge / `Apple-Response`, `rsaaeskey`), `crypto::pairing` + `crypto::aes`
     (legacy Ed25519 pair-setup/verify fallback), `proto::sdp` + ANNOUNCE, `Transport`-header SETUP,
@@ -120,8 +126,10 @@ removing video is out of scope.
 - **Unlocked anchors still play:** Apple's receiver rejects SETRATEANCHORTIME until its PTP clock
   is locked on the anchor's grandmaster. PlayOnAir must play on hosts where 319/320 are taken
   (macOS with AirPlay Receiver on, non-root CI) and before lock, so it uses the item 20 fallback.
-  Pacing stays real time; only the absolute start offset can differ from the sender's intent
-  (bounded by 1 s after the first anchor). The PTP follower never transmits and does not take part
+  An anchor that arrives while its timeline is locking waits up to 1 s for lock first, so a session
+  that starts right after a new grandmaster still plays through PTP. Pacing stays real time; only
+  the absolute start offset can differ from the sender's intent (bounded by 1 s after the first
+  unlocked anchor). The PTP follower never transmits and does not take part
   in master election.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

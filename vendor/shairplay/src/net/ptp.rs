@@ -22,6 +22,9 @@
 //! Lock: a timeline is locked once [`LOCK_MIN_SAMPLES`] samples are in the filter and the newest
 //! is younger than [`LOCK_STALE_NS`]. Only timelines whose last sender address is in the
 //! session's peer set (SETUP `timingPeerInfo`, SETPEERS / SETPEERSX) are used for that session.
+//! A fresh peer timeline with fewer samples is *locking* (it locks within about half a second
+//! at 8 Hz Sync): an anchor on it is deferred until lock rather than falling back at once
+//! ([`AnchorMapping::Locking`]).
 //!
 //! Sockets are bound once per process for a given fixed port pair and shared by every
 //! [`crate::RaopServer`] that asks for it, so several advertised receivers in one process do not
@@ -193,9 +196,20 @@ fn parse_timestamp_message(buf: &[u8]) -> Option<TimestampMessage> {
 /// Grandmaster offsets learned from Sync / Follow_Up traffic, keyed by clock identity.
 ///
 /// Cheap to clone (shared state). Times are local [`mono_now_ns`] nanoseconds.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PtpClock {
     state: Arc<Mutex<ClockState>>,
+}
+
+/// What the follower can do with a network time on one timeline, for one session, now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimelineMapping {
+    /// Locked: the network time maps to this local monotonic instant (ns).
+    Locked(u64),
+    /// A session-peer timeline with fresh samples, not yet enough of them to lock.
+    Locking,
+    /// Unknown timeline, not a session peer, or stale: no lock is coming soon.
+    Unavailable,
 }
 
 impl PtpClock {
@@ -256,21 +270,74 @@ impl PtpClock {
 
     /// Map a network time on `timeline_id` to a local monotonic instant (ns).
     ///
-    /// Returns `None` unless the timeline is locked at `now_ns` and its sender address is one
-    /// of `peers`.
-    pub(crate) fn to_local_ns(&self, timeline_id: u64, network_ns: u64, peers: &[IpAddr], now_ns: u64) -> Option<u64> {
+    /// Locked when the timeline has [`LOCK_MIN_SAMPLES`] samples, its newest sample is fresh at
+    /// `now_ns`, and its sender address is one of `peers`; locking when only the sample count
+    /// is missing.
+    pub(crate) fn map(&self, timeline_id: u64, network_ns: u64, peers: &[IpAddr], now_ns: u64) -> TimelineMapping {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let timeline = state.timelines.iter().find(|t| t.clock_id == timeline_id)?;
-        if !peers.contains(&timeline.source)
-            || timeline.filter.samples < LOCK_MIN_SAMPLES
-            || now_ns.saturating_sub(timeline.last_sample_ns) > LOCK_STALE_NS
-        {
-            return None;
+        let Some(timeline) = state.timelines.iter().find(|t| t.clock_id == timeline_id) else {
+            return TimelineMapping::Unavailable;
+        };
+        if !peers.contains(&timeline.source) || now_ns.saturating_sub(timeline.last_sample_ns) > LOCK_STALE_NS {
+            return TimelineMapping::Unavailable;
         }
-        let offset = timeline.filter.estimate()?;
-        let local = i128::from(network_ns) - i128::from(offset);
-        u64::try_from(local).ok()
+        if timeline.filter.samples < LOCK_MIN_SAMPLES {
+            return TimelineMapping::Locking;
+        }
+        timeline
+            .filter
+            .estimate()
+            .and_then(|offset| u64::try_from(i128::from(network_ns) - i128::from(offset)).ok())
+            .map_or(TimelineMapping::Unavailable, TimelineMapping::Locked)
     }
+
+    /// [`Self::map`] reduced to the locked instant.
+    #[cfg(test)]
+    pub(crate) fn to_local_ns(&self, timeline_id: u64, network_ns: u64, peers: &[IpAddr], now_ns: u64) -> Option<u64> {
+        match self.map(timeline_id, network_ns, peers, now_ns) {
+            TimelineMapping::Locked(local) => Some(local),
+            TimelineMapping::Locking | TimelineMapping::Unavailable => None,
+        }
+    }
+
+    /// Inject one offset sample (`master_ns` observed at local `rx_ns`) as a Sync pair would.
+    #[cfg(test)]
+    pub(crate) fn add_sample(&self, clock_id: u64, source: IpAddr, master_ns: i64, rx_ns: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add_sample(clock_id, source, master_ns, rx_ns);
+    }
+}
+
+/// A session's view of the PTP follower (clock plus the peer set at anchor time), carried by a
+/// deferred anchor so the delivery thread can map it once the timeline locks.
+#[derive(Clone, Debug)]
+pub(crate) struct PtpMapper {
+    clock: PtpClock,
+    peers: Vec<IpAddr>,
+}
+
+impl PtpMapper {
+    pub(crate) const fn new(clock: PtpClock, peers: Vec<IpAddr>) -> Self {
+        Self { clock, peers }
+    }
+
+    /// [`PtpClock::map`] for this session's peers.
+    pub(crate) fn map(&self, timeline_id: u64, network_ns: u64, now_ns: u64) -> TimelineMapping {
+        self.clock.map(timeline_id, network_ns, &self.peers, now_ns)
+    }
+}
+
+/// How a `SETRATEANCHORTIME` network time maps for a session.
+#[derive(Debug)]
+pub(crate) enum AnchorMapping {
+    /// Mapped to this local monotonic instant (ns).
+    Locked(u64),
+    /// The timeline is locking: map later through this mapper.
+    Locking(PtpMapper),
+    /// No PTP mapping (not PTP timing, no follower, unknown, foreign or stale timeline).
+    Unavailable,
 }
 
 impl ClockState {
@@ -582,18 +649,22 @@ impl SessionTiming {
         self.peers = peers;
     }
 
-    /// Map an anchor network time to a local instant through `clock`, if locked for this session.
-    pub(crate) fn to_local_ns(
+    /// Map an anchor network time through `clock` for this session.
+    pub(crate) fn map_anchor(
         &self,
-        clock: Option<&PtpClock>,
+        clock: Option<PtpClock>,
         timeline_id: u64,
         network_ns: u64,
         now_ns: u64,
-    ) -> Option<u64> {
-        if !self.ptp {
-            return None;
+    ) -> AnchorMapping {
+        let Some(clock) = clock.filter(|_| self.ptp) else {
+            return AnchorMapping::Unavailable;
+        };
+        match clock.map(timeline_id, network_ns, &self.peers, now_ns) {
+            TimelineMapping::Locked(local) => AnchorMapping::Locked(local),
+            TimelineMapping::Locking => AnchorMapping::Locking(PtpMapper::new(clock, self.peers.clone())),
+            TimelineMapping::Unavailable => AnchorMapping::Unavailable,
         }
-        clock?.to_local_ns(timeline_id, network_ns, &self.peers, now_ns)
     }
 }
 
@@ -673,6 +744,55 @@ mod tests {
             None,
             "stale lock"
         );
+    }
+
+    /// A fresh session-peer timeline is locking until it has enough samples; unknown, foreign
+    /// or stale timelines are unavailable (no wait is worth it); a non-PTP session never maps.
+    #[test]
+    fn timeline_reports_locking_before_lock() {
+        let clock = PtpClock::new();
+        let offset = 1_000_000_000_000u64;
+        let peers = [sender()];
+        assert_eq!(
+            clock.map(GM, offset, &peers, 0),
+            TimelineMapping::Unavailable,
+            "unknown"
+        );
+        feed_pair(&clock, 0, 5_000_000_000 + offset, 5_000_000_000);
+        assert_eq!(clock.map(GM, offset, &peers, 5_100_000_000), TimelineMapping::Locking);
+        let stranger = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))];
+        assert_eq!(
+            clock.map(GM, offset, &stranger, 5_100_000_000),
+            TimelineMapping::Unavailable,
+            "not a session peer"
+        );
+        assert_eq!(
+            clock.map(GM, offset, &peers, 5_000_000_000 + LOCK_STALE_NS + 1),
+            TimelineMapping::Unavailable,
+            "stale"
+        );
+
+        let mut setup = plist::Dictionary::new();
+        setup.insert("timingProtocol".into(), "PTP".into());
+        let mut timing = SessionTiming::default();
+        timing.configure_from_setup(&setup);
+        timing.replace_peers(&["192.168.1.20".into()]);
+        let AnchorMapping::Locking(mapper) = timing.map_anchor(Some(clock.clone()), GM, offset, 5_100_000_000) else {
+            panic!("session sees the timeline locking");
+        };
+        for seq in 1..LOCK_MIN_SAMPLES as u16 {
+            let rx = 5_000_000_000 + u64::from(seq) * 125_000_000;
+            feed_pair(&clock, seq, rx + offset, rx);
+        }
+        assert_eq!(
+            mapper.map(GM, offset + 7_000_000_000, 5_500_000_000),
+            TimelineMapping::Locked(7_000_000_000),
+            "the deferred mapper sees the lock"
+        );
+        assert!(matches!(
+            SessionTiming::default().map_anchor(Some(clock), GM, offset, 5_500_000_000),
+            AnchorMapping::Unavailable
+        ));
     }
 
     /// Queuing delay only lowers raw samples; the filter keeps the least-delayed one and ignores
