@@ -9,6 +9,7 @@
 - **Volume curve matches the iPhone slider**: the bottom of the slider is silent and the middle is half volume.
 - Fix: Cast TVs with X.509 v1 certificates (for example Samsung The Frame) connect and are advertised.
 - Fix: Chromecasts with only an IPv6 address work; speakers that share a name get stable, distinct AirPlay names.
+- Google Home speaker groups play as one AirPlay speaker; their volume slider scales the member speakers and keeps their balance, including after switching to the group from a single speaker mid-song.
 - Temporary Google speaker groups no longer show up as extra AirPlay speakers; groups made in the Google Home app still do.
 - AirPlay 1 is removed; PlayOnAir is AirPlay 2 only.
 
