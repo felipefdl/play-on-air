@@ -11,7 +11,7 @@
 //! - deadline-based PING, drain unsolicited messages, answer device PINGs
 //! - parse errors are not ownership theft; IDLE recover-then-kick policy
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -71,6 +71,13 @@ const OWN_COMMAND_SETTLE: Duration = Duration::from_millis(1_500);
 /// Volume differences below this are the same level (Cast reports floats with noise).
 const VOLUME_MATCH_EPSILON: f32 = 0.005;
 
+/// A reported level equal to one we commanded this recently is our echo, however late it
+/// arrives. Group endpoints replay a slider drag's intermediate levels seconds afterwards.
+const VOLUME_ECHO_WINDOW: Duration = Duration::from_secs(10);
+
+/// Commanded levels remembered for echo matching (a fast slider drag sends ~10 per second).
+const VOLUME_ECHO_HISTORY: usize = 128;
+
 /// Player state we commanded last (only PLAYING / PAUSED are attributable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlayerIntent {
@@ -82,7 +89,8 @@ enum PlayerIntent {
 ///
 /// Player state: only while our media session is live (an intent is set on LOAD / PLAY /
 /// PAUSE and cleared when the session ends). Volume: always, against the last level we set
-/// or observed. Within [`OWN_COMMAND_SETTLE`] of our own command, observations are ignored
+/// or observed; any level we commanded within [`VOLUME_ECHO_WINDOW`] is an echo, not a user
+/// change. Within [`OWN_COMMAND_SETTLE`] of our own command, observations are ignored
 /// entirely; a real user change in that window is still caught by the next status after it.
 #[derive(Debug, Default)]
 struct RemoteTracker {
@@ -90,6 +98,7 @@ struct RemoteTracker {
   player_settle_until: Option<Instant>,
   volume: Option<(f32, bool)>,
   volume_settle_until: Option<Instant>,
+  commanded_levels: VecDeque<(f32, Instant)>,
 }
 
 impl RemoteTracker {
@@ -124,14 +133,31 @@ impl RemoteTracker {
     })
   }
 
-  /// We are about to set the receiver level.
-  fn expect_volume_command(&mut self, now: Instant) {
+  /// We are about to set the receiver to `level`.
+  fn expect_volume_command(&mut self, level: f32, now: Instant) {
     self.volume_settle_until = Some(now + OWN_COMMAND_SETTLE);
+    if self.commanded_levels.len() == VOLUME_ECHO_HISTORY {
+      let _oldest = self.commanded_levels.pop_front();
+    }
+    self.commanded_levels.push_back((volume_level_clamped(level), now));
   }
 
   /// Level we set or read ourselves: the new baseline, never reported.
   const fn note_volume(&mut self, level: f32, muted: bool) {
     self.volume = Some((volume_level_clamped(level), muted));
+  }
+
+  /// Whether `level` matches a level we commanded within [`VOLUME_ECHO_WINDOW`].
+  fn is_volume_echo(&mut self, level: f32, now: Instant) -> bool {
+    while let Some(&(_, at)) = self.commanded_levels.front()
+      && now.saturating_duration_since(at) > VOLUME_ECHO_WINDOW
+    {
+      let _expired = self.commanded_levels.pop_front();
+    }
+    self
+      .commanded_levels
+      .iter()
+      .any(|&(commanded, _)| (commanded - level).abs() < VOLUME_MATCH_EPSILON)
   }
 
   /// A receiver status reported `level` / `muted`.
@@ -142,6 +168,9 @@ impl RemoteTracker {
     let level = volume_level_clamped(reported_level);
     let previous = self.volume.replace((level, muted))?;
     if (previous.0 - level).abs() < VOLUME_MATCH_EPSILON && previous.1 == muted {
+      return None;
+    }
+    if previous.1 == muted && self.is_volume_echo(level, now) {
       return None;
     }
     Some(CastRemoteKind::Volume { level, muted })
@@ -2403,7 +2432,7 @@ impl WorkerState {
     if self.device.is_none() {
       self.ensure_connected(true)?;
     }
-    self.remote.expect_volume_command(Instant::now());
+    self.remote.expect_volume_command(clamped, Instant::now());
     let first = {
       let device = self
         .device
@@ -2958,7 +2987,7 @@ mod tests {
   }
 
   mod remote_tracker {
-    use super::super::{CastRemoteKind, OWN_COMMAND_SETTLE, PlayerIntent, RemoteTracker};
+    use super::super::{CastRemoteKind, OWN_COMMAND_SETTLE, PlayerIntent, RemoteTracker, VOLUME_ECHO_WINDOW};
     use rust_cast::channels::media::PlayerState;
     use std::time::{Duration, Instant};
 
@@ -3025,7 +3054,7 @@ mod tests {
       // First observation is only a baseline.
       assert_eq!(tracker.observe_volume(0.4, false, t0), None);
       // Our own set: baseline moves, broadcasts of it (and stale ones in the window) are quiet.
-      tracker.expect_volume_command(t0);
+      tracker.expect_volume_command(0.7, t0);
       tracker.note_volume(0.7, false);
       assert_eq!(tracker.observe_volume(0.4, false, t0), None, "stale pre-command status");
       let t1 = after_settle(t0);
@@ -3041,6 +3070,38 @@ mod tests {
         Some(CastRemoteKind::Volume { level: 0.8, muted: true })
       );
       assert_eq!(tracker.observe_volume(0.8, true, t1), None);
+    }
+
+    /// A group endpoint replays a slider drag's intermediate levels seconds after the drag
+    /// (seen live around a pause): those are our echoes, not user changes to send back.
+    #[test]
+    fn late_replay_of_commanded_levels_is_not_reported() {
+      let t0 = Instant::now();
+      let mut tracker = RemoteTracker::default();
+      assert_eq!(tracker.observe_volume(0.55, false, t0), None);
+      for (step, level) in [0.547_f32, 0.524, 0.500, 0.487, 0.476, 0.454, 0.430, 0.399]
+        .into_iter()
+        .enumerate()
+      {
+        let at = t0 + Duration::from_millis(100 * u64::try_from(step).unwrap());
+        tracker.expect_volume_command(level, at);
+        tracker.note_volume(level, false);
+      }
+      let late = t0 + Duration::from_secs(3);
+      for level in [0.500_06, 0.487_06, 0.476_05, 0.454_05, 0.430_04, 0.399_03] {
+        assert_eq!(tracker.observe_volume(level, false, late), None, "replayed echo {level}");
+      }
+      // A level we never commanded is still the user's.
+      assert_eq!(
+        tracker.observe_volume(0.25, false, late),
+        Some(CastRemoteKind::Volume { level: 0.25, muted: false })
+      );
+      // Once the window passes, an old commanded level counts as a user change again.
+      let much_later = t0 + VOLUME_ECHO_WINDOW + Duration::from_secs(5);
+      assert_eq!(
+        tracker.observe_volume(0.5, false, much_later),
+        Some(CastRemoteKind::Volume { level: 0.5, muted: false })
+      );
     }
   }
 
