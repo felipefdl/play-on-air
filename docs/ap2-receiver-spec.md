@@ -195,7 +195,7 @@ for framing, High for 24-bit comparison.
 | Topic | Fork | Apple |
 |---|---|---|
 | Anchor time | Locked PTP timeline of a session peer maps network time to local monotonic time (`vendor/shairplay/src/net/ptp.rs`); unlocked or foreign timeline uses the pinned receipt-time fallback (`buffered_audio.rs`, `Playout::resolve_anchor`) | Network time on the PTP timeline maps to host time; unlocked anchors are rejected |
-| Release | Packet handed to the host at presentation minus `Audio-Latency` (the Cast cushion), on a 64-bit RTP timeline | Renderer presents at `H(anchor) + (r - anchor_rtp) / rate`, compensating device latency |
+| Release | Packet handed to the host at presentation minus the release lead, on a 64-bit RTP timeline. PlayOnAir sets the lead to its Cast read-ahead (8 s, `CAST_READ_AHEAD`, never below `Audio-Latency`) so audio the sender queued ahead is in the host ring when Cast (re)LOADs and goes out as one burst; Cast speakers start on buffered bytes, not time. The sender still sees `Audio-Latency` (2 s), and the speaker plays up to the lead ahead of the sender's timeline (no A/V sync promise) | Renderer presents at `H(anchor) + (r - anchor_rtp) / rate`, compensating device latency |
 | Start alignment | No nudge; packets whose end is behind the playhead are pruned; 30 ms fade-in per anchor | Same |
 | Rate 0 | Stop, buffer kept, anchor cleared | Same |
 | Non-0/1 rates | Plist `status` -6705 | Same |
@@ -277,6 +277,10 @@ Confidence: Medium (`[INFERENCE]` that senders follow this, from the receiver's 
   range flush otherwise, from inclusive / until exclusive, rules retired at `flushUntilSeq + 20`.
   Flush-all stops playback and resets anchor and RTP epoch; range flush keeps playing, trims from
   `flushFromTS` to the end and continues the epoch from the cut.
+- Only a flush-all notifies the host (`AudioSession::on_flush`): everything the host already holds
+  predates the next anchor, so PlayOnAir re-LOADs Cast once that anchor's audio is queued. A range
+  flush keeps playing and trims only the queue, so the host is not told (audio already handed over
+  past `flushFromTS`, at most the release lead, still plays).
 - Missing `flushUntilSeq` answers plist `status` -6705. A successful flush answers empty (no
   `RTP-Info`).
 

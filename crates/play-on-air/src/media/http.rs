@@ -25,15 +25,17 @@ use crate::audio::{
 };
 use crate::error::{Error, Result};
 
-// ── Live stream pacing / cushion constants ──────────────────────────────────
+// ── Live stream pacing / read-ahead constants ───────────────────────────────
 //
-// Three layers keep Nest from underrunning:
-// 1. Bridge prebuffer (one FLAC block of real PCM) before Cast LOAD: audio is flowing. The
-//    AirPlay producer is paced on the sender timeline (real time), so PCM that accumulates
-//    while Cast LOADs is the only backlog.
-// 2. Silence preroll (~2 s) at body start, unpaced — Cast-side cushion; counts
-//    toward `frames_emitted` so the pacer starts ~LIVE_LEAD ahead.
-// 3. LIVE_LEAD (~2 s) steady-state pace cap — Nest may not pull further ahead.
+// Cast speakers start playing once enough *bytes* are buffered (measured on Nest Audio and
+// Nest Mini, `CAST_READ_AHEAD`), so a fresh LOAD must get real audio in a burst:
+// 1. shairplay hands buffered audio to the ring `CAST_READ_AHEAD` before its presentation
+//    time (`RaopServerBuilder::release_lead`), so the ring already holds up to that much real
+//    PCM when Cast GETs `/stream` after a LOAD or re-LOAD.
+// 2. The body bursts that queued PCM unpaced, up to `CAST_READ_AHEAD` ahead of wall clock;
+//    pacing then holds Cast at that lead in steady state.
+// 3. Silence preroll only when the ring is empty at GET (a genuinely empty queue), so a body
+//    with nothing real to send still starts; it is never injected mid-stream.
 //
 // Shared by `LiveWav` and `LiveFlac`. FLAC has no Content-Length rollover.
 
@@ -41,14 +43,23 @@ use crate::error::{Error, Result};
 const LIVE_CHUNK_FRAMES: usize = 1024;
 /// Sleep when the PCM ring underruns so the HTTP body stays open without injecting silence.
 const LIVE_UNDERRUN_SLEEP: Duration = Duration::from_millis(5);
-/// Silence duration prepended before real PCM (unpaced; TCP as fast as it accepts).
+/// Silence prepended when a body starts with an empty ring (unpaced; TCP as fast as it accepts).
 ///
-/// Counts toward `frames_emitted` so the realtime pacer starts ~[`LIVE_LEAD`] ahead —
-/// that **is** the Cast cushion. Do not inject silence mid-stream on underrun.
+/// Real queued PCM is always sent instead when there is any: silence compresses to a few bytes
+/// per FLAC frame and does not advance the Cast start, it only delays the real audio. Never
+/// injected mid-stream on underrun.
 const SILENCE_PREROLL: Duration = Duration::from_secs(2);
-/// How far ahead of wall-clock audio time Nest may pull (maintains the cushion).
-const LIVE_LEAD: Duration = Duration::from_secs(2);
-/// When the schedule is late by more than this, advance pace origin by the lateness.
+/// How far ahead of real time Cast may buffer: the burst on a fresh GET and the steady-state
+/// pace cap.
+///
+/// Cast gates PLAYING on buffered bytes. Measured with LIVE FLAC bodies of digital silence
+/// (typical music byte rate): a body that has its audio ready plays 0.15–0.3 s after the GET on
+/// both Nest Audio and Nest Mini once 0.2–0.55 MB (~2–4 s of audio) are in; delivered in real
+/// time instead it takes ~1 s, and a Nest Audio held at 0–2 s (and sometimes 5 s) of lead drops
+/// back to BUFFERING right after starting. 8 s covers the start threshold with margin and keeps
+/// Nest Audio fed.
+pub const CAST_READ_AHEAD: Duration = Duration::from_secs(8);
+/// When emitted audio falls behind wall clock by more than this, advance the pace origin.
 const PACE_LATE_SLACK: Duration = Duration::from_millis(50);
 /// Minimum interval between ring-overflow drop log lines (hot path stays quiet).
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -502,13 +513,14 @@ fn live_wav_response(
     },
   };
 
-  let preroll_frames = silence_preroll_frames(rate);
+  let preroll_frames = silence_preroll_frames(rate, &ring, 1);
   // Body ends at exactly max_body_bytes (Content-Length); pad the final partial region.
   let threshold = live_body_threshold(max_body_bytes);
   tracing::info!(
     channels = ch,
     sample_rate = rate,
     preroll_frames,
+    queued_frames = ring.available_frames(),
     max_body_bytes,
     threshold,
     "Cast client pulling LiveWav stream"
@@ -547,7 +559,7 @@ fn live_wav_response(
   response
 }
 
-/// Chunked live FLAC response: STREAMINFO once, silence preroll as FLAC frames, then paced PCM.
+/// Chunked live FLAC response: STREAMINFO once, queued PCM burst, then paced PCM.
 ///
 /// No Content-Length and no rollover — the stream is unbounded until superseded or the peer drops.
 #[expect(
@@ -581,11 +593,12 @@ fn live_flac_response(
   };
 
   // Fixed-block live stream: round silence preroll up so every frame is FLAC_BLOCK_SIZE.
-  let preroll_frames = round_up_to_flac_blocks(silence_preroll_frames(rate));
+  let preroll_frames = round_up_to_flac_blocks(silence_preroll_frames(rate, &ring, FLAC_BLOCK_SIZE));
   tracing::info!(
     channels = ch,
     sample_rate = rate,
     preroll_frames,
+    queued_frames = ring.available_frames(),
     flac_block_size = FLAC_BLOCK_SIZE,
     "Cast client pulling LiveFlac stream"
   );
@@ -624,8 +637,12 @@ pub(crate) fn live_body_threshold(max_body_bytes: u64) -> u64 {
   max_body_bytes.max(44)
 }
 
-/// Silence frames for [`SILENCE_PREROLL`] at `sample_rate` (integer math, no float).
-fn silence_preroll_frames(sample_rate: u32) -> usize {
+/// Silence frames to prepend: none when `ring` already holds `min_real_frames` of real PCM,
+/// else [`SILENCE_PREROLL`] at `sample_rate` (integer math, no float).
+fn silence_preroll_frames(sample_rate: u32, ring: &PcmRing, min_real_frames: usize) -> usize {
+  if ring.available_frames() >= min_real_frames.max(1) {
+    return 0;
+  }
   let rate = u64::from(sample_rate.max(1));
   let millis = u64::try_from(SILENCE_PREROLL.as_millis()).unwrap_or(0);
   // frames = rate * millis / 1000
@@ -633,11 +650,12 @@ fn silence_preroll_frames(sample_rate: u32) -> usize {
   usize::try_from(n).unwrap_or(usize::MAX)
 }
 
-/// Progressive async stream: WAV header, silence preroll, then paced PCM from the ring.
+/// Progressive async stream: WAV header, queued PCM burst (silence only for an empty ring), then
+/// paced PCM from the ring.
 ///
 /// Nest BUFFERED pull can drain the ring faster than AirPlay fills it. We must **not**
 /// inject silence on underrun (that becomes constant audible cuts). Instead: wait for
-/// real PCM, and pace emission so Nest stays at most [`LIVE_LEAD`] ahead of realtime.
+/// real PCM, and pace emission so Nest stays at most [`CAST_READ_AHEAD`] ahead of realtime.
 #[expect(
   clippy::too_many_arguments,
   reason = "stream state is assembled once; splitting would obscure the data path"
@@ -705,8 +723,7 @@ fn live_wav_byte_stream(
       live.preroll_frames_left = live.preroll_frames_left.saturating_sub(n);
       live.i16_buf.clear();
       live.i16_buf.resize(samples, 0);
-      // Preroll silence does not sleep — Nest should buffer it fast.
-      // Counts toward frames_emitted so the pacer starts ~LIVE_LEAD ahead.
+      // Preroll silence does not sleep; it counts toward frames_emitted (it is played).
       let chunk = live.i16_to_le_bytes();
       return Some(live.emit_chunk(chunk, n));
     }
@@ -749,7 +766,8 @@ fn live_wav_byte_stream(
   })
 }
 
-/// Progressive async FLAC stream: STREAMINFO, silence preroll frames, then paced PCM blocks.
+/// Progressive async FLAC stream: STREAMINFO, queued PCM burst (silence only for an empty ring),
+/// then paced PCM blocks.
 ///
 /// Unbounded (no Content-Length / no rollover). Full [`FLAC_BLOCK_SIZE`] blocks in steady state;
 /// wait for real PCM on underrun (no mid-stream silence inject). Generation check **before** pop.
@@ -805,8 +823,7 @@ fn live_flac_byte_stream(
       let samples = n.saturating_mul(usize::from(live.channels));
       live.i16_buf.clear();
       live.i16_buf.resize(samples, 0);
-      // Preroll silence does not sleep — Nest should buffer it fast.
-      // Counts toward frames_emitted so the pacer starts ~LIVE_LEAD ahead.
+      // Preroll silence does not sleep; it counts toward frames_emitted (it is played).
       match live.encode_current_i16_buf() {
         Ok(chunk) => return Some(live.emit_chunk(chunk, n)),
         Err(err) => {
@@ -1034,7 +1051,7 @@ impl LiveStreamState {
     self.last_drop_log = Some(now);
   }
 
-  /// Hold Nest pull so it stays at most [`LIVE_LEAD`] ahead of wall-clock audio time.
+  /// Hold Nest pull so it stays at most [`CAST_READ_AHEAD`] ahead of wall-clock audio time.
   ///
   /// Shared with [`LiveFlacState`] via [`pace_realtime_shared`].
   async fn pace_realtime(&mut self, next_frames: usize) {
@@ -1069,10 +1086,10 @@ impl LiveStreamState {
 
 /// Shared realtime pacing for `LiveWav` and `LiveFlac`.
 ///
-/// When `now` is past the scheduled wake:
-/// - no sleep (emit immediately);
-/// - if late beyond [`PACE_LATE_SLACK`] **and** the ring has no backlog, advance the
-///   pace origin by the lateness so the schedule reflects reality;
+/// When `now` is past the scheduled wake (Cast holds less than [`CAST_READ_AHEAD`]):
+/// - no sleep (emit immediately, refilling Cast toward the read-ahead);
+/// - if emitted audio is behind wall clock beyond [`PACE_LATE_SLACK`] **and** the ring has
+///   no backlog, advance the pace origin by the lateness so the schedule reflects reality;
 /// - if the ring still holds backlog (consumer was stalled while AirPlay filled), keep
 ///   the origin fixed so successive ticks stay unpaced until `frames_emitted` catches
 ///   wall clock — that rushes Nest's cushion back up; pacing re-engages when current.
@@ -1092,7 +1109,7 @@ async fn pace_realtime_shared(
     sample_rate,
     origin,
     now,
-    LIVE_LEAD,
+    CAST_READ_AHEAD,
     PACE_LATE_SLACK,
   );
   if let Some(lateness) = plan.rebaseline {
@@ -1112,13 +1129,15 @@ async fn pace_realtime_shared(
 struct PacePlan {
   /// Sleep this long before emitting (schedule is early).
   sleep: Option<Duration>,
-  /// Advance pace origin by this lateness (schedule is late beyond slack).
+  /// Advance pace origin by this lateness (emitted audio behind wall clock beyond slack).
   rebaseline: Option<Duration>,
 }
 
 /// Compute sleep / rebaseline for realtime pacing with a maintained lead.
 ///
-/// Drift-free: audio time is `total_frames_after * 1000 / sample_rate` from origin.
+/// Drift-free: audio time is `total_frames_after * 1000 / sample_rate` from origin. Sleeps while
+/// the next chunk would put Cast more than `live_lead` ahead; lateness is measured against the
+/// audio due time itself, so being short of the lead refills unpaced without collapsing it.
 #[expect(
   clippy::too_many_arguments,
   reason = "pure helper takes explicit schedule inputs for unit tests"
@@ -1143,10 +1162,10 @@ fn pace_plan(
       rebaseline: None,
     }
   } else {
-    let lateness = now.saturating_duration_since(wake_at);
-    // When late beyond slack, shift origin so the schedule matches wall clock.
-    // Sleep stays None on this tick (emit immediately); after origin advances,
-    // the next chunk paces at realtime again.
+    let lateness = now.saturating_duration_since(due);
+    // When emitted audio is behind wall clock beyond slack (Cast drained it), shift origin so
+    // the schedule matches wall clock. Sleep stays None on this tick (emit immediately); after
+    // origin advances, the lead refills and pacing re-engages.
     let rebaseline = if lateness > late_slack {
       Some(lateness)
     } else {
@@ -1174,10 +1193,24 @@ mod tests {
   }
 
   #[test]
-  fn silence_preroll_frames_at_48k_is_two_seconds() {
-    assert_eq!(silence_preroll_frames(48_000), 96_000);
-    assert_eq!(silence_preroll_frames(44_100), 88_200);
-    assert_eq!(silence_preroll_frames(1), 2);
+  fn silence_preroll_only_covers_an_empty_ring() {
+    let empty = PcmRing::new(2, 8_192);
+    assert_eq!(silence_preroll_frames(48_000, &empty, FLAC_BLOCK_SIZE), 96_000);
+    assert_eq!(silence_preroll_frames(44_100, &empty, FLAC_BLOCK_SIZE), 88_200);
+    assert_eq!(silence_preroll_frames(1, &empty, 1), 2);
+
+    let short = PcmRing::new(2, 8_192);
+    short.push_f32(&[0.1; 2 * 100]);
+    assert_eq!(
+      silence_preroll_frames(48_000, &short, FLAC_BLOCK_SIZE),
+      96_000,
+      "less than one FLAC block of real PCM is still an empty queue for FLAC"
+    );
+    assert_eq!(silence_preroll_frames(48_000, &short, 1), 0, "any real PCM skips WAV preroll");
+
+    let queued = PcmRing::new(2, 8_192);
+    queued.push_f32(&vec![0.1; 2 * FLAC_BLOCK_SIZE]);
+    assert_eq!(silence_preroll_frames(48_000, &queued, FLAC_BLOCK_SIZE), 0);
   }
 
   #[test]
@@ -1208,13 +1241,26 @@ mod tests {
   #[test]
   fn pace_plan_rebaselines_when_late_beyond_slack() {
     let origin = Instant::now();
-    // wake_at ≈ origin for 0 frames with 2 s lead: due=origin, wake=origin-2s.
-    // now = origin + 100 ms → lateness ≈ 2.1 s > 50 ms slack.
+    // 0 frames + 1024 next @ 48 kHz: due = origin + 21 ms.
+    // now = origin + 100 ms → emitted audio 79 ms behind wall clock > 50 ms slack.
     let now = origin + Duration::from_millis(100);
     let plan = pace_plan(0, 1_024, 48_000, origin, now, Duration::from_secs(2), Duration::from_millis(50));
     assert_eq!(plan.sleep, None);
     let late = plan.rebaseline.expect("should rebaseline when late");
-    assert!(late >= Duration::from_secs(2), "lateness={late:?}");
+    assert!(
+      late >= Duration::from_millis(75) && late <= Duration::from_millis(80),
+      "lateness={late:?}"
+    );
+  }
+
+  #[test]
+  fn pace_plan_refills_a_short_lead_without_rebaseline() {
+    // 1 s emitted, wall at 0.5 s: Cast holds 0.5 s, below the 8 s read-ahead. Emit at once and
+    // keep the origin, so the lead refills instead of being redefined as "full".
+    let origin = Instant::now();
+    let now = origin + Duration::from_millis(500);
+    let plan = pace_plan(48_000, 2_048, 48_000, origin, now, CAST_READ_AHEAD, PACE_LATE_SLACK);
+    assert_eq!(plan, PacePlan { sleep: None, rebaseline: None });
   }
 
   #[test]
@@ -1238,16 +1284,15 @@ mod tests {
 
   #[test]
   fn pace_plan_rebaseline_then_pacing_reengages() {
-    // Post-stall: wall clock advanced 500 ms past wake_at. First plan is unpaced + rebaseline;
-    // applying the origin shift makes the next plan on-schedule (pacing re-engages).
+    // Post-stall: 2 s emitted, wall clock at 2.5 s (Cast drained everything and waited 0.5 s).
+    // First plan is unpaced + rebaseline; after the origin shift the lead refills unpaced and
+    // pacing re-engages once Cast is a full lead ahead again.
     let origin = Instant::now();
     let rate = 48_000_u32;
     let lead = Duration::from_secs(2);
     let slack = Duration::from_millis(50);
-    // 96k frames @ 48 kHz with 2 s lead → wake_at = origin.
     let frames = 96_000_u64;
-    let stall = Duration::from_millis(500);
-    let now = origin + stall;
+    let now = origin + Duration::from_millis(2_500);
 
     let plan = pace_plan(frames, 1_024, rate, origin, now, lead, slack);
     assert_eq!(plan.sleep, None, "late tick must not sleep");
@@ -1255,11 +1300,12 @@ mod tests {
     assert!(late >= Duration::from_millis(450), "lateness={late:?}");
 
     let new_origin = origin + late;
-    // Same frozen `now` after rebaseline: schedule is current → no large sleep, no rebaseline.
+    // Same frozen `now` after rebaseline: schedule is current → no sleep, no rebaseline.
     let plan_after = pace_plan(frames, 1_024, rate, new_origin, now, lead, slack);
-    assert_eq!(plan_after.rebaseline, None, "rebaselined origin must be current");
-    // Next chunk (~21 ms of audio) with wall clock still at `now` wants a short sleep.
-    let plan_next = pace_plan(frames + 1_024, 1_024, rate, new_origin, now, lead, slack);
+    assert_eq!(plan_after, PacePlan { sleep: None, rebaseline: None }, "lead refills unpaced");
+    // Once a full lead is emitted past the rebaselined origin, the next chunk sleeps ~21 ms.
+    let lead_frames = 96_000_u64;
+    let plan_next = pace_plan(frames + lead_frames + 1_024, 1_024, rate, new_origin, now, lead, slack);
     let sleep_for = plan_next.sleep.expect("pacing re-engages after rebaseline");
     assert!(
       sleep_for > Duration::from_millis(10) && sleep_for < Duration::from_millis(50),
@@ -1310,13 +1356,13 @@ mod tests {
       ring.occupancy_frames()
     );
 
-    // 96_000 frames @ 48 kHz with LIVE_LEAD 2 s → wake_at ≈ origin.
-    // Origin 300 ms in the past → late beyond PACE_LATE_SLACK, rebaseline candidate.
+    // Nothing emitted yet, origin 300 ms in the past → emitted audio behind wall clock beyond
+    // PACE_LATE_SLACK, rebaseline candidate.
     let origin = Instant::now()
       .checked_sub(Duration::from_millis(300))
       .expect("instant subtract");
     let mut pace_origin = Some(origin);
-    let frames_emitted = 96_000_u64;
+    let frames_emitted = 0_u64;
 
     // (a)+(b) Late + backlog: origin held, call returns unpaced (no long sleep).
     let t0 = Instant::now();
@@ -1353,15 +1399,11 @@ mod tests {
       "late+empty must advance origin: before={before:?} after={after_rebaseline:?}"
     );
 
-    // After rebaseline, schedule is current; advance frames far enough that plan wants sleep,
-    // then the shared call must actually sleep (pacing re-engages).
-    // 96_000 + several chunks of next_frames with fixed wall ≈ rebaselined origin → ahead.
-    let mut frames = frames_emitted;
-    // Push schedule ~80 ms ahead of wall: audio_ms grows while wall barely moves.
-    // wake_at = origin + audio_ms - lead; after rebaseline wake ≈ now; adding frames
-    // makes wake_at > now → sleep.
+    // After rebaseline the schedule is current; once a full CAST_READ_AHEAD plus ~80 ms is
+    // emitted, wake_at = origin + audio_ms - lead lands ~100 ms out → the call must sleep.
+    let lead_frames = u64::from(rate) * u64::try_from(CAST_READ_AHEAD.as_millis()).expect("ms") / 1_000;
     let advance_frames = u64::from(rate) * 80 / 1_000; // ~80 ms of audio
-    frames = frames.saturating_add(advance_frames);
+    let frames = frames_emitted.saturating_add(lead_frames).saturating_add(advance_frames);
 
     let t2 = Instant::now();
     pace_realtime_shared(frames, &mut pace_origin, rate, next_frames, &ring, backlog_threshold).await;
@@ -2015,32 +2057,28 @@ mod tests {
     }
   }
 
-  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-  async fn live_flac_preroll_then_bit_exact_pcm() {
-    use crate::audio::{FLAC_BLOCK_SIZE, round_up_to_flac_blocks};
-
-    let sample_rate = 8_000_u32;
-    let channels = 1_u16;
-    // Real SILENCE_PREROLL (2 s) at 8 kHz, rounded up to fixed FLAC blocks.
-    let preroll = round_up_to_flac_blocks(silence_preroll_frames(sample_rate));
-    assert!(preroll >= silence_preroll_frames(sample_rate));
-    assert_eq!(preroll % FLAC_BLOCK_SIZE, 0);
-
-    // One full FLAC block of known pattern after silence (f32 → ring → i16 path).
+  /// Mono 440 Hz pattern of one FLAC block at 8 kHz, plus its i16 form via the ring conversion.
+  fn flac_pattern_8k() -> (Vec<f32>, Vec<i16>) {
     let pattern_frames = FLAC_BLOCK_SIZE;
     let mut pattern_f32 = Vec::with_capacity(pattern_frames);
     for i in 0..pattern_frames {
-      let t = i as f32 / sample_rate as f32;
-      let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
-      pattern_f32.push(s);
+      let t = i as f32 / 8_000.0;
+      pattern_f32.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5);
     }
-    // Capture expected i16 via the same ring conversion production uses.
-    let probe = PcmRing::new(channels, pattern_frames);
+    let probe = PcmRing::new(1, pattern_frames);
     probe.push_f32(&pattern_f32);
     let mut expected_i16 = Vec::new();
     assert_eq!(probe.pop_i16(pattern_frames, &mut expected_i16), pattern_frames);
+    (pattern_f32, expected_i16)
+  }
 
-    let ring = Arc::new(PcmRing::new(channels, pattern_frames.saturating_mul(4)));
+  /// PCM already queued at GET is the first audio in the body: no silence ahead of it.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn live_flac_queued_pcm_is_sent_first_bit_exact() {
+    let sample_rate = 8_000_u32;
+    let channels = 1_u16;
+    let (pattern_f32, expected_i16) = flac_pattern_8k();
+    let ring = Arc::new(PcmRing::new(channels, FLAC_BLOCK_SIZE * 4));
     ring.push_f32(&pattern_f32);
 
     let handle = MediaServer::start("127.0.0.1").await.expect("start");
@@ -2049,55 +2087,66 @@ mod tests {
       channels,
       sample_rate,
     });
-
-    let url = handle.stream_url();
-    // Preroll encode is unpaced; one paced audio block follows. A few seconds is plenty.
-    let body = http_get_body_timed(&url, Duration::from_secs(8)).await;
-    assert!(body.len() > 42, "expected STREAMINFO + frames, got {}", body.len());
+    let body = http_get_body_timed(&handle.stream_url(), Duration::from_secs(2)).await;
     assert_eq!(&body[0..4], b"fLaC");
-
     let (got_rate, got_ch, decoded) = claxon_decode_prefix(&body);
     assert_eq!(got_rate, sample_rate);
     assert_eq!(got_ch, u32::from(channels));
+    assert!(decoded.len() >= expected_i16.len(), "decoded {} samples", decoded.len());
+    for (i, (&orig, &dec)) in expected_i16.iter().zip(decoded.iter()).enumerate() {
+      assert_eq!(i32::from(orig), dec, "PCM mismatch at sample {i}");
+    }
+    handle.shutdown();
+  }
 
-    // Need full preroll silence + full pattern block.
-    let need = preroll.saturating_add(pattern_frames);
+  /// A GET that finds the ring empty starts with the silence preroll, then the real PCM that
+  /// arrives later, bit-exact.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn live_flac_empty_ring_gets_preroll_then_bit_exact_pcm() {
+    let sample_rate = 8_000_u32;
+    let channels = 1_u16;
+    let (pattern_f32, expected_i16) = flac_pattern_8k();
+    let ring = Arc::new(PcmRing::new(channels, FLAC_BLOCK_SIZE * 4));
+    let preroll = round_up_to_flac_blocks(silence_preroll_frames(sample_rate, &ring, FLAC_BLOCK_SIZE));
+    assert!(preroll >= 2 * 8_000, "empty ring gets the full preroll");
+    assert_eq!(preroll % FLAC_BLOCK_SIZE, 0);
+
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac {
+      ring: Arc::clone(&ring),
+      channels,
+      sample_rate,
+    });
+    let feeder_ring = Arc::clone(&ring);
+    let feeder = tokio::spawn(async move {
+      sleep(Duration::from_millis(300)).await;
+      feeder_ring.push_f32(&pattern_f32);
+    });
+    let body = http_get_body_timed(&handle.stream_url(), Duration::from_secs(3)).await;
+    feeder.await.expect("feeder");
+    let (_, _, decoded) = claxon_decode_prefix(&body);
+    let need = preroll.saturating_add(expected_i16.len());
     assert!(
       decoded.len() >= need,
-      "decoded {} samples, need at least {need} (preroll={preroll} + pattern={pattern_frames}); body={}",
+      "decoded {} samples, need {need} (preroll={preroll}); body={}",
       decoded.len(),
       body.len()
     );
-
-    // First ~SILENCE_PREROLL (and padding to block boundary) must be zero.
     for (i, &s) in decoded.iter().take(preroll).enumerate() {
       assert_eq!(s, 0, "preroll sample {i} must be silence, got {s}");
     }
-    // At least the real SILENCE_PREROLL duration is silent.
-    let bare_preroll = silence_preroll_frames(sample_rate);
-    for (i, &s) in decoded.iter().take(bare_preroll).enumerate() {
-      assert_eq!(s, 0, "bare preroll sample {i} must be silence");
-    }
-
-    // Bit-exact PCM after preroll.
-    let after = &decoded[preroll..preroll + pattern_frames];
+    let after = &decoded[preroll..preroll + expected_i16.len()];
     for (i, (&orig, &dec)) in expected_i16.iter().zip(after.iter()).enumerate() {
       assert_eq!(i32::from(orig), dec, "PCM mismatch at sample {i}");
     }
-
     handle.shutdown();
   }
 
   /// Stereo `LiveFlac`: distinct L/R so a channel swap fails bit-exact claxon decode.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn live_flac_stereo_channel_order_bit_exact() {
-    use crate::audio::{FLAC_BLOCK_SIZE, round_up_to_flac_blocks};
-
     let sample_rate = 8_000_u32;
     let channels = 2_u16;
-    let preroll = round_up_to_flac_blocks(silence_preroll_frames(sample_rate));
-    // preroll is in frames; decoded samples = preroll * channels.
-    let preroll_samples = preroll.saturating_mul(usize::from(channels));
 
     let pattern_frames = FLAC_BLOCK_SIZE;
     // Distinct L/R: L = +0.5, R = -0.5 (interleaved f32).
@@ -2131,19 +2180,15 @@ mod tests {
     assert_eq!(got_rate, sample_rate);
     assert_eq!(got_ch, u32::from(channels));
 
-    let need = preroll_samples.saturating_add(expected_i16.len());
+    // Queued PCM at GET: no preroll, the pattern is the first audio.
     assert!(
-      decoded.len() >= need,
-      "decoded {} samples, need at least {need}; body={}",
+      decoded.len() >= expected_i16.len(),
+      "decoded {} samples, need at least {}; body={}",
       decoded.len(),
+      expected_i16.len(),
       body.len()
     );
-
-    for (i, &s) in decoded.iter().take(preroll_samples).enumerate() {
-      assert_eq!(s, 0, "preroll sample {i} must be silence, got {s}");
-    }
-
-    let after = &decoded[preroll_samples..preroll_samples + expected_i16.len()];
+    let after = &decoded[..expected_i16.len()];
     for (i, (&orig, &dec)) in expected_i16.iter().zip(after.iter()).enumerate() {
       assert_eq!(i32::from(orig), dec, "PCM mismatch at sample {i}");
     }

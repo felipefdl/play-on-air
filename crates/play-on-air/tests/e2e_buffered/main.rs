@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 
 use play_on_air::airplay::{AirPlayManager, AirPlaySessionEvent, ReceiverOptions, stable_raop_port};
 use play_on_air::bridge::{Bridge, RingLookup};
-use play_on_air::cast::CastPool;
+use play_on_air::cast::{CastControl, CastPool, CastStreamKind, MediaLoadRequest, PlaybackDevice, SetPlaybackDevices};
+use play_on_air::media::CAST_READ_AHEAD;
 use play_on_air::registry::{Device, DeviceRegistry};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -87,7 +88,8 @@ impl Harness {
     }));
     let cast_pool = Arc::new(CastPool::new(None));
     cast_pool.ensure(&device);
-    let bridge = Arc::new(Bridge::new(registry, Arc::clone(&cast_pool)).with_airplay(Arc::clone(&airplay)));
+    let cast_control: Arc<dyn CastControl> = Arc::<CastPool>::clone(&cast_pool);
+    let bridge = Arc::new(Bridge::new(registry, cast_control).with_airplay(Arc::clone(&airplay)));
     let rings: Arc<dyn RingLookup> = Arc::<AirPlayManager>::clone(&airplay);
     let bridge_task = tokio::spawn(Arc::clone(&bridge).run(event_rx, rings));
     airplay.ensure(&device_id, &name).await.expect("start AirPlay receiver");
@@ -271,7 +273,7 @@ async fn burst_ahead_plays_continuously_in_real_time() {
 
   harness.wait_for_tone(Tone::Low, 3.0, START_DEADLINE).await;
   harness.wait_for_tone(Tone::High, 3.0, START_DEADLINE).await;
-  tokio::time::sleep(Duration::from_secs(2)).await;
+  tokio::time::sleep(Duration::from_secs(6)).await;
   let overflow = harness.ring_overflow_frames();
 
   let captures = harness.cast.captures();
@@ -289,12 +291,33 @@ async fn burst_ahead_plays_continuously_in_real_time() {
   );
   let onset = runs.iter().find(|run| run.tone.is_some()).expect("tone onset");
   let onset_at = arrival_of(capture, onset.start);
-  // Real time within scheduling jitter of a loaded CI box; releasing the 60 s burst on
-  // arrival would read as many times real time (or overflow the host ring).
-  let ratio = realtime_ratio(capture, onset_at + Duration::from_secs(1));
-  assert!((0.8..=1.25).contains(&ratio), "playout rate {ratio:.3}× real time");
+  let rate = f64::from(SAMPLE_RATE);
+  let lead_s = CAST_READ_AHEAD.as_secs_f64();
+  let ahead_s =
+    |at: Instant| (samples_at(capture, at) - onset.start) as f64 / rate - at.duration_since(onset_at).as_secs_f64();
+  // The sender queued far ahead, so the fresh LOAD gets the read-ahead as a burst. No PTP
+  // grandmaster here: the unlocked fallback presents the anchor sample `Audio-Latency` (2 s)
+  // after receipt, so Cast can be CAST_READ_AHEAD - 2 s ahead of real time. Most of that
+  // arrives within the first few seconds (a debug-build decode and encode bound the burst
+  // rate here; real time would stay ~0 s ahead).
+  let expected_ahead = lead_s - 2.0;
+  let burst_ahead = ahead_s(onset_at + Duration::from_secs(3));
   assert!(
-    onset_at.duration_since(anchored) < Duration::from_secs(8),
+    burst_ahead >= expected_ahead - 1.0,
+    "Cast only {burst_ahead:.2} s ahead 3 s after onset; expected ~{expected_ahead} s"
+  );
+  // Then real time within scheduling jitter of a loaded CI box: releasing the 60 s burst on
+  // arrival would read as many times real time (or overflow the host ring).
+  let ratio = realtime_ratio(capture, onset_at + Duration::from_secs(4));
+  assert!((0.8..=1.25).contains(&ratio), "playout rate {ratio:.3}× real time");
+  // Steady state holds Cast at the read-ahead, never unbounded.
+  let steady_ahead = ahead_s(Instant::now());
+  assert!(
+    (expected_ahead - 1.0..=lead_s + 0.5).contains(&steady_ahead),
+    "Cast {steady_ahead:.2} s ahead of real time in steady state; expected ~{expected_ahead} s"
+  );
+  assert!(
+    onset_at.duration_since(anchored) < Duration::from_secs(3),
     "first audio reached Cast {:?} after the anchor",
     onset_at.duration_since(anchored)
   );
@@ -407,6 +430,7 @@ async fn flush_then_new_anchor_drops_old_track() {
   let captures = harness.cast.captures();
   let grace = flushed_at + Duration::from_millis(250);
   let mut high_onset = None;
+  let mut high_get = None;
   for capture in &captures {
     assert!(capture.error.is_none(), "stream error: {:?}", capture.error);
     let runs = analysis::runs(&capture.samples);
@@ -422,6 +446,7 @@ async fn flush_then_new_anchor_drops_old_track() {
     );
     if let Some(run) = first_tone_run(&runs, Tone::High, analysis::UNIT_SAMPLES) {
       let _onset = high_onset.get_or_insert_with(|| arrival_of(capture, run.start));
+      let _get = high_get.get_or_insert_with(|| capture.requested_at.expect("GET time"));
       let late_low = runs
         .iter()
         .filter(|later| later.start > run.start && later.tone == Some(Tone::Low))
@@ -429,11 +454,100 @@ async fn flush_then_new_anchor_drops_old_track() {
       assert_eq!(late_low, 0, "old track after new track started: {runs:?}");
     }
   }
-  let skip = high_onset.expect("new track reached Cast").duration_since(flushed_at);
+  let onset = high_onset.expect("new track reached Cast");
+  let skip = onset.duration_since(flushed_at);
+  let from_get = onset.saturating_duration_since(high_get.expect("new track GET"));
   assert!(skip < Duration::from_secs(5), "new track took {skip:?} after the flush");
+  // The re-LOAD's pull gets the new track's queued audio at once, not silence first.
+  assert!(
+    from_get < Duration::from_secs(1),
+    "new track reached Cast {from_get:?} after the re-LOAD GET"
+  );
   assert_eq!(overflow, 0, "host PCM ring dropped {overflow} frames");
   assert_no_audio_loss_warnings();
 
   sender.teardown().await;
   harness.stop().await;
+}
+
+/// Cast pool against the fake device: `SET_PLAYBACK_DEVICES` carries the receiver app session
+/// id and the full member list to `receiver-0`, and after the answered session move media
+/// control runs on the session host while the old worker no longer owns the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multizone_expansion_moves_media_control_to_the_session_host() {
+  let _serial = SERIAL.lock().await;
+  let cast = FakeCast::start();
+  let port = cast.port();
+  // Holds the media URL's port open; the fake only connects to it.
+  let media = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("media listener");
+  let media_url = format!("http://127.0.0.1:{}/stream", media.local_addr().expect("media addr").port());
+  let device = Device::new("mz-leader", "Leader", "127.0.0.1", "localhost", port, "mz-leader");
+  let pool = Arc::new(CastPool::new(None));
+  pool.ensure(&device);
+
+  let flow_pool = Arc::clone(&pool);
+  let (session, update, leader_still_owns) = tokio::task::spawn_blocking(move || {
+    let session = flow_pool.load("mz-leader", MediaLoadRequest::flac(media_url.clone(), CastStreamKind::Live))?;
+    let update = flow_pool.set_playback_devices(
+      "mz-leader",
+      SetPlaybackDevices {
+        devices: vec![
+          PlaybackDevice {
+            device_id: "mz-leader".to_owned(),
+            ip_address: "127.0.0.1".to_owned(),
+            port,
+          },
+          PlaybackDevice {
+            device_id: "56cb7fe7e13f325625325c4a304c57fa".to_owned(),
+            ip_address: "127.0.0.2".to_owned(),
+            port: 8009,
+          },
+        ],
+        session_name: Some("Leader + 1".to_owned()),
+      },
+    )?;
+    let endpoint = update.endpoint.clone().expect("session moved");
+    flow_pool.open_session_host("mz-host", &endpoint.ip_address, endpoint.port);
+    flow_pool.move_session("mz-leader", "mz-host")?;
+    flow_pool.pause("mz-host")?;
+    // A re-LOAD (skip, stall) on the session host joins the running receiver: no LAUNCH.
+    drop(flow_pool.load("mz-host", MediaLoadRequest::flac(media_url, CastStreamKind::Live))?);
+    let leader_still_owns = flow_pool.pause("mz-leader").is_ok();
+    Ok::<_, play_on_air::error::Error>((session, update, leader_still_owns))
+  })
+  .await
+  .expect("join multizone flow")
+  .expect("multizone flow");
+
+  let endpoint = update.endpoint.expect("endpoint");
+  assert_eq!(endpoint.device_id, fake_cast::GROUP_ENDPOINT_ID);
+  assert_eq!(endpoint.port, port);
+  assert_eq!(update.failed_devices, Vec::<String>::new());
+  assert!(!leader_still_owns, "the leader's worker handed its session over");
+  assert!(
+    !pool.device_ids().contains(&"mz-host".to_owned()),
+    "session hosts are not registry speakers"
+  );
+
+  let commands = cast.commands();
+  let set = commands
+    .iter()
+    .find(|cmd| cmd.kind == "SET_PLAYBACK_DEVICES")
+    .expect("SET_PLAYBACK_DEVICES sent");
+  assert_eq!(set.destination, "receiver-0");
+  assert_eq!(set.payload["sessionId"], session.session_id.as_str());
+  assert_eq!(set.payload["sessionName"], "Leader + 1");
+  assert_eq!(set.payload["deviceList"][1]["deviceId"], "56cb7fe7e13f325625325c4a304c57fa");
+  let pauses = commands.iter().filter(|cmd| cmd.kind == "PAUSE").count();
+  assert_eq!(pauses, 1, "one PAUSE, from the session host");
+  let launches = commands.iter().filter(|cmd| cmd.kind == "LAUNCH").count();
+  assert_eq!(launches, 1, "only the first LOAD launches the receiver");
+  let loads = commands.iter().filter(|cmd| cmd.kind == "LOAD").count();
+  assert_eq!(loads, 2);
+
+  tokio::task::spawn_blocking(move || pool.shutdown())
+    .await
+    .expect("Cast pool shutdown");
+  tokio::task::spawn_blocking(move || cast.stop()).await.expect("fake Cast stop");
+  drop(media);
 }

@@ -1,8 +1,9 @@
 //! Fake Google Cast device: Cast v2 over TLS on localhost plus a FLAC stream consumer.
 //!
 //! Accepts the control-plane traffic the warm Cast pool sends (CONNECT, PING,
-//! `GET_STATUS`, LAUNCH, LOAD, PAUSE, PLAY, STOP, `SET_VOLUME`) and answers with
-//! `RECEIVER_STATUS` / `MEDIA_STATUS` / `PONG`. Each LOAD starts a consumer that GETs the
+//! `GET_STATUS`, LAUNCH, LOAD, PAUSE, PLAY, STOP, `SET_VOLUME`, multizone
+//! `SET_PLAYBACK_DEVICES`) and answers with `RECEIVER_STATUS` / `MEDIA_STATUS` / `PONG` /
+//! `PLAYBACK_SESSION_UPDATED` (the session "moves" to a group endpoint on this same port). Each LOAD starts a consumer that GETs the
 //! media URL (always dialed on `127.0.0.1`, keeping the test on loopback) and decodes
 //! the chunked FLAC body with claxon, recording channel 0 and arrival times.
 
@@ -24,6 +25,9 @@ const KEY: &[u8] = include_bytes!("../../src/cast/testdata/v3-self-signed-p256.t
 const NS_HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
 const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
 const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
+const NS_MULTIZONE: &str = "urn:x-cast:com.google.cast.multizone";
+/// Group endpoint id the fake reports after a `SET_PLAYBACK_DEVICES`.
+pub(crate) const GROUP_ENDPOINT_ID: &str = "5c23adbc-893b-446c-bb38-a935d16e1be4";
 const APP_ID: &str = "CC1AD845";
 const SESSION_ID: &str = "fake-session-1";
 const TRANSPORT_ID: &str = "fake-transport-1";
@@ -33,6 +37,8 @@ const POLL: Duration = Duration::from_millis(50);
 /// Decoded FLAC body of one LOAD.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Capture {
+  /// When the media GET was sent (the LOAD's pull starting).
+  pub(crate) requested_at: Option<Instant>,
   /// Content type the HTTP response declared.
   pub(crate) content_type: String,
   /// FLAC `STREAMINFO` sample rate.
@@ -50,6 +56,10 @@ pub(crate) struct Capture {
 pub(crate) struct Command {
   pub(crate) at: Instant,
   pub(crate) kind: String,
+  /// Destination the sender addressed (`receiver-0` or an app transport).
+  pub(crate) destination: String,
+  /// Full JSON payload.
+  pub(crate) payload: Value,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +73,8 @@ struct DeviceState {
 
 #[derive(Debug, Default)]
 struct Shared {
+  /// Control-plane port (also the group endpoint's port).
+  port: u16,
   state: Mutex<DeviceState>,
   captures: Mutex<Vec<Arc<Mutex<Capture>>>>,
   consumers: Mutex<Vec<Consumer>>,
@@ -102,6 +114,7 @@ impl FakeCast {
     listener.set_nonblocking(true).expect("nonblocking listener");
     let port = listener.local_addr().expect("fake Cast addr").port();
     let shared = Arc::new(Shared {
+      port,
       state: Mutex::new(DeviceState { volume: 0.5, ..DeviceState::default() }),
       ..Shared::default()
     });
@@ -206,7 +219,12 @@ fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Vec<CastMessage> {
   let payload: Value = serde_json::from_str(&message.payload).unwrap_or(Value::Null);
   let kind = payload.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
   let request_id = payload.get("requestId").and_then(Value::as_u64).unwrap_or(0);
-  shared.commands.lock().push(Command { at: Instant::now(), kind: kind.clone() });
+  shared.commands.lock().push(Command {
+    at: Instant::now(),
+    kind: kind.clone(),
+    destination: message.destination.clone(),
+    payload: payload.clone(),
+  });
   let reply = |namespace: &str, body: Value| CastMessage {
     source: message.destination.clone(),
     destination: message.source.clone(),
@@ -260,6 +278,25 @@ fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Vec<CastMessage> {
         stop_consumers(shared);
       }
       vec![reply(NS_MEDIA, status)]
+    },
+    (NS_MULTIZONE, "SET_PLAYBACK_DEVICES") => {
+      let session_id = payload.get("sessionId").cloned().unwrap_or(Value::Null);
+      vec![reply(
+        NS_MULTIZONE,
+        json!({
+          "type": "PLAYBACK_SESSION_UPDATED",
+          "requestId": request_id,
+          "name": payload.get("sessionName").cloned().unwrap_or(Value::Null),
+          "failedDevices": [],
+          "sessionEndpoint": {
+            "deviceId": GROUP_ENDPOINT_ID,
+            "localDeviceId": GROUP_ENDPOINT_ID,
+            "ipAddress": "127.0.0.1",
+            "port": shared.port,
+            "sessionId": session_id,
+          },
+        }),
+      )]
     },
     // CONNECT / CLOSE on `tp.connection` need no reply; other requests are ignored.
     _ => Vec::new(),
@@ -343,6 +380,7 @@ fn split_url(url: &str) -> (u16, String) {
 
 fn consume(mut stream: TcpStream, path: &str, capture: &Mutex<Capture>) -> Result<(), String> {
   let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: fake-cast\r\nConnection: close\r\n\r\n");
+  capture.lock().requested_at = Some(Instant::now());
   stream.write_all(request.as_bytes()).map_err(|err| err.to_string())?;
   let mut reader = BufReader::new(stream);
   let mut chunked = false;

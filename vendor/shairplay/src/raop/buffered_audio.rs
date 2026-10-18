@@ -8,10 +8,12 @@
 //!   that RTP time increases). An anchor pins RTP `anchor_rtp` to local instant `H(anchor)`;
 //!   every sample `r` is presented at `H(anchor) + (r - anchor_rtp) / sample_rate`.
 //! - **Release.** PlayOnAir's output is not a DAC but a host ring feeding a Cast speaker that
-//!   holds its own cushion. The receiver advertises that output delay as the RTSP
-//!   `Audio-Latency` (`L`, in source samples). A packet is handed to the host when
-//!   `now >= presentation - L`, so it becomes audible at its presentation time after the Cast
-//!   cushion. Release is therefore paced by the sender's timeline, never by arrival.
+//!   holds its own buffer. The receiver advertises an output delay as the RTSP `Audio-Latency`
+//!   (`L`, in source samples) and releases each packet to the host at `presentation - lead`.
+//!   The lead defaults to `L`; a host sets a longer one
+//!   ([`crate::RaopServerBuilder::release_lead`]) so audio the sender queued ahead is available
+//!   to burst when its output (re)starts. Release is paced by the sender's timeline, never by
+//!   arrival.
 //! - **Late packets.** A packet whose end is already behind the playhead (`presentation < now`)
 //!   is pruned; an anchor in the past joins mid-stream.
 //! - **Rate.** Only 0 and 1 are valid. Rate 0 stops release, keeps the buffer and clears the
@@ -105,6 +107,8 @@ pub(crate) struct OutputConfig {
     pub(crate) max_channels: Option<u8>,
     /// Receiver output latency advertised as RTSP `Audio-Latency` (source samples).
     pub(crate) latency_samples: u32,
+    /// Release lead; `None` releases at presentation minus `latency_samples`.
+    pub(crate) release_lead: Option<Duration>,
 }
 
 /// `true` when 24-bit sequence `a` is strictly before `b` (modulo 2^24).
@@ -287,6 +291,8 @@ pub(crate) struct Playout {
     pending: Option<PendingAnchor>,
     source_rate: u32,
     latency_samples: u32,
+    /// Fixed release lead in ns; `None` follows `latency_samples` at the source rate.
+    release_lead_ns: Option<i128>,
     flush_rules: Vec<FlushRule>,
     fallback_pin: Option<FallbackPin>,
     fallback_warned: bool,
@@ -294,7 +300,7 @@ pub(crate) struct Playout {
 }
 
 impl Playout {
-    pub(crate) fn new(latency_samples: u32) -> Self {
+    pub(crate) fn new(latency_samples: u32, release_lead: Option<Duration>) -> Self {
         Self {
             queue: BTreeMap::new(),
             rtp: RtpExtender::default(),
@@ -302,6 +308,7 @@ impl Playout {
             pending: None,
             source_rate: DEFAULT_SOURCE_RATE,
             latency_samples,
+            release_lead_ns: release_lead.map(|lead| i128::try_from(lead.as_nanos()).unwrap_or(i128::MAX)),
             flush_rules: Vec::new(),
             fallback_pin: None,
             fallback_warned: false,
@@ -313,8 +320,16 @@ impl Playout {
         samples * NS_PER_SEC / i128::from(self.source_rate.max(1))
     }
 
+    /// Advertised `Audio-Latency` in ns at the source rate.
     fn latency_ns(&self) -> i128 {
         self.samples_to_ns(i128::from(self.latency_samples))
+    }
+
+    /// How long before its presentation time a packet is handed to the host (never less than
+    /// the advertised latency).
+    fn release_lead_ns(&self) -> i128 {
+        let latency = self.latency_ns();
+        self.release_lead_ns.map_or(latency, |lead| lead.max(latency))
     }
 
     fn presentation_ns(&self, anchor: Anchor, rtp: u64) -> i128 {
@@ -462,7 +477,8 @@ impl Playout {
 
     /// Unlocked fallback for an anchor received at `receipt_ns`.
     fn fallback(&mut self, timeline_id: u64, ns: u64, receipt_ns: u64) -> i128 {
-        // Release-on-receipt target for the anchor sample.
+        // Present the anchor sample the advertised output latency after receipt, as the sender
+        // expects; with a release lead of at least that latency it is released on receipt.
         let target = i128::from(receipt_ns) + self.latency_ns();
         if let Some(pin) = self.fallback_pin
             && pin.timeline_id == timeline_id
@@ -528,7 +544,7 @@ impl Playout {
             return Poll::Idle;
         };
         let now = i128::from(now_ns);
-        let latency = self.latency_ns();
+        let lead = self.release_lead_ns();
         let mut pruned = 0usize;
         let poll = loop {
             let Some((&rtp, _)) = self.queue.first_key_value() else {
@@ -540,7 +556,7 @@ impl Playout {
                 pruned += 1;
                 continue;
             }
-            let release = self.presentation_ns(anchor, rtp) - latency;
+            let release = self.presentation_ns(anchor, rtp) - lead;
             if release > now {
                 break Poll::Wait(u64::try_from(release).unwrap_or(u64::MAX));
             }
@@ -584,10 +600,10 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(latency_samples: u32) -> Arc<Self> {
+    fn new(latency_samples: u32, release_lead: Option<Duration>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
-                playout: Playout::new(latency_samples),
+                playout: Playout::new(latency_samples, release_lead),
                 stopped: false,
                 events: Vec::with_capacity(4),
             }),
@@ -621,11 +637,15 @@ impl PlayoutHandle {
         Ok(reply)
     }
 
-    /// Apply FLUSHBUFFERED.
+    /// Apply FLUSHBUFFERED. Only a flush-all notifies the host: a range flush keeps playing
+    /// and trims only the queue.
     pub(crate) fn flush(&self, request: FlushRequest) {
+        let flush_all = request.from_seq.is_none() || request.from_ts.is_none();
         let mut state = self.shared.lock();
         state.playout.flush(request);
-        state.events.push(HostEvent::Flush);
+        if flush_all {
+            state.events.push(HostEvent::Flush);
+        }
         drop(state);
         self.shared.wake.notify_one();
         self.shared.room.notify_one();
@@ -669,7 +689,7 @@ impl BufferedAudioProcessor {
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
     ) -> (PlayoutHandle, tokio::task::AbortHandle) {
-        let shared = Shared::new(output_config.latency_samples);
+        let shared = Shared::new(output_config.latency_samples, output_config.release_lead);
         let handle = PlayoutHandle {
             shared: Arc::clone(&shared),
         };
@@ -1023,7 +1043,7 @@ mod tests {
     /// following one a frame later.
     #[test]
     fn anchored_release_waits_until_presentation_minus_latency() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 5_000, 4);
         assert!(matches!(p.poll(0), Poll::Idle), "no anchor, nothing due");
 
@@ -1048,11 +1068,78 @@ mod tests {
         assert!(!second.fade_in);
     }
 
+    /// A release lead longer than `Audio-Latency` hands the host everything presented within
+    /// the lead at once (the anchor sample is due now, as iOS sends it after a skip), then paces
+    /// the rest at presentation minus the lead.
+    #[test]
+    fn release_lead_bursts_queued_audio_within_the_lead() {
+        let lead = Duration::from_secs(8);
+        let mut p = Playout::new(LATENCY, Some(lead));
+        let packets = 20 * SR / FRAME; // 20 s queued
+        fill(&mut p, 1, 0, packets);
+        let now = 50 * S;
+        p.set_rate(play(0, now), now).unwrap();
+        let mut burst = 0u32;
+        while let Poll::Release(r) = p.poll(now) {
+            assert_eq!(r.rtp, burst * FRAME);
+            burst += 1;
+        }
+        let lead_packets = 8 * SR / FRAME;
+        assert!(
+            burst >= lead_packets && burst <= lead_packets + 1,
+            "burst {burst} packets, lead is {lead_packets}"
+        );
+        let next_rtp = u64::from(burst * FRAME);
+        let due = now + next_rtp * S / u64::from(SR) - 8 * S;
+        match p.poll(now) {
+            Poll::Wait(until) => assert!(until.abs_diff(due) <= 1, "next due {until}, want {due}"),
+            other => panic!("expected wait, got {other:?}"),
+        }
+    }
+
+    /// The unlocked fallback presents the anchor sample the advertised latency after receipt;
+    /// a longer release lead then hands over everything presented within the lead on receipt.
+    #[test]
+    fn unlocked_fallback_with_release_lead_bursts_on_receipt() {
+        let mut p = Playout::new(LATENCY, Some(Duration::from_secs(8)));
+        fill(&mut p, 1, 0, 20 * SR / FRAME);
+        let receipt = 7 * S;
+        let request = SetRateRequest {
+            rate: 1,
+            anchor: Some((
+                0,
+                AnchorTime::Network {
+                    timeline_id: 0xABCD,
+                    ns: 1_000 * S,
+                },
+            )),
+        };
+        p.set_rate(request, receipt).unwrap();
+        assert_eq!(p.anchor.map(|a| a.local_ns), Some(i128::from(receipt + 2 * S)));
+        let mut burst = 0u32;
+        while let Poll::Release(_) = p.poll(receipt) {
+            burst += 1;
+        }
+        // Released on receipt: presented by receipt + 8 s, so 6 s past the anchor sample.
+        let expected = 6 * SR / FRAME;
+        assert!(
+            burst.abs_diff(expected) <= 1,
+            "burst {burst} packets, expected ~{expected}"
+        );
+    }
+
+    /// A release lead shorter than the advertised latency is raised to it.
+    #[test]
+    fn release_lead_never_below_latency() {
+        let p = Playout::new(LATENCY, Some(Duration::from_millis(500)));
+        assert_eq!(p.release_lead_ns(), 2 * i128::from(S));
+    }
+
     /// Anchor already in the past: packets entirely behind the playhead are pruned and playback
     /// joins at the packet that contains "now".
     #[test]
     fn anchor_in_past_prunes_and_joins_mid_stream() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 0, 100);
         let now = 20 * S;
         // Anchor rtp 0 presented 1 s ago: ~43 packets are fully behind the playhead.
@@ -1070,7 +1157,7 @@ mod tests {
     /// the kept audio on its own timeline.
     #[test]
     fn pause_keeps_buffer_and_resume_uses_new_anchor() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 0, 20);
         p.set_rate(play(0, 3 * S), S).unwrap();
         assert_eq!(release_rtp(p.poll(S)), 0);
@@ -1098,7 +1185,7 @@ mod tests {
 
     #[test]
     fn rate_must_be_zero_or_one_and_play_needs_anchor() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         let err = p.set_rate(SetRateRequest { rate: 2, anchor: None }, 0).unwrap_err();
         assert_eq!(err, PlayoutError::InvalidRate(2));
         assert_eq!(err.status(), STATUS_PARAM_ERROR);
@@ -1113,12 +1200,12 @@ mod tests {
     #[test]
     fn far_ahead_burst_backpressures_and_never_floods_the_host() {
         let total_packets = 300 * SR / FRAME; // ~5 minutes
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         let start = 5 * S;
         p.set_rate(play(0, start + 2 * S), start).unwrap();
 
         // Host ring model: the Cast consumer starts pulling 3 s after the first release (LOAD)
-        // and then drains in real time; ring capacity as configured product-side (10 s).
+        // and then drains in real time; a 10 s host ring (latency plus Cast start headroom).
         let ring_capacity_frames = 10 * u64::from(SR);
         let consumer_delay = 3 * S;
         let mut sent = 0u32;
@@ -1170,7 +1257,7 @@ mod tests {
     /// until (exclusive) across the 24-bit wrap, and retires at until + 20.
     #[test]
     fn flush_all_stops_and_drops_before_until_across_wrap() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 0xFF_FFE0, 1_000, 8);
         p.set_rate(play(1_000, 3 * S), S).unwrap();
         let until = 0xFF_FFF8;
@@ -1201,7 +1288,7 @@ mod tests {
     /// until, and continues the RTP epoch from the cut. Sequence bounds wrap at 2^24.
     #[test]
     fn range_flush_trims_to_end_and_drops_from_inclusive_until_exclusive() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         let base_seq = 0xFF_FFFA;
         fill(&mut p, base_seq, 0, 12);
         p.set_rate(play(0, 3 * S), S).unwrap();
@@ -1237,7 +1324,7 @@ mod tests {
     /// from the pin re-pins.
     #[test]
     fn unlocked_anchor_falls_back_to_receipt_and_keeps_relative_timing() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 0, 400);
         let timeline_id = 0xABCD;
         let network = |ns: u64| SetRateRequest {
@@ -1326,7 +1413,7 @@ mod tests {
     /// timeline locks, then maps through PTP and drops the fallback offset.
     #[test]
     fn anchor_on_locking_timeline_waits_for_lock_and_maps_through_ptp() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 0, 400);
         let early = SetRateRequest {
             rate: 1,
@@ -1372,7 +1459,7 @@ mod tests {
     /// based on the anchor's receipt time.
     #[test]
     fn anchor_on_locking_timeline_falls_back_after_bounded_wait() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 0, 400);
         let clock = PtpClock::new();
         sync_sample(&clock, S);
@@ -1407,7 +1494,7 @@ mod tests {
     /// unlocked anchor (lock lost) re-pins on its own receipt instead of reusing the old offset.
     #[test]
     fn fallback_offset_dropped_once_an_anchor_maps_through_ptp() {
-        let mut p = Playout::new(LATENCY);
+        let mut p = Playout::new(LATENCY, None);
         fill(&mut p, 1, 0, 400);
         let network = |rtp: u32, ns: u64| SetRateRequest {
             rate: 1,
@@ -1480,7 +1567,7 @@ mod tests {
     /// Hard stop from another thread ends a delivery thread parked on a far-future release.
     #[test]
     fn stop_unblocks_parked_delivery_thread() {
-        let shared = Shared::new(LATENCY);
+        let shared = Shared::new(LATENCY, None);
         let handle = PlayoutHandle {
             shared: Arc::clone(&shared),
         };
@@ -1495,6 +1582,7 @@ mod tests {
             sample_rate: None,
             max_channels: Some(2),
             latency_samples: LATENCY,
+            release_lead: None,
         };
         let join =
             std::thread::spawn(move || delivery_loop(&thread_shared, Output::new(Arc::new(NullHandler), config)));
@@ -1513,7 +1601,7 @@ mod tests {
     /// The reader suspended at high water resumes when delivery frees room, and stop wakes it.
     #[tokio::test]
     async fn reader_waits_at_high_water_until_room_or_stop() {
-        let shared = Shared::new(LATENCY);
+        let shared = Shared::new(LATENCY, None);
         {
             let mut state = shared.lock();
             fill(&mut state.playout, 1, 0, 120 * SR / FRAME + 2);
