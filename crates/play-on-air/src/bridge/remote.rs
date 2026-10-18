@@ -18,6 +18,7 @@ use shairplay::MediaRemoteCommand;
 use crate::airplay::NowPlaying;
 use crate::cast::{CastRemoteEvent, CastRemoteKind, CastTrack};
 use crate::media::MediaServerHandle;
+use crate::registry::CAST_GROUP_MODEL;
 
 use super::Bridge;
 use super::state::DeviceState;
@@ -65,17 +66,25 @@ impl Bridge {
   }
 
   /// A Cast-side change we did not command: forward it to the AirPlay sender.
+  ///
+  /// Single speakers only. A Cast group (a Google Home speaker group, or the multizone session
+  /// host of an AirPlay multi-select) reports derived, late status: its level is computed from
+  /// the members while they ramp, and it reported PLAYING 13 s after our PAUSE. Forwarding that
+  /// fed a volume loop with the iPhone and resumed playback on its own, so groups stay one-way.
   pub fn on_cast_remote(&self, event: &CastRemoteEvent) {
-    // A multizone session host reports the group: its play / pause belong to the group owner,
-    // and its volume is the group master level, not one speaker's (each member's own
-    // worker reports that speaker's volume).
-    let (owner, from_session_host) = match self.owner_for_cast_key(&event.device_id) {
-      Some(owner) if owner != event.device_id => (owner, true),
-      Some(_) | None => (event.device_id.clone(), false),
-    };
-    let device_id = owner.as_str();
-    if from_session_host && matches!(event.kind, CastRemoteKind::Volume { .. }) {
-      tracing::debug!(key = %event.device_id, "ignoring Cast group master volume change");
+    let owner = self.owner_for_cast_key(&event.device_id);
+    if owner.as_deref().is_some_and(|key_owner| key_owner != event.device_id) {
+      tracing::debug!(key = %event.device_id, kind = ?event.kind, "ignoring Cast multizone session host change");
+      return;
+    }
+    let owned_id = owner.unwrap_or_else(|| event.device_id.clone());
+    let device_id = owned_id.as_str();
+    if self
+      .registry
+      .get(device_id)
+      .is_some_and(|device| device.model == CAST_GROUP_MODEL)
+    {
+      tracing::debug!(%device_id, kind = ?event.kind, "ignoring Cast speaker group change");
       return;
     }
     match event.kind {
@@ -226,6 +235,31 @@ mod tests {
     bridge.on_cast_remote(&remote("dev-vol-rc", CastRemoteKind::Volume { level: 0.9, muted: true }));
     assert_eq!(*last_volume.lock(), Some(0.35), "mute keeps the level to restore");
     bridge.handle_session_end("dev-vol-rc").await;
+  }
+
+  /// A Google Home speaker group reports derived, late status: its PLAYING after our PAUSE
+  /// resumed the iPhone and its levels looped with the slider (seen live). Groups are one-way.
+  #[tokio::test]
+  async fn speaker_group_changes_are_not_forwarded() {
+    use crate::registry::Device;
+
+    let registry = Arc::new(DeviceRegistry::new());
+    let _new = registry.appear(
+      Device::new("grp", "Gym and Pool", "127.0.0.1", "grp.local", 32_128, "Google-Cast-Group-grp")
+        .with_model(CAST_GROUP_MODEL),
+    );
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
+    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let session = test_playing_session(media, "grp", pool, Arc::new(PcmRing::new(2, 64)));
+    let last_volume = Arc::clone(&session.last_volume_linear);
+    insert_playing(&bridge, "grp", 1, session);
+
+    bridge.on_cast_remote(&remote("grp", CastRemoteKind::Paused));
+    assert!(!bridge.is_locally_paused("grp"), "group pause status is not the user's");
+    bridge.on_cast_remote(&remote("grp", CastRemoteKind::Volume { level: 0.28, muted: false }));
+    assert_eq!(*last_volume.lock(), None, "group level is not reported back");
+    bridge.handle_session_end("grp").await;
   }
 
   /// Now-playing updates the session track (used by re-LOADs) and serves the artwork.

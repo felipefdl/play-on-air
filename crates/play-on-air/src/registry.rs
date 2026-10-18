@@ -32,6 +32,9 @@ pub const fn linux_service_removed_triggers_leave() -> bool {
   false
 }
 
+/// TXT `md` of a Cast speaker group (user-made in Google Home, or a temporary multizone group).
+pub const CAST_GROUP_MODEL: &str = "Google Cast Group";
+
 /// A discovered Google Cast device on the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
