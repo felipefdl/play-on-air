@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- **Picking several PlayOnAir speakers on the iPhone plays them in sync**: the first speaker loads and the others join its Cast session through Google's multizone, so Google keeps them aligned. Volume stays per speaker; removing any speaker keeps the rest playing.
+- **Playback follows the iPhone's clock**: buffered audio is timed from the sender's anchor over PTP instead of arrival time, and early audio is held with TCP back-pressure instead of dropped. Fixes long sessions that dropped audio and ended with "terminal media stall".
+- **Skip, seek and resume start in well under a second**: each Cast load bursts 8 s of queued audio, so the Nest Audio no longer buffers 6–11 s after a skip. Pause reaches Cast in about 0.1 s.
+- **Two-way control**: play/pause and volume changed on the speaker or in the Google Home app reach the iPhone; track title, artist, album and artwork are sent to Cast.
+- **Volume curve matches the iPhone slider**: the bottom of the slider is silent and the middle is half volume.
+- Fix: Cast TVs with X.509 v1 certificates (for example Samsung The Frame) connect and are advertised.
+- Fix: Chromecasts with only an IPv6 address work; speakers that share a name get stable, distinct AirPlay names.
+- Temporary Google speaker groups no longer show up as extra AirPlay speakers; groups made in the Google Home app still do.
+- AirPlay 1 is removed; PlayOnAir is AirPlay 2 only.
+
 ## 0.2.3
 
 - Fix: Cast LOAD no longer leaves an active media session after the caller times out (late success is abandoned and stopped).
