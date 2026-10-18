@@ -42,10 +42,7 @@ pub(super) fn test_playing_session(
     stall_reload_owed: false,
     started_at: Instant::now(),
     flac_strike: None,
-    pause_debounce_arm: 0,
-    pause_debounce_cancel: None,
-    flush_debounce_arm: 0,
-    flush_debounce_cancel: None,
+    transport_flight: Arc::new(tokio::sync::Mutex::new(())),
     tasks: SessionTasks::default(),
     rollover_cancel: None,
     rollover_task: None,
@@ -123,12 +120,24 @@ pub(super) enum CastCall {
   GetVolume(String),
   Pause(String),
   Play(String),
+  MediaStatus(String),
   Stop(String),
   SessionEnded(String),
   Metadata(String),
-  SetPlaybackDevices { key: String, members: Vec<String> },
-  OpenHost { key: String, host: String, port: u16 },
-  Move { from: String, to: String },
+  SetPlaybackDevices {
+    key: String,
+    members: Vec<String>,
+  },
+  OpenHost {
+    key: String,
+    host: String,
+    port: u16,
+  },
+  Move {
+    from: String,
+    to: String,
+    session_id: Option<String>,
+  },
   CloseHost(String),
 }
 
@@ -149,11 +158,18 @@ pub(super) struct FakeCast {
   answers: Mutex<std::collections::VecDeque<crate::error::Result<crate::cast::PlaybackSessionUpdate>>>,
   /// Run (once) while the next LOAD is on the wire.
   load_hook: Mutex<Option<LoadHook>>,
+  /// Results of the next `move_session` calls, in order; an empty queue moves successfully.
+  moves: Mutex<std::collections::VecDeque<crate::error::Result<()>>>,
 }
 
 impl FakeCast {
   pub(super) fn answer(&self, answer: crate::error::Result<crate::cast::PlaybackSessionUpdate>) {
     self.answers.lock().push_back(answer);
+  }
+
+  /// Answer the next `move_session` with `result` (an adopt that fails on the new host).
+  pub(super) fn answer_move(&self, result: crate::error::Result<()>) {
+    self.moves.lock().push_back(result);
   }
 
   /// Run `hook` during the next LOAD, before it returns.
@@ -199,14 +215,25 @@ impl CastControl for FakeCast {
     Ok(0.5)
   }
 
-  fn pause(&self, key: &str) -> crate::error::Result<()> {
+  fn pause(&self, key: &str) -> crate::error::Result<crate::cast::MediaPlayback> {
     self.record(CastCall::Pause(key.to_owned()));
-    Ok(())
+    Ok(crate::cast::MediaPlayback {
+      player_state: rust_cast::channels::media::PlayerState::Paused,
+      current_time: Some(1.0),
+    })
   }
 
   fn play(&self, key: &str) -> crate::error::Result<()> {
     self.record(CastCall::Play(key.to_owned()));
     Ok(())
+  }
+
+  fn media_playback(&self, key: &str) -> crate::error::Result<crate::cast::MediaPlayback> {
+    self.record(CastCall::MediaStatus(key.to_owned()));
+    Ok(crate::cast::MediaPlayback {
+      player_state: rust_cast::channels::media::PlayerState::Paused,
+      current_time: Some(1.0),
+    })
   }
 
   fn stop_best_effort(&self, key: &str, _timeout: std::time::Duration) -> bool {
@@ -246,9 +273,13 @@ impl CastControl for FakeCast {
     });
   }
 
-  fn move_session(&self, from: &str, to: &str) -> crate::error::Result<()> {
-    self.record(CastCall::Move { from: from.to_owned(), to: to.to_owned() });
-    Ok(())
+  fn move_session(&self, from: &str, to: &str, session_id: Option<&str>) -> crate::error::Result<()> {
+    self.record(CastCall::Move {
+      from: from.to_owned(),
+      to: to.to_owned(),
+      session_id: session_id.map(str::to_owned),
+    });
+    self.moves.lock().pop_front().unwrap_or(Ok(()))
   }
 
   fn close_session_host(&self, key: &str) {

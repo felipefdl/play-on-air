@@ -203,9 +203,27 @@ expansion moves the session to a new group endpoint on the leader's IP and a new
 ### Remove a speaker
 
 `SET_PLAYBACK_DEVICES` with the member omitted, sent to the group endpoint. The Home app marks it
-`DESELECTING` and waits for `DEVICE_REMOVED` or a status without it. (Medium: code only) What the
-endpoint does when one member remains (keep the group endpoint or move back to the physical device
-with a new `sessionEndpoint`) is not observed [INFERENCE: probably moves back].
+`DESELECTING` and waits for `DEVICE_REMOVED` or a status without it. (Medium: code only)
+
+Seen live with PlayOnAir: shrinking a two-speaker group (Gym leader on group endpoint
+`172.27.10.213:32158`, Pool Bathroom member) to Pool Bathroom alone answered with a
+`sessionEndpoint` on Pool Bathroom's own `172.27.10.145:8009`; the group endpoint went away. A
+`CONNECT` plus media `GET_STATUS` there on the session's **old** transport id made the receiver
+close the connection (EOF, "failed to fill whole buffer"). (High)
+
+### Following a moved session
+
+After any `sessionEndpoint`, the sender drops its connection state and reconnects to
+`ipAddress:port` (`pgm.java`, "Session endpoint changed. Removing old session connection for
+session id"), then joins the app by session id. PlayOnAir does the same: receiver `GET_STATUS` on
+the new host, the application whose `sessionId` is `sessionEndpoint.sessionId` (else the session's
+own id) and that lists the media namespace, `CONNECT` to that application's `transportId`, media
+`GET_STATUS` for the media session id. The old transport id is never reused on the new host.
+(High for the reconnect; Medium that the transport id changes, inferred from the EOF above)
+
+If that fails, the session no longer plays where PlayOnAir's control was, so PlayOnAir re-LOADs a
+fresh session on the group owner's own speaker and adds the remaining members back with
+`SET_PLAYBACK_DEVICES`.
 
 ### End the group
 

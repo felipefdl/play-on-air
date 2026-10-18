@@ -22,6 +22,9 @@
 //!   speaker is then dropped from the list. Ending and re-LOADing on a member instead would gap
 //!   every speaker and re-form the group.
 //! - The last member leaving ends the Cast session normally (STOP on the session host).
+//! - When Cast moves the session (`sessionEndpoint`), media control joins it on the new host by
+//!   session id. If that fails, control never stays on the old endpoint: the owner re-LOADs a
+//!   fresh session on its own speaker and the remaining members are added back.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,6 +36,7 @@ use crate::cast::{PlaybackDevice, SessionEndpoint, SetPlaybackDevices, normalize
 use crate::error::Error;
 
 use super::Bridge;
+use super::load::ReloadOutcome;
 use super::stall::spawn_stall_watchdog;
 use super::start::accept_start_in;
 use super::state::{CastRoute, DeviceState, FollowingSession, PlayingSession, RingPump};
@@ -249,6 +253,23 @@ impl Bridge {
     self.schedule_group_reconcile(uuid);
   }
 
+  /// An accepted re-LOAD of `device_id`: if it owns a group whose Cast membership is unconfirmed
+  /// (a fresh session after a failed move), confirm it and re-add the members.
+  pub(super) fn confirm_group_session(self: &Arc<Self>, device_id: &str) {
+    let Some(uuid) = self.session_group(device_id) else {
+      return;
+    };
+    let unconfirmed = self
+      .groups
+      .lock()
+      .get(&uuid)
+      .is_some_and(|group| group.owner.as_deref() == Some(device_id) && group.cast_members.is_empty());
+    if unconfirmed {
+      tracing::info!(%device_id, group = %uuid, "group owner's Cast session re-LOADed; re-adding the members");
+      self.group_owner_playing(&uuid, device_id);
+    }
+  }
+
   /// A follower's AirPlay session ended: drop it from the Cast group.
   pub(super) fn end_following(self: &Arc<Self>, device_id: &str, generation: u64) {
     let follower = {
@@ -329,15 +350,6 @@ impl Bridge {
     };
     session.device_id.clone_from(&survivor);
     session.route.set_volume(&survivor);
-    // Debounce timers of the old owner would fire against its (now idle) slot.
-    if let Some(timer) = session.pause_debounce_cancel.take() {
-      session.pause_debounce_arm = session.pause_debounce_arm.wrapping_add(1);
-      timer.abort();
-    }
-    if let Some(timer) = session.flush_debounce_cancel.take() {
-      session.flush_debounce_arm = session.flush_debounce_arm.wrapping_add(1);
-      timer.abort();
-    }
     if let Some(cancel) = session.watchdog_cancel.take() {
       let _cancelled = cancel.send(());
     }
@@ -590,7 +602,8 @@ impl Bridge {
       .cloned()
       .collect();
     let desired = desired_members(&group.cast_members, &owner, &followers);
-    if desired == group.cast_members {
+    // No confirmed Cast session to expand yet (the owner's LOAD confirms it).
+    if group.cast_members.is_empty() || desired == group.cast_members {
       return None;
     }
     let added: Vec<String> = desired.iter().filter(|id| !group.cast_members.contains(id)).cloned().collect();
@@ -674,13 +687,22 @@ impl Bridge {
     }
 
     if let Some(endpoint) = moved_to {
-      self.follow_session_endpoint(uuid, &plan.route, &endpoint).await;
+      self.follow_session_endpoint(uuid, &plan.owner, &plan.route, &endpoint).await;
     }
   }
 
   /// The Cast session moved to `endpoint`: media control (LOAD, PAUSE, PLAY, STOP, ownership
   /// probes) follows it there, since that host runs the Default Media Receiver now.
-  async fn follow_session_endpoint(&self, uuid: &str, route: &Arc<CastRoute>, endpoint: &SessionEndpoint) {
+  ///
+  /// If the session cannot be taken over there, it no longer plays where control was either, so
+  /// the owner re-LOADs a fresh session on its own speaker and the members are added back.
+  async fn follow_session_endpoint(
+    self: &Arc<Self>,
+    uuid: &str,
+    owner: &str,
+    route: &Arc<CastRoute>,
+    endpoint: &SessionEndpoint,
+  ) {
     let new_key = session_host_key(endpoint);
     let old_key = route.media();
     if new_key == old_key {
@@ -689,39 +711,80 @@ impl Bridge {
     let pool = Arc::clone(&self.cast_pool);
     let (host, port) = (endpoint.ip_address.clone(), endpoint.port);
     let (from, to) = (old_key.clone(), new_key.clone());
+    let session_id = endpoint.session_id.clone();
     let moved = tokio::task::spawn_blocking(move || {
       pool.open_session_host(&to, &host, port);
-      pool.move_session(&from, &to)
+      pool.move_session(&from, &to, session_id.as_deref())
     })
     .await
     .unwrap_or_else(|join_err| Err(Error::Bridge(format!("session move task join: {join_err}"))));
-    match moved {
+    let previous_host = match moved {
       Ok(()) => {
         route.set_media(&new_key);
-        let previous_host = {
+        let previous = {
           let mut groups = self.groups.lock();
           groups.get_mut(uuid).and_then(|group| group.host_key.replace(new_key.clone()))
         };
-        if let Some(previous) = previous_host.filter(|previous| *previous != new_key) {
-          self.close_session_host(previous);
-        }
         tracing::info!(
           group = %uuid,
           from = %old_key,
           to = %new_key,
           "Cast group session moved; media control follows the session host"
         );
+        previous
       },
       Err(err) => {
         tracing::warn!(
           group = %uuid,
+          from = %old_key,
           host = %new_key,
+          %owner,
           error = %err,
-          "cannot take over the moved Cast session; keeping media control on {old_key}"
+          "cannot take over the moved Cast session; re-LOADing on the owner's speaker and re-adding members"
         );
-        self.close_session_host(new_key);
+        route.set_media(owner);
+        let previous = {
+          let mut groups = self.groups.lock();
+          groups.get_mut(uuid).and_then(|group| {
+            group.cast_members.clear();
+            group.host_key.take()
+          })
+        };
+        self.close_session_host(new_key.clone());
+        self.reload_group_owner(uuid, owner);
+        previous
       },
+    };
+    if let Some(previous) = previous_host.filter(|previous| *previous != new_key) {
+      self.close_session_host(previous);
     }
+  }
+
+  /// Fresh LOAD of the group owner's session on its own speaker (after a failed session move).
+  ///
+  /// Runs as a session task behind the membership change that holds the re-LOAD flight; the
+  /// accepted LOAD re-adds the members ([`Self::confirm_group_session`]). While paused, the
+  /// resume's PLAY finds no media on the speaker and re-LOADs instead.
+  fn reload_group_owner(self: &Arc<Self>, uuid: &str, owner: &str) {
+    let Some(generation) = self.session_generation(owner) else {
+      return;
+    };
+    let bridge = Arc::clone(self);
+    let (group, device_id) = (uuid.to_owned(), owner.to_owned());
+    self.spawn_session_task(owner, generation, async move {
+      match bridge
+        .reload_playing_media(&device_id, generation, "group_move_failed", None)
+        .await
+      {
+        ReloadOutcome::Loaded => {},
+        ReloadOutcome::Paused => {
+          tracing::info!(%device_id, %group, generation, "group session re-LOAD waits for resume");
+        },
+        ReloadOutcome::Failed => {
+          tracing::warn!(%device_id, %group, generation, "group session re-LOAD on the owner's speaker failed");
+        },
+      }
+    });
   }
 }
 
@@ -889,7 +952,78 @@ mod tests {
     assert!(calls.contains(&CastCall::Move {
       from: A.to_owned(),
       to: HOST_KEY.to_owned(),
+      session_id: Some("session-a".to_owned()),
     }));
+    h.stop().await;
+  }
+
+  /// Live failure: the owner leaves, the shrink moves the session to a new endpoint, and the
+  /// session cannot be taken over there. Control must not stay on the old (gone) endpoint: the
+  /// surviving owner re-LOADs on its own speaker, the remaining member is added back, and
+  /// transport commands go to the new session.
+  #[tokio::test]
+  async fn failed_takeover_after_move_reloads_on_the_survivor_and_re_expands() {
+    let h = Harness::start();
+    let _rings = form_group(&h).await;
+    let _ring_c = h.airplay_start(C);
+    h.wait_for("third member joined", |it| it.cast_members() == ids(&[A, B, C]))
+      .await;
+    let moved_host = "cast-session:127.0.0.1:32300";
+    h.cast.answer(Ok(PlaybackSessionUpdate {
+      name: Some("Gym speaker + 1".to_owned()),
+      failed_devices: Vec::new(),
+      endpoint: Some(SessionEndpoint {
+        device_id: "7d0c1f2e-0000-4000-8000-000000000001".to_owned(),
+        ip_address: "127.0.0.1".to_owned(),
+        port: 32300,
+        session_id: Some("session-a".to_owned()),
+      }),
+    }));
+    h.cast
+      .answer_move(Err(Error::Cast("adopt media status: failed to fill whole buffer".to_owned())));
+
+    h.airplay_end(A);
+    h.wait_for("fresh LOAD on the survivor's speaker", |it| {
+      it.cast.calls().contains(&CastCall::Load(B.to_owned()))
+    })
+    .await;
+    h.wait_for("members re-added on the survivor's speaker", |it| {
+      it.cast_members() == ids(&[B, C])
+    })
+    .await;
+
+    let calls = h.cast.calls();
+    assert!(calls.contains(&CastCall::Move {
+      from: HOST_KEY.to_owned(),
+      to: moved_host.to_owned(),
+      session_id: Some("session-a".to_owned()),
+    }));
+    assert!(calls.contains(&CastCall::CloseHost(moved_host.to_owned())));
+    assert!(
+      calls.contains(&CastCall::CloseHost(HOST_KEY.to_owned())),
+      "the old endpoint is dropped"
+    );
+    assert_eq!(
+      h.set_playback_calls().last(),
+      Some(&(B.to_owned(), ids(&[B, C]))),
+      "re-expansion from the survivor's speaker"
+    );
+    assert_eq!(h.bridge.owner_for_cast_key(B).as_deref(), Some(B));
+    assert_eq!(h.bridge.owner_for_cast_key(HOST_KEY), None, "no control on the gone endpoint");
+    assert!(h.playing_owner(B));
+    assert!(h.bridge.is_following(C));
+
+    for device_id in [B, C] {
+      h.send(AirPlaySessionEvent::Paused {
+        device_id: device_id.to_owned(),
+        at: Instant::now(),
+      });
+    }
+    h.wait_for("pause on the survivor's speaker", |it| {
+      it.cast.calls().contains(&CastCall::Pause(B.to_owned()))
+    })
+    .await;
+    assert!(!h.cast.calls().contains(&CastCall::Pause(HOST_KEY.to_owned())));
     h.stop().await;
   }
 
@@ -969,16 +1103,17 @@ mod tests {
     let _rings = form_group(&h).await;
 
     for device_id in [A, B] {
-      h.send(AirPlaySessionEvent::Paused { device_id: device_id.to_owned() });
+      h.send(AirPlaySessionEvent::Paused {
+        device_id: device_id.to_owned(),
+        at: Instant::now(),
+      });
       h.send(AirPlaySessionEvent::Volume {
         device_id: device_id.to_owned(),
         volume_db: -10.0,
       });
     }
-    h.wait_for("debounced pause", |it| {
-      it.cast.calls().contains(&CastCall::Pause(HOST_KEY.to_owned()))
-    })
-    .await;
+    h.wait_for("pause", |it| it.cast.calls().contains(&CastCall::Pause(HOST_KEY.to_owned())))
+      .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let calls = h.cast.calls();
     let pauses = calls.iter().filter(|c| matches!(c, CastCall::Pause(_))).count();

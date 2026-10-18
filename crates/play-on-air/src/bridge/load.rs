@@ -313,12 +313,15 @@ impl Bridge {
   /// re-LOAD it is re-evaluated and skipped (returning `true`) when a LOAD published after that
   /// flush was already accepted. An accepted LOAD records the flush requests it covers, so an
   /// abandoned flush (pause, failure) stays owed for the next resume.
+  ///
+  /// An accepted re-LOAD of a group owner whose Cast session is new (after a failed session
+  /// move) re-adds the group's members.
   #[expect(
     clippy::too_many_lines,
     reason = "flight serialize + multi-stage pause/gen validity gates must stay ordered (B2)"
   )]
   pub(super) async fn reload_playing_media(
-    &self,
+    self: &Arc<Self>,
     device_id: &str,
     generation: u64,
     reason: &str,
@@ -478,6 +481,7 @@ impl Bridge {
             media_session_id = session.media_session_id,
             "Cast re-LOAD ok"
           );
+          self.confirm_group_session(device_id);
           return ReloadOutcome::Loaded;
         }
         // Wire success was not accepted — STOP unless replace forbids it (B1 orphan otherwise).

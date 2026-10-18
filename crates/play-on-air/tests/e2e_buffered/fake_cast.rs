@@ -3,7 +3,9 @@
 //! Accepts the control-plane traffic the warm Cast pool sends (CONNECT, PING,
 //! `GET_STATUS`, LAUNCH, LOAD, PAUSE, PLAY, STOP, `SET_VOLUME`, multizone
 //! `SET_PLAYBACK_DEVICES`) and answers with `RECEIVER_STATUS` / `MEDIA_STATUS` / `PONG` /
-//! `PLAYBACK_SESSION_UPDATED` (the session "moves" to a group endpoint on this same port). Each LOAD starts a consumer that GETs the
+//! `PLAYBACK_SESSION_UPDATED` (the session "moves" to a group endpoint on this same port and,
+//! like a real move, its app gets a new transport id; a media message to any other transport
+//! closes the connection, as a receiver does). Each LOAD starts a consumer that GETs the
 //! media URL (always dialed on `127.0.0.1`, keeping the test on loopback) and decodes
 //! the chunked FLAC body with claxon, recording channel 0 and arrival times.
 
@@ -30,7 +32,8 @@ const NS_MULTIZONE: &str = "urn:x-cast:com.google.cast.multizone";
 pub(crate) const GROUP_ENDPOINT_ID: &str = "5c23adbc-893b-446c-bb38-a935d16e1be4";
 const APP_ID: &str = "CC1AD845";
 const SESSION_ID: &str = "fake-session-1";
-const TRANSPORT_ID: &str = "fake-transport-1";
+/// Transport id prefix; the number goes up with every session move.
+const TRANSPORT_PREFIX: &str = "fake-transport-";
 /// Poll interval for stop flags on blocking sockets.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -65,10 +68,18 @@ pub(crate) struct Command {
 #[derive(Debug, Default)]
 struct DeviceState {
   launched: bool,
+  /// Session moves so far; the app's transport id is `fake-transport-<moves + 1>`.
+  moves: u32,
   media_session_id: i32,
   player_state: String,
   content_id: Option<String>,
   volume: f64,
+}
+
+impl DeviceState {
+  fn transport_id(&self) -> String {
+    format!("{TRANSPORT_PREFIX}{}", self.moves + 1)
+  }
 }
 
 #[derive(Debug, Default)]
@@ -203,7 +214,11 @@ fn serve_session(tcp: TcpStream, config: Arc<ServerConfig>, shared: &Arc<Shared>
       }
       let frame: Vec<u8> = inbox.drain(..4 + frame_len).skip(4).collect();
       let message = CastMessage::decode(&frame);
-      for reply in handle(shared, &message) {
+      let Some(replies) = handle(shared, &message) else {
+        // A real receiver drops the connection on a message to an unknown transport.
+        return;
+      };
+      for reply in replies {
         let encoded = reply.encode();
         let mut wire = u32::try_from(encoded.len()).expect("frame fits").to_be_bytes().to_vec();
         wire.extend_from_slice(&encoded);
@@ -215,7 +230,8 @@ fn serve_session(tcp: TcpStream, config: Arc<ServerConfig>, shared: &Arc<Shared>
   }
 }
 
-fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Vec<CastMessage> {
+/// Replies to `message`; `None` closes the connection (media message to an unknown transport).
+fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Option<Vec<CastMessage>> {
   let payload: Value = serde_json::from_str(&message.payload).unwrap_or(Value::Null);
   let kind = payload.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
   let request_id = payload.get("requestId").and_then(Value::as_u64).unwrap_or(0);
@@ -231,7 +247,10 @@ fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Vec<CastMessage> {
     namespace: namespace.to_owned(),
     payload: body.to_string(),
   };
-  match (message.namespace.as_str(), kind.as_str()) {
+  if message.namespace == NS_MEDIA && message.destination != shared.state.lock().transport_id() {
+    return None;
+  }
+  Some(match (message.namespace.as_str(), kind.as_str()) {
     (NS_HEARTBEAT, "PING") => vec![reply(NS_HEARTBEAT, json!({ "type": "PONG" }))],
     (NS_RECEIVER, "LAUNCH" | "GET_STATUS" | "SET_VOLUME" | "STOP") => {
       let mut state = shared.state.lock();
@@ -281,6 +300,9 @@ fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Vec<CastMessage> {
     },
     (NS_MULTIZONE, "SET_PLAYBACK_DEVICES") => {
       let session_id = payload.get("sessionId").cloned().unwrap_or(Value::Null);
+      let mut state = shared.state.lock();
+      state.moves = state.moves.saturating_add(1);
+      drop(state);
       vec![reply(
         NS_MULTIZONE,
         json!({
@@ -300,7 +322,7 @@ fn handle(shared: &Arc<Shared>, message: &CastMessage) -> Vec<CastMessage> {
     },
     // CONNECT / CLOSE on `tp.connection` need no reply; other requests are ignored.
     _ => Vec::new(),
-  }
+  })
 }
 
 fn receiver_status(state: &DeviceState, request_id: u64) -> Value {
@@ -308,7 +330,7 @@ fn receiver_status(state: &DeviceState, request_id: u64) -> Value {
     json!([{
       "appId": APP_ID,
       "sessionId": SESSION_ID,
-      "transportId": TRANSPORT_ID,
+      "transportId": state.transport_id(),
       "displayName": "Default Media Receiver",
       "statusText": "",
       "namespaces": [{ "name": NS_MEDIA }],

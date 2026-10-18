@@ -472,7 +472,8 @@ async fn flush_then_new_anchor_drops_old_track() {
 
 /// Cast pool against the fake device: `SET_PLAYBACK_DEVICES` carries the receiver app session
 /// id and the full member list to `receiver-0`, and after the answered session move media
-/// control runs on the session host while the old worker no longer owns the session.
+/// control runs on the session host, on the app's new transport (a message to the old one
+/// would close the connection), while the old worker no longer owns the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multizone_expansion_moves_media_control_to_the_session_host() {
   let _serial = SERIAL.lock().await;
@@ -508,8 +509,9 @@ async fn multizone_expansion_moves_media_control_to_the_session_host() {
     )?;
     let endpoint = update.endpoint.clone().expect("session moved");
     flow_pool.open_session_host("mz-host", &endpoint.ip_address, endpoint.port);
-    flow_pool.move_session("mz-leader", "mz-host")?;
-    flow_pool.pause("mz-host")?;
+    flow_pool.move_session("mz-leader", "mz-host", endpoint.session_id.as_deref())?;
+    let paused = flow_pool.pause("mz-host")?;
+    assert_eq!(paused.player_state, rust_cast::channels::media::PlayerState::Paused);
     // A re-LOAD (skip, stall) on the session host joins the running receiver: no LAUNCH.
     drop(flow_pool.load("mz-host", MediaLoadRequest::flac(media_url, CastStreamKind::Live))?);
     let leader_still_owns = flow_pool.pause("mz-leader").is_ok();
@@ -538,12 +540,62 @@ async fn multizone_expansion_moves_media_control_to_the_session_host() {
   assert_eq!(set.payload["sessionId"], session.session_id.as_str());
   assert_eq!(set.payload["sessionName"], "Leader + 1");
   assert_eq!(set.payload["deviceList"][1]["deviceId"], "56cb7fe7e13f325625325c4a304c57fa");
-  let pauses = commands.iter().filter(|cmd| cmd.kind == "PAUSE").count();
-  assert_eq!(pauses, 1, "one PAUSE, from the session host");
+  let pauses: Vec<&str> = commands
+    .iter()
+    .filter(|cmd| cmd.kind == "PAUSE")
+    .map(|cmd| cmd.destination.as_str())
+    .collect();
+  assert_eq!(
+    pauses,
+    vec!["fake-transport-2"],
+    "one PAUSE, from the session host, on the moved app's transport"
+  );
   let launches = commands.iter().filter(|cmd| cmd.kind == "LAUNCH").count();
   assert_eq!(launches, 1, "only the first LOAD launches the receiver");
   let loads = commands.iter().filter(|cmd| cmd.kind == "LOAD").count();
   assert_eq!(loads, 2);
+
+  tokio::task::spawn_blocking(move || pool.shutdown())
+    .await
+    .expect("Cast pool shutdown");
+  tokio::task::spawn_blocking(move || cast.stop()).await.expect("fake Cast stop");
+  drop(media);
+}
+
+/// A moved session the new host does not run (here: the session id the move reported is not
+/// there) is not adopted, and the old worker does not take it back: its host no longer plays it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_session_takeover_leaves_no_worker_in_control() {
+  let _serial = SERIAL.lock().await;
+  let cast = FakeCast::start();
+  let port = cast.port();
+  let media = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("media listener");
+  let media_url = format!("http://127.0.0.1:{}/stream", media.local_addr().expect("media addr").port());
+  let device = Device::new("mz-gone", "Gone", "127.0.0.1", "localhost", port, "mz-gone");
+  let pool = Arc::new(CastPool::new(None));
+  pool.ensure(&device);
+
+  let flow_pool = Arc::clone(&pool);
+  let (moved, leader_owns, host_owns) = tokio::task::spawn_blocking(move || {
+    drop(flow_pool.load("mz-gone", MediaLoadRequest::flac(media_url, CastStreamKind::Live))?);
+    flow_pool.open_session_host("mz-gone-host", "127.0.0.1", port);
+    let moved = flow_pool.move_session("mz-gone", "mz-gone-host", Some("not-running-here"));
+    let leader_owns = flow_pool.pause("mz-gone").is_ok();
+    let host_owns = flow_pool.pause("mz-gone-host").is_ok();
+    Ok::<_, play_on_air::error::Error>((moved, leader_owns, host_owns))
+  })
+  .await
+  .expect("join takeover flow")
+  .expect("takeover flow");
+
+  let err = moved.expect_err("takeover must fail");
+  assert!(err.to_string().contains("no receiver app runs session"), "{err}");
+  assert!(!leader_owns, "no hand-back to the old host");
+  assert!(!host_owns, "the new host did not adopt a session it does not run");
+  assert!(
+    !cast.commands().iter().any(|cmd| cmd.kind == "PAUSE"),
+    "no PAUSE reached any transport"
+  );
 
   tokio::task::spawn_blocking(move || pool.shutdown())
     .await

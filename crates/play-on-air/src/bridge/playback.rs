@@ -1,6 +1,9 @@
-//! AirPlay pause / resume / flush / volume handling with re-anchor debounce timers.
+//! AirPlay pause / resume / flush / volume handling.
 //!
-//! Timers and the Cast PAUSE / PLAY commands they lead to run on the session's task set, so
+//! A pause sends Cast PAUSE at once: with the Cast read-ahead buffered on the speaker, every
+//! moment PAUSE waits is audible. A flush owes a re-LOAD to the next resume, when the sender's
+//! new anchor has queued audio (Cast still buffers the pre-flush audio, so PLAY would replay
+//! it). Cast PAUSE / PLAY and the post-PAUSE diagnostics probe run on the session's task set, so
 //! replace and end teardown abort them with the generation.
 
 use std::sync::Arc;
@@ -10,27 +13,18 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::airplay::airplay_db_to_cast_linear;
-use crate::cast::CastControl;
+use crate::cast::{CastControl, MediaPlayback};
 
 use super::Bridge;
-use super::state::{CastRoute, DeviceState};
+use super::state::{CastRoute, DeviceState, PlayingSession};
 
 /// After a long pause the Cast media session may be gone or holding a stale buffer tail.
 /// Re-LOAD instead of PLAY when the pause exceeded this budget.
 const LONG_PAUSE_RELOAD: Duration = Duration::from_secs(30);
 
-/// iOS timeline re-anchors emit a pause that is not user intent.
-///
-/// Debounce Cast PAUSE and flush re-LOAD for this window: a `Resumed` (or PCM restart)
-/// cancels a pending pause and logs "re-anchor absorbed"; a pending flush-all re-LOADs at
-/// resume instead (Cast buffers pre-flush audio). A real pause fires ~0.7 s late.
-const REANCHOR_DEBOUNCE: Duration = Duration::from_millis(700);
-
-/// Whether resume should skip Cast PLAY because a re-LOAD already owns the worker (D3).
-#[must_use]
-const fn resume_should_skip_play_for_reload(reload_in_flight: bool) -> bool {
-  reload_in_flight
-}
+/// After a Cast PAUSE is acknowledged, read the media status once more this much later, to see
+/// whether the receiver really stopped (position frozen) or keeps playing buffered audio.
+const PAUSE_PROBE_DELAY: Duration = Duration::from_secs(1);
 
 /// Whether a detached PAUSE/PLAY from `expected_gen` may still touch Cast for `device_id`.
 ///
@@ -40,16 +34,45 @@ fn detached_cast_control_allowed(alive: bool, live_gen: Option<u64>, expected_ge
   alive && live_gen == Some(expected_gen)
 }
 
+/// What a detached Cast PAUSE / PLAY needs from its session.
+#[derive(Debug)]
+struct TransportControl {
+  pool: Arc<dyn CastControl>,
+  route: Arc<CastRoute>,
+  session_alive: Arc<AtomicBool>,
+  playback_paused: Arc<AtomicBool>,
+  transport_flight: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl TransportControl {
+  fn of(session: &PlayingSession) -> Self {
+    Self {
+      pool: Arc::clone(&session.pool),
+      route: Arc::clone(&session.route),
+      session_alive: Arc::clone(&session.session_alive),
+      playback_paused: Arc::clone(&session.playback_paused),
+      transport_flight: Arc::clone(&session.transport_flight),
+    }
+  }
+}
+
+/// Where a pause started, for the latency report.
+#[derive(Debug, Clone, Copy)]
+struct PauseOrigin {
+  /// When the AirPlay receiver got the rate 0 (or flush).
+  rate0_at: Instant,
+  /// Media body bytes served at that moment.
+  bytes_at_rate0: u64,
+}
+
 /// Cast follow-up chosen by [`Bridge::plan_resume`] (bookkeeping already applied).
 #[derive(Debug)]
 enum ResumeAction {
-  /// Pending re-anchor pause/flush cancelled; no Cast command.
-  Absorb,
+  /// Not paused and nothing owed; no Cast command.
+  None,
   Play {
     generation: u64,
-    pool: Arc<dyn CastControl>,
-    route: Arc<CastRoute>,
-    session_alive: Arc<AtomicBool>,
+    control: TransportControl,
   },
   Reload {
     generation: u64,
@@ -59,162 +82,174 @@ enum ResumeAction {
   },
 }
 
-/// Pure decision for a `Paused` event (unit-tested).
+/// Pure decision for a `Resumed` event (unit-tested).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReanchorPauseDecision {
-  /// Already paused (pending or committed); ignore duplicate.
-  Ignore,
-  /// Arm (or re-arm) the pause debounce timer; set local `paused`.
-  ArmDebounce,
-}
-
-/// Pure decision for a `Resumed` event after inspecting pending debounce state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReanchorResumeDecision {
-  /// Cancel pending pause and/or flush; no Cast command.
-  Absorb,
+enum ResumeDecision {
   /// Cast was paused; issue PLAY.
   Play,
   /// Cast was paused longer than [`LONG_PAUSE_RELOAD`]; re-LOAD.
   Reload,
-  /// A fired flush never got its re-LOAD (a pause abandoned it); re-LOAD so Cast does not
-  /// replay the pre-flush buffer tail.
-  ReloadOwedFlush,
-  /// A stall re-LOAD was abandoned by a pause; Cast's media is still stalled, so re-LOAD.
-  ReloadOwedStall,
-  /// A flush-all is pending: Cast still buffers up to `CAST_READ_AHEAD` of audio from before
-  /// it (old track on a skip), so re-LOAD now that the new anchor's audio is queued.
+  /// A flush is owed: Cast still buffers up to `CAST_READ_AHEAD` of audio from before it (the
+  /// old track on a skip), so re-LOAD now that the new anchor's audio is queued.
   ReloadFlush,
-  /// Nothing to do (not paused, no pending timers).
+  /// A stall re-LOAD was abandoned by a pause; Cast's media is still stalled, so re-LOAD.
+  ReloadStall,
+  /// Not paused and nothing owed.
   None,
 }
 
-/// A re-LOAD a pause abandoned and the next resume owes.
+/// A re-LOAD the next resume owes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwedReload {
   None,
-  /// A fired flush (takes precedence: its LOAD also replaces stalled media).
+  /// A flush (takes precedence: its LOAD also replaces stalled media).
   Flush,
-  /// A stall re-LOAD.
+  /// A stall re-LOAD a pause abandoned.
   Stall,
 }
 
-const fn reanchor_on_paused(already_paused: bool) -> ReanchorPauseDecision {
-  if already_paused {
-    ReanchorPauseDecision::Ignore
-  } else {
-    ReanchorPauseDecision::ArmDebounce
-  }
-}
-
-#[expect(
-  clippy::fn_params_excessive_bools,
-  reason = "pure decision helper mirrors resume pending/paused flags for unit tests"
-)]
-const fn reanchor_on_resumed(
-  pause_pending: bool,
-  flush_pending: bool,
-  paused: bool,
-  long_pause: bool,
-  owed: OwedReload,
-) -> ReanchorResumeDecision {
-  // An owed re-LOAD outranks re-anchor absorb. Flush: the ring was already cleared, so only a
-  // fresh LOAD drops the old track Cast still buffers (PLAY would resume that tail). Stall:
-  // Cast's media stopped pulling, so PLAY would not bring the audio back.
+const fn resume_decision(paused: bool, long_pause: bool, owed: OwedReload) -> ResumeDecision {
+  // An owed re-LOAD outranks PLAY. Flush: the ring was cleared, so only a fresh LOAD drops the
+  // old track Cast still buffers (PLAY would resume that tail). Stall: Cast's media stopped
+  // pulling, so PLAY would not bring the audio back.
   match owed {
-    OwedReload::Flush => return ReanchorResumeDecision::ReloadOwedFlush,
-    OwedReload::Stall => return ReanchorResumeDecision::ReloadOwedStall,
-    OwedReload::None => {},
+    OwedReload::Flush => ResumeDecision::ReloadFlush,
+    OwedReload::Stall => ResumeDecision::ReloadStall,
+    OwedReload::None if paused && long_pause => ResumeDecision::Reload,
+    OwedReload::None if paused => ResumeDecision::Play,
+    OwedReload::None => ResumeDecision::None,
   }
-  // A flush-all discarded everything queued; what Cast buffers is stale, and PLAY or absorb
-  // would play it before the sender's new audio.
-  if flush_pending {
-    return ReanchorResumeDecision::ReloadFlush;
-  }
-  // Pending pause means Cast was never paused — always absorb (no PLAY).
-  if pause_pending {
-    return ReanchorResumeDecision::Absorb;
-  }
-  // Cast PAUSE already issued (or long-lived paused without pending timer).
-  if paused {
-    if long_pause {
-      return ReanchorResumeDecision::Reload;
-    }
-    return ReanchorResumeDecision::Play;
-  }
-  ReanchorResumeDecision::None
 }
 
-/// Whether a pause debounce timer arm may issue Cast PAUSE.
-const fn reanchor_pause_timer_may_fire(still_paused: bool, arm_matches: bool) -> bool {
-  still_paused && arm_matches
-}
-
-/// Whether a flush debounce timer arm may issue re-LOAD.
-const fn reanchor_flush_timer_may_fire(arm_matches: bool) -> bool {
-  arm_matches
-}
-
-/// Pause re-anchor debounce: Cast PAUSE unless a resume aborts this task first.
-async fn pause_debounce_timer(bridge: Arc<Bridge>, device_id: String, generation: u64, arm: u64) {
-  sleep(REANCHOR_DEBOUNCE).await;
-  bridge.fire_pause_debounce(&device_id, generation, arm);
-}
-
-/// Flush re-anchor debounce: re-LOAD unless a resume aborts this task first.
-async fn flush_debounce_timer(bridge: Arc<Bridge>, device_id: String, generation: u64, arm: u64) {
-  sleep(REANCHOR_DEBOUNCE).await;
-  bridge.fire_flush_debounce(&device_id, generation, arm);
-}
-
-/// Cast PAUSE after the debounce elapsed; re-checks generation + liveness on the blocking side.
+/// Cast PAUSE for a rate 0, in order with PLAY, then the post-PAUSE probe.
+///
+/// Under [`TransportControl::transport_flight`] the command re-checks that the session still
+/// wants to be paused, so a resume that overtook it leaves Cast playing.
 async fn cast_pause_command(
   bridge: Arc<Bridge>,
   device_id: String,
   generation: u64,
-  pool: Arc<dyn CastControl>,
-  route: Arc<CastRoute>,
-  session_alive: Arc<AtomicBool>,
+  origin: PauseOrigin,
+  control: TransportControl,
 ) {
+  let transport = control.transport_flight.lock().await;
+  let started = Instant::now();
+  let check_bridge = Arc::clone(&bridge);
   let id = device_id.clone();
+  let pool = Arc::clone(&control.pool);
+  let route = Arc::clone(&control.route);
+  let alive = Arc::clone(&control.session_alive);
+  let paused = Arc::clone(&control.playback_paused);
   let pause_result = tokio::task::spawn_blocking(move || {
-    let live_gen = bridge.session_generation(&id);
-    if !detached_cast_control_allowed(session_alive.load(Ordering::Acquire), live_gen, generation) {
-      return Ok(());
+    let live_gen = check_bridge.session_generation(&id);
+    if !detached_cast_control_allowed(alive.load(Ordering::Acquire), live_gen, generation)
+      || !paused.load(Ordering::Acquire)
+    {
+      return Ok(None);
     }
-    pool.pause(&route.media())
+    pool.pause(&route.media()).map(Some)
   })
   .await;
-  match pause_result {
-    Ok(Ok(())) => {},
+  drop(transport);
+  let acked_at = Instant::now();
+  let ack = match pause_result {
+    Ok(Ok(Some(ack))) => ack,
+    Ok(Ok(None)) => {
+      tracing::debug!(%device_id, generation, "Cast PAUSE skipped; resumed or replaced first");
+      return;
+    },
     Ok(Err(err)) => {
-      tracing::debug!(%device_id, generation, error = %err, "Cast pause failed");
+      tracing::warn!(%device_id, generation, error = %err, "Cast PAUSE failed");
+      return;
     },
     Err(err) => {
-      tracing::debug!(%device_id, generation, error = %err, "Cast pause task join failed");
+      tracing::warn!(%device_id, generation, error = %err, "Cast PAUSE task join failed");
+      return;
     },
-  }
+  };
+  let bytes_at_ack = bridge.served_bytes(&device_id, generation);
+  tracing::info!(
+    %device_id,
+    generation,
+    cast_target = %control.route.media(),
+    since_rate0_ms = acked_at.duration_since(origin.rate0_at).as_millis(),
+    bridge_ms = started.duration_since(origin.rate0_at).as_millis(),
+    command_ms = acked_at.duration_since(started).as_millis(),
+    player_state = ?ack.player_state,
+    current_time = ?ack.current_time,
+    bytes_since_rate0 = ?bytes_at_ack.map(|bytes| bytes.saturating_sub(origin.bytes_at_rate0)),
+    "Cast PAUSE acknowledged"
+  );
+  probe_after_pause(&bridge, &device_id, generation, &control, ack, bytes_at_ack).await;
 }
 
-/// Cast PLAY on resume; a failed PLAY falls back to a generation-scoped re-LOAD.
-async fn cast_play_command(
-  bridge: Arc<Bridge>,
-  device_id: String,
+/// Diagnostics: [`PAUSE_PROBE_DELAY`] after the PAUSE ack, report whether the receiver still
+/// advances its position and whether it kept pulling the media body.
+async fn probe_after_pause(
+  bridge: &Arc<Bridge>,
+  device_id: &str,
   generation: u64,
-  pool: Arc<dyn CastControl>,
-  route: Arc<CastRoute>,
-  session_alive: Arc<AtomicBool>,
+  control: &TransportControl,
+  ack: MediaPlayback,
+  bytes_at_ack: Option<u64>,
 ) {
-  let play_id = device_id.clone();
-  let bridge_for_check = Arc::clone(&bridge);
+  sleep(PAUSE_PROBE_DELAY).await;
+  if !control.playback_paused.load(Ordering::Acquire) || bridge.session_generation(device_id) != Some(generation) {
+    return;
+  }
+  let bytes_now = bridge.served_bytes(device_id, generation);
+  let pool = Arc::clone(&control.pool);
+  let key = control.route.media();
+  let status = tokio::task::spawn_blocking(move || pool.media_playback(&key)).await;
+  let probed = match status {
+    Ok(Ok(probed)) => probed,
+    Ok(Err(err)) => {
+      tracing::info!(%device_id, generation, error = %err, "Cast media status after PAUSE unavailable");
+      return;
+    },
+    Err(err) => {
+      tracing::debug!(%device_id, generation, error = %err, "Cast media status task join failed");
+      return;
+    },
+  };
+  let advanced_s = probed.current_time.zip(ack.current_time).map(|(later, then)| later - then);
+  let bytes_since_ack = bytes_now.zip(bytes_at_ack).map(|(later, then)| later.saturating_sub(then));
+  tracing::info!(
+    %device_id,
+    generation,
+    after_ms = PAUSE_PROBE_DELAY.as_millis(),
+    player_state = ?probed.player_state,
+    current_time = ?probed.current_time,
+    current_time_at_ack = ?ack.current_time,
+    advanced_s = ?advanced_s,
+    bytes_since_ack = ?bytes_since_ack,
+    "Cast media status after PAUSE"
+  );
+}
+
+/// Cast PLAY on resume, in order with PAUSE; a failed PLAY falls back to a re-LOAD.
+async fn cast_play_command(bridge: Arc<Bridge>, device_id: String, generation: u64, control: TransportControl) {
+  let transport = control.transport_flight.lock().await;
+  let check_bridge = Arc::clone(&bridge);
+  let id = device_id.clone();
+  let TransportControl {
+    pool,
+    route,
+    session_alive,
+    playback_paused,
+    ..
+  } = control;
   let play_result = tokio::task::spawn_blocking(move || {
-    let live_gen = bridge_for_check.session_generation(&play_id);
-    if !detached_cast_control_allowed(session_alive.load(Ordering::Acquire), live_gen, generation) {
+    let live_gen = check_bridge.session_generation(&id);
+    if !detached_cast_control_allowed(session_alive.load(Ordering::Acquire), live_gen, generation)
+      || playback_paused.load(Ordering::Acquire)
+    {
       return Ok(());
     }
     pool.play(&route.media())
   })
   .await;
+  drop(transport);
   match &play_result {
     Ok(Ok(())) => return,
     Ok(Err(err)) => {
@@ -266,13 +301,13 @@ impl Bridge {
     }
   }
 
-  /// Pause Cast media (AirPlay rate=0). Keeps HTTP + session in `Playing { paused }`.
+  /// Pause Cast media (AirPlay rate 0, received at `rate0_at`). Keeps HTTP + session in
+  /// `Playing { paused }`.
   ///
-  /// Local paused bookkeeping is synchronous; Cast PAUSE is **debounced** by
-  /// [`REANCHOR_DEBOUNCE`] so iOS re-anchors that resume quickly never reach Cast.
-  /// The timer is a session task spawned under the slot lock, so its abort handle is
-  /// recorded before it can fire.
-  pub(super) fn handle_pause(self: &Arc<Self>, device_id: &str) {
+  /// Local paused bookkeeping is synchronous and Cast PAUSE goes out at once: an iOS track
+  /// skip (flush, rate 0, then a new anchor) pauses too, and its resume re-LOADs. The PAUSE
+  /// is a session task spawned under the slot lock, so teardown aborts it with the generation.
+  pub(super) fn handle_pause(self: &Arc<Self>, device_id: &str, rate0_at: Instant) {
     let mut devices = self.devices.lock();
     let Some(DeviceState::Playing { generation: live_gen, session }) =
       devices.get_mut(device_id).map(|slot| &mut slot.state)
@@ -281,39 +316,50 @@ impl Bridge {
       tracing::debug!(%device_id, "dropping Paused; no Playing generation");
       return;
     };
-    if matches!(reanchor_on_paused(session.paused), ReanchorPauseDecision::Ignore) {
+    let generation = *live_gen;
+    if session.paused {
+      drop(devices);
+      tracing::debug!(%device_id, generation, "AirPlay paused; already paused");
       return;
     }
-    let generation = *live_gen;
     session.paused = true;
     session.playback_paused.store(true, Ordering::Release);
     session.paused_at = Some(Instant::now());
-    let arm = session.pause_debounce_arm.wrapping_add(1);
-    session.pause_debounce_arm = arm;
-    if let Some(prev) = session.pause_debounce_cancel.take() {
-      prev.abort();
-    }
-    let timer = pause_debounce_timer(Arc::clone(self), device_id.to_owned(), generation, arm);
-    session.pause_debounce_cancel = Some(session.tasks.spawn(device_id, timer));
+    let origin = PauseOrigin {
+      rate0_at,
+      bytes_at_rate0: session.media.bytes_served(),
+    };
+    let command = cast_pause_command(
+      Arc::clone(self),
+      device_id.to_owned(),
+      generation,
+      origin,
+      TransportControl::of(session),
+    );
+    let _pause = session.tasks.spawn(device_id, command);
     drop(devices);
-    tracing::debug!(%device_id, generation, arm, "AirPlay paused; arming re-anchor pause debounce");
+    tracing::info!(
+      %device_id,
+      generation,
+      queued_ms = rate0_at.elapsed().as_millis(),
+      "AirPlay paused; pausing Cast media"
+    );
   }
 
   /// Resume Cast media after AirPlay playout restarts.
   ///
-  /// Cancels pending pause/flush re-anchor timers first. Cast PLAY only if Cast was
-  /// actually paused (debounce already fired); re-LOAD after a long pause or when a fired
-  /// flush or a pause-abandoned stall re-LOAD is still owed. Detached PLAY re-checks the
-  /// generation and `session_alive` so a replaced generation cannot PLAY the new session.
+  /// Cast PLAY if paused; re-LOAD after a long pause or when a flush or a pause-abandoned stall
+  /// re-LOAD is owed. PLAY runs after any PAUSE still in flight and re-checks the generation and
+  /// `session_alive`, so a replaced generation cannot PLAY the new session.
   pub(super) fn handle_resume(self: &Arc<Self>, device_id: &str) {
     let Some(action) = self.plan_resume(device_id) else {
       return;
     };
     match action {
-      ResumeAction::Absorb => {},
-      ResumeAction::Play { generation, pool, route, session_alive } => {
+      ResumeAction::None => {},
+      ResumeAction::Play { generation, control } => {
         tracing::info!(%device_id, generation, "AirPlay resumed; resuming Cast media");
-        let command = cast_play_command(Arc::clone(self), device_id.to_owned(), generation, pool, route, session_alive);
+        let command = cast_play_command(Arc::clone(self), device_id.to_owned(), generation, control);
         self.spawn_session_task(device_id, generation, command);
       },
       ResumeAction::Reload { generation, reason, flush_request } => {
@@ -327,7 +373,7 @@ impl Bridge {
   /// Apply `Resumed` bookkeeping under the slot lock and choose the Cast follow-up.
   ///
   /// Every `Resumed` clears local pause state (whatever the decision), so the stall watchdog
-  /// and re-LOAD gates never see a stale `paused` after a cancelled pending pause.
+  /// and re-LOAD gates never see a stale `paused`.
   fn plan_resume(&self, device_id: &str) -> Option<ResumeAction> {
     let mut devices = self.devices.lock();
     let Some(DeviceState::Playing { generation: live_gen, session }) =
@@ -338,8 +384,6 @@ impl Bridge {
       return None;
     };
     let generation = *live_gen;
-    let pause_pending = session.pause_debounce_cancel.is_some();
-    let flush_pending = session.flush_debounce_cancel.is_some();
     let long_pause = session.paused_at.is_some_and(|at| at.elapsed() >= LONG_PAUSE_RELOAD);
     let owed = if session.flush_reload_owed() {
       OwedReload::Flush
@@ -348,69 +392,44 @@ impl Bridge {
     } else {
       OwedReload::None
     };
-    let decision = reanchor_on_resumed(pause_pending, flush_pending, session.paused, long_pause, owed);
-    // D3: flush/resume re-LOAD already on the Cast worker — PLAY would congest and time out.
-    let reload_in_flight = session.inflight_load.lock().is_some() || session.reload_flight.try_lock().is_err();
-
+    let decision = resume_decision(session.paused, long_pause, owed);
     session.paused = false;
     session.playback_paused.store(false, Ordering::Release);
     session.paused_at = None;
-    // Bump arms too: a timer already past its sleep (waiting on this lock) must not fire.
-    if let Some(timer) = session.pause_debounce_cancel.take() {
-      session.pause_debounce_arm = session.pause_debounce_arm.wrapping_add(1);
-      timer.abort();
-    }
-    if let Some(timer) = session.flush_debounce_cancel.take() {
-      session.flush_debounce_arm = session.flush_debounce_arm.wrapping_add(1);
-      timer.abort();
-    }
 
     let action = match decision {
-      ReanchorResumeDecision::Absorb => {
-        tracing::debug!(%device_id, generation, "re-anchor absorbed");
-        ResumeAction::Absorb
-      },
-      ReanchorResumeDecision::Play if resume_should_skip_play_for_reload(reload_in_flight) => {
-        tracing::debug!(%device_id, generation, "skip Cast PLAY; re-LOAD already in flight");
-        ResumeAction::Absorb
-      },
-      ReanchorResumeDecision::Play => ResumeAction::Play {
+      ResumeDecision::Play => ResumeAction::Play {
         generation,
-        pool: Arc::clone(&session.pool),
-        route: Arc::clone(&session.route),
-        session_alive: Arc::clone(&session.session_alive),
+        control: TransportControl::of(session),
       },
-      ReanchorResumeDecision::Reload => ResumeAction::Reload {
+      ResumeDecision::Reload => ResumeAction::Reload {
         generation,
         reason: "long_pause_resume",
         flush_request: None,
       },
-      ReanchorResumeDecision::ReloadOwedFlush => ResumeAction::Reload {
-        generation,
-        reason: "flush_owed_resume",
-        flush_request: Some(session.flush_reload_requested),
-      },
-      ReanchorResumeDecision::ReloadFlush => ResumeAction::Reload {
+      ResumeDecision::ReloadFlush => ResumeAction::Reload {
         generation,
         reason: "flush_resume",
-        flush_request: None,
+        flush_request: Some(session.flush_reload_requested),
       },
-      ReanchorResumeDecision::ReloadOwedStall => ResumeAction::Reload {
+      ResumeDecision::ReloadStall => ResumeAction::Reload {
         generation,
         reason: "stall_owed_resume",
         flush_request: None,
       },
-      ReanchorResumeDecision::None => ResumeAction::Absorb,
+      ResumeDecision::None => ResumeAction::None,
     };
     drop(devices);
     Some(action)
   }
 
-  /// Flush-all: ring already cleared by ingest. Re-LOAD is **debounced** by
-  /// [`REANCHOR_DEBOUNCE`] so it lands when the sender's new anchor has queued audio: a
-  /// resume inside the window re-LOADs right away (`flush_resume`); otherwise the timer
-  /// re-LOADs, or owes the re-LOAD to resume while paused.
-  pub(super) fn handle_flush(self: &Arc<Self>, device_id: &str) {
+  /// Flush-all: ring already cleared by ingest; the next resume owes a re-LOAD.
+  ///
+  /// Every flush comes with a pause (Cast PAUSE already stopped the pre-flush audio) and is
+  /// followed by a resume once the sender's new anchor has audio queued, so the re-LOAD waits
+  /// for that resume instead of a timer. A re-LOAD in flight that started before this flush
+  /// does not cover it.
+  pub(super) fn handle_flush(&self, device_id: &str) {
     let mut devices = self.devices.lock();
     let Some(DeviceState::Playing { generation: live_gen, session }) =
       devices.get_mut(device_id).map(|slot| &mut slot.state)
@@ -420,80 +439,23 @@ impl Bridge {
       return;
     };
     let generation = *live_gen;
-    let arm = session.flush_debounce_arm.wrapping_add(1);
-    session.flush_debounce_arm = arm;
-    let rearmed = session.flush_debounce_cancel.take().is_some_and(|prev| {
-      prev.abort();
-      true
-    });
-    let timer = flush_debounce_timer(Arc::clone(self), device_id.to_owned(), generation, arm);
-    session.flush_debounce_cancel = Some(session.tasks.spawn(device_id, timer));
-    drop(devices);
-    tracing::debug!(%device_id, generation, arm, rearmed, "AirPlay flushed; arming re-anchor flush debounce");
-  }
-
-  /// Pause debounce timer fired: issue Cast PAUSE if still paused for this arm/generation.
-  fn fire_pause_debounce(self: &Arc<Self>, device_id: &str, generation: u64, arm: u64) {
-    let mut devices = self.devices.lock();
-    let Some(DeviceState::Playing { generation: live_gen, session }) =
-      devices.get_mut(device_id).map(|slot| &mut slot.state)
-    else {
-      return;
-    };
-    if *live_gen != generation || !session.session_alive.load(Ordering::Acquire) {
-      return;
-    }
-    if !reanchor_pause_timer_may_fire(session.paused, session.pause_debounce_arm == arm) {
-      return;
-    }
-    session.pause_debounce_cancel = None;
-    let command = cast_pause_command(
-      Arc::clone(self),
-      device_id.to_owned(),
-      generation,
-      Arc::clone(&session.pool),
-      Arc::clone(&session.route),
-      Arc::clone(&session.session_alive),
-    );
-    let _pause = session.tasks.spawn(device_id, command);
-    drop(devices);
-    tracing::info!(%device_id, generation, "AirPlay pause debounce elapsed; pausing Cast media");
-  }
-
-  /// Flush debounce timer fired: re-LOAD if this arm is still current (no re-anchor).
-  ///
-  /// The request is recorded first; while paused the re-LOAD is owed to the next resume
-  /// instead of being attempted (and dropped) now.
-  fn fire_flush_debounce(self: &Arc<Self>, device_id: &str, generation: u64, arm: u64) {
-    let mut devices = self.devices.lock();
-    let Some(DeviceState::Playing { generation: live_gen, session }) =
-      devices.get_mut(device_id).map(|slot| &mut slot.state)
-    else {
-      return;
-    };
-    if *live_gen != generation || !session.session_alive.load(Ordering::Acquire) {
-      return;
-    }
-    if !reanchor_flush_timer_may_fire(session.flush_debounce_arm == arm) {
-      return;
-    }
-    session.flush_debounce_cancel = None;
     session.flush_reload_requested = session.flush_reload_requested.saturating_add(1);
     let request = session.flush_reload_requested;
-    if session.paused {
-      drop(devices);
-      tracing::info!(
-        %device_id,
-        generation,
-        request,
-        "AirPlay flush debounce elapsed while paused; re-LOAD owed to resume"
-      );
-      return;
-    }
-    let reload = self.reload_task(device_id, generation, "flush", Some(request));
-    let _reload = session.tasks.spawn(device_id, reload);
     drop(devices);
-    tracing::info!(%device_id, generation, request, "AirPlay flush debounce elapsed; re-LOADing Cast media");
+    tracing::info!(%device_id, generation, request, "AirPlay flushed; re-LOAD owed to the next resume");
+  }
+
+  /// Media body bytes served for `device_id`'s live `generation` (pause diagnostics).
+  fn served_bytes(&self, device_id: &str, generation: u64) -> Option<u64> {
+    match self.devices.lock().get(device_id).map(|slot| &slot.state) {
+      Some(DeviceState::Playing { generation: live_gen, session }) if *live_gen == generation => {
+        Some(session.media.bytes_served())
+      },
+      Some(
+        DeviceState::Idle | DeviceState::Starting { .. } | DeviceState::Playing { .. } | DeviceState::Following { .. },
+      )
+      | None => None,
+    }
   }
 }
 
@@ -505,69 +467,205 @@ mod tests {
   use parking_lot::Mutex;
 
   use crate::audio::PcmRing;
-  use crate::bridge::load::{LoadVolumePolicy, ReloadGate, ReloadOutcome, volume_after_load};
+  use crate::bridge::load::{LoadVolumePolicy, ReloadOutcome, volume_after_load};
   use crate::bridge::teardown::{TeardownCastPolicy, teardown_playing};
-  use crate::bridge::test_support::{insert_playing, test_playing_session};
+  use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, test_playing_session};
   use crate::media::MediaServer;
   use crate::registry::DeviceRegistry;
 
-  #[tokio::test]
-  async fn handle_pause_marks_paused_without_ending_session() {
-    let registry = Arc::new(DeviceRegistry::new());
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(registry, Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    let ring = Arc::new(PcmRing::new(2, 64));
-    insert_playing(&bridge, "dev-pause", 1, test_playing_session(media, "dev-pause", pool, ring));
-
-    bridge.handle_pause("dev-pause");
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-pause").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert!(session.paused);
-      assert!(session.paused_at.is_some());
-      drop(devices);
-    }
-    assert!(bridge.has_session("dev-pause"));
-    bridge.handle_session_end("dev-pause").await;
-  }
-
-  /// `handle_pause` is sync and returns after arming debounce; Cast PAUSE is delayed.
-  #[tokio::test]
-  async fn handle_pause_returns_without_awaiting_cast() {
-    let registry = Arc::new(DeviceRegistry::new());
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(registry, Arc::clone(&pool)));
+  /// Bridge on a recording [`FakeCast`] with one Playing session for `device_id`.
+  async fn fake_bridge(device_id: &str) -> (Arc<Bridge>, Arc<FakeCast>) {
+    let fake = Arc::new(FakeCast::default());
+    let pool: Arc<dyn CastControl> = Arc::<FakeCast>::clone(&fake);
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     insert_playing(
       &bridge,
-      "dev-pause-fast",
+      device_id,
       1,
-      test_playing_session(media, "dev-pause-fast", pool, Arc::new(PcmRing::new(2, 64))),
+      test_playing_session(media, device_id, pool, Arc::new(PcmRing::new(2, 64))),
     );
+    (bridge, fake)
+  }
 
-    let start = Instant::now();
-    bridge.handle_pause("dev-pause-fast");
-    let elapsed = start.elapsed();
-    assert!(
-      elapsed < Duration::from_millis(50),
-      "handle_pause must return without awaiting Cast PAUSE; elapsed={elapsed:?}"
-    );
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-pause-fast").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert!(session.paused, "local paused set before Cast PAUSE");
-      assert!(
-        session.pause_debounce_cancel.is_some(),
-        "pause debounce armed; Cast PAUSE not issued yet"
-      );
-      drop(devices);
+  /// Cast transport commands (PAUSE / PLAY / LOAD) in the order the fake received them.
+  fn transport(fake: &FakeCast) -> Vec<CastCall> {
+    fake
+      .calls()
+      .into_iter()
+      .filter(|call| matches!(call, CastCall::Pause(_) | CastCall::Play(_) | CastCall::Load(_)))
+      .collect()
+  }
+
+  async fn wait_until(what: &str, fake: &FakeCast, check: impl Fn(&[CastCall]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !check(&fake.calls()) {
+      assert!(Instant::now() < deadline, "timed out waiting for {what}: {:?}", fake.calls());
+      sleep(Duration::from_millis(5)).await;
     }
-    bridge.handle_session_end("dev-pause-fast").await;
+  }
+
+  fn with_session<T>(bridge: &Bridge, device_id: &str, read: impl FnOnce(&PlayingSession) -> T) -> T {
+    let devices = bridge.devices.lock();
+    let Some(DeviceState::Playing { session, .. }) = devices.get(device_id).map(|slot| &slot.state) else {
+      panic!("expected Playing");
+    };
+    let value = read(session);
+    drop(devices);
+    value
+  }
+
+  /// A rate 0 reaches Cast as PAUSE right away (no debounce): the speaker's read-ahead keeps
+  /// playing for as long as PAUSE waits.
+  #[tokio::test]
+  async fn pause_sends_cast_pause_immediately() {
+    let (bridge, fake) = fake_bridge("dev-pause").await;
+
+    let rate0_at = Instant::now();
+    bridge.handle_pause("dev-pause", rate0_at);
+    assert!(with_session(&bridge, "dev-pause", |session| session.paused && session.paused_at.is_some()));
+    wait_until("Cast PAUSE", &fake, |calls| {
+      calls.contains(&CastCall::Pause("dev-pause".to_owned()))
+    })
+    .await;
+    assert!(
+      rate0_at.elapsed() < Duration::from_millis(300),
+      "Cast PAUSE took {:?}",
+      rate0_at.elapsed()
+    );
+    assert!(bridge.has_session("dev-pause"), "pause keeps the session");
+
+    // A duplicate rate 0 sends nothing more.
+    bridge.handle_pause("dev-pause", Instant::now());
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(transport(&fake), vec![CastCall::Pause("dev-pause".to_owned())]);
+    bridge.handle_session_end("dev-pause").await;
+  }
+
+  /// Resume after a pause sends PLAY, after the PAUSE.
+  #[tokio::test]
+  async fn resume_after_pause_plays() {
+    let (bridge, fake) = fake_bridge("dev-resume").await;
+
+    bridge.handle_pause("dev-resume", Instant::now());
+    wait_until("Cast PAUSE", &fake, |calls| {
+      calls.contains(&CastCall::Pause("dev-resume".to_owned()))
+    })
+    .await;
+    bridge.handle_resume("dev-resume");
+    wait_until("Cast PLAY", &fake, |calls| {
+      calls.contains(&CastCall::Play("dev-resume".to_owned()))
+    })
+    .await;
+    assert_eq!(
+      transport(&fake),
+      vec![
+        CastCall::Pause("dev-resume".to_owned()),
+        CastCall::Play("dev-resume".to_owned())
+      ]
+    );
+    assert!(!with_session(&bridge, "dev-resume", |session| session.paused));
+    bridge.handle_session_end("dev-resume").await;
+  }
+
+  /// Pause and resume back to back (an iOS re-anchor): Cast never ends paused, whichever order
+  /// the detached commands reach the transport lock in.
+  #[tokio::test]
+  async fn quick_pause_resume_never_ends_paused() {
+    let (bridge, fake) = fake_bridge("dev-reanchor").await;
+
+    for _ in 0..20 {
+      bridge.handle_pause("dev-reanchor", Instant::now());
+      bridge.handle_resume("dev-reanchor");
+    }
+    sleep(Duration::from_millis(200)).await;
+    let calls = transport(&fake);
+    assert!(
+      !matches!(calls.last(), Some(CastCall::Pause(_))),
+      "Cast must not end paused after a resume: {calls:?}"
+    );
+    assert!(!with_session(&bridge, "dev-reanchor", |session| session.paused));
+    bridge.handle_session_end("dev-reanchor").await;
+  }
+
+  /// iOS skip: flush + rate 0, then the new anchor's rate 1. Cast pauses at once (the old track
+  /// stops) and the resume re-LOADs exactly once; nothing is left owed or paused.
+  #[tokio::test]
+  async fn skip_pauses_then_reloads_once_at_resume() {
+    let (bridge, fake) = fake_bridge("dev-skip").await;
+
+    bridge.handle_flush("dev-skip");
+    bridge.handle_pause("dev-skip", Instant::now());
+    wait_until("Cast PAUSE", &fake, |calls| {
+      calls.contains(&CastCall::Pause("dev-skip".to_owned()))
+    })
+    .await;
+    sleep(Duration::from_millis(50)).await;
+    bridge.handle_resume("dev-skip");
+    wait_until("re-LOAD", &fake, |calls| calls.contains(&CastCall::Load("dev-skip".to_owned()))).await;
+    sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+      transport(&fake),
+      vec![CastCall::Pause("dev-skip".to_owned()), CastCall::Load("dev-skip".to_owned())],
+      "one PAUSE, then one re-LOAD instead of PLAY"
+    );
+    with_session(&bridge, "dev-skip", |session| {
+      assert!(!session.paused, "resume cleared local pause");
+      assert_eq!(session.flush_reload_requested, 1);
+      assert!(!session.flush_reload_owed(), "the re-LOAD covered the flush");
+    });
+    bridge.handle_session_end("dev-skip").await;
+  }
+
+  /// Skip while paused (and resumed much later): the flush stays owed, so the resume re-LOADs
+  /// instead of resuming the pre-flush buffer tail with Cast PLAY.
+  #[tokio::test]
+  async fn flush_while_paused_reloads_on_resume() {
+    let (bridge, _fake) = fake_bridge("dev-flush-paused").await;
+
+    bridge.handle_pause("dev-flush-paused", Instant::now());
+    bridge.handle_flush("dev-flush-paused");
+    assert!(with_session(&bridge, "dev-flush-paused", PlayingSession::flush_reload_owed));
+    let action = bridge.plan_resume("dev-flush-paused").expect("Playing");
+    assert!(
+      matches!(
+        action,
+        ResumeAction::Reload {
+          generation: 1,
+          reason: "flush_resume",
+          flush_request: Some(1),
+        }
+      ),
+      "resume after a paused flush must re-LOAD, got {action:?}"
+    );
+    bridge.handle_session_end("dev-flush-paused").await;
+  }
+
+  /// One probe after the PAUSE ack reads the media status (pause latency diagnostics).
+  #[tokio::test]
+  async fn pause_ack_is_followed_by_one_media_status_probe() {
+    let probes = |fake: &FakeCast| {
+      fake
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, CastCall::MediaStatus(_)))
+        .count()
+    };
+    let (bridge, fake) = fake_bridge("dev-probe").await;
+
+    bridge.handle_pause("dev-probe", Instant::now());
+    sleep(PAUSE_PROBE_DELAY + Duration::from_millis(300)).await;
+    assert_eq!(probes(&fake), 1, "{:?}", fake.calls());
+
+    // A resume before the probe cancels it.
+    bridge.handle_resume("dev-probe");
+    bridge.handle_pause("dev-probe", Instant::now());
+    sleep(Duration::from_millis(50)).await;
+    bridge.handle_resume("dev-probe");
+    sleep(PAUSE_PROBE_DELAY + Duration::from_millis(300)).await;
+    assert_eq!(probes(&fake), 1, "no probe once resumed: {:?}", fake.calls());
+    bridge.handle_session_end("dev-probe").await;
   }
 
   #[tokio::test]
@@ -591,313 +689,39 @@ mod tests {
     bridge.handle_session_end("dev-vol").await;
   }
 
-  #[tokio::test]
-  async fn flush_debounces_within_window() {
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    insert_playing(
-      &bridge,
-      "dev-flush",
-      1,
-      test_playing_session(media, "dev-flush", pool, Arc::new(PcmRing::new(2, 64))),
-    );
-
-    bridge.handle_flush("dev-flush");
-    // Immediate second flush re-arms the same debounce window (still no re-LOAD yet).
-    bridge.handle_flush("dev-flush");
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-flush").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert_eq!(
-        session.flush_reload_requested, 0,
-        "flush re-LOAD only after silence past REANCHOR_DEBOUNCE"
-      );
-      assert!(session.flush_debounce_cancel.is_some(), "flush debounce armed");
-      assert_eq!(session.flush_debounce_arm, 2, "second flush re-arms");
-      drop(devices);
-    }
-    bridge.handle_session_end("dev-flush").await;
-  }
-
   #[test]
-  fn reanchor_decision_helpers() {
-    assert_eq!(reanchor_on_paused(false), ReanchorPauseDecision::ArmDebounce);
-    assert_eq!(reanchor_on_paused(true), ReanchorPauseDecision::Ignore);
-
-    assert_eq!(
-      reanchor_on_resumed(true, false, true, false, OwedReload::None),
-      ReanchorResumeDecision::Absorb
-    );
-    // A pending flush-all re-LOADs at resume: Cast buffers pre-flush audio.
-    assert_eq!(
-      reanchor_on_resumed(true, true, true, false, OwedReload::None),
-      ReanchorResumeDecision::ReloadFlush
-    );
-    assert_eq!(
-      reanchor_on_resumed(false, true, false, false, OwedReload::None),
-      ReanchorResumeDecision::ReloadFlush
-    );
-    assert_eq!(
-      reanchor_on_resumed(false, false, true, false, OwedReload::None),
-      ReanchorResumeDecision::Play
-    );
-    assert_eq!(
-      reanchor_on_resumed(false, false, true, true, OwedReload::None),
-      ReanchorResumeDecision::Reload
-    );
-    assert_eq!(
-      reanchor_on_resumed(false, false, false, false, OwedReload::None),
-      ReanchorResumeDecision::None
-    );
-    // An owed flush re-LOAD wins over absorb (pending pause) and over PLAY (Cast paused).
-    assert_eq!(
-      reanchor_on_resumed(true, false, true, false, OwedReload::Flush),
-      ReanchorResumeDecision::ReloadOwedFlush
-    );
-    assert_eq!(
-      reanchor_on_resumed(false, false, true, false, OwedReload::Flush),
-      ReanchorResumeDecision::ReloadOwedFlush
-    );
-    // An owed stall re-LOAD outranks absorb and PLAY too; an owed flush covers it.
-    assert_eq!(
-      reanchor_on_resumed(true, false, true, false, OwedReload::Stall),
-      ReanchorResumeDecision::ReloadOwedStall
-    );
-    assert_eq!(
-      reanchor_on_resumed(false, false, false, false, OwedReload::Stall),
-      ReanchorResumeDecision::ReloadOwedStall
-    );
-
-    assert!(reanchor_pause_timer_may_fire(true, true));
-    assert!(!reanchor_pause_timer_may_fire(false, true));
-    assert!(!reanchor_pause_timer_may_fire(true, false));
-    assert!(reanchor_flush_timer_may_fire(true));
-    assert!(!reanchor_flush_timer_may_fire(false));
+  fn resume_decision_helper() {
+    assert_eq!(resume_decision(true, false, OwedReload::None), ResumeDecision::Play);
+    assert_eq!(resume_decision(true, true, OwedReload::None), ResumeDecision::Reload);
+    assert_eq!(resume_decision(false, false, OwedReload::None), ResumeDecision::None);
+    // An owed flush re-LOAD wins over PLAY, paused or not.
+    assert_eq!(resume_decision(true, false, OwedReload::Flush), ResumeDecision::ReloadFlush);
+    assert_eq!(resume_decision(false, false, OwedReload::Flush), ResumeDecision::ReloadFlush);
+    assert_eq!(resume_decision(true, true, OwedReload::Flush), ResumeDecision::ReloadFlush);
+    // An owed stall re-LOAD outranks PLAY too.
+    assert_eq!(resume_decision(true, false, OwedReload::Stall), ResumeDecision::ReloadStall);
+    assert_eq!(resume_decision(false, false, OwedReload::Stall), ResumeDecision::ReloadStall);
   }
 
-  /// Skip: Flushed + Resumed within the window re-LOADs once, at resume (when the new anchor's
-  /// audio is queued), instead of absorbing it and letting Cast play its pre-flush buffer; the
-  /// cancelled flush debounce never adds a second re-LOAD.
+  /// A resume clears every piece of local pause state, so the stall watchdog and re-LOAD gates
+  /// are not left muted by a stale `paused`.
   #[tokio::test]
-  async fn flush_then_resume_within_window_reloads_once_at_resume() {
-    use crate::bridge::test_support::{CastCall, FakeCast};
+  async fn resume_clears_pause_state() {
+    let (bridge, _fake) = fake_bridge("dev-resume-state").await;
 
-    let fake = Arc::new(FakeCast::default());
-    let pool: Arc<dyn CastControl> = Arc::<FakeCast>::clone(&fake);
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    insert_playing(
-      &bridge,
-      "dev-skip",
-      1,
-      test_playing_session(media, "dev-skip", pool, Arc::new(PcmRing::new(2, 64))),
-    );
-    let loads = |cast: &FakeCast| cast.calls().iter().filter(|call| matches!(call, CastCall::Load(_))).count();
-
-    bridge.handle_flush("dev-skip");
-    bridge.handle_pause("dev-skip");
-    sleep(Duration::from_millis(50)).await;
-    let action = bridge.plan_resume("dev-skip").expect("Playing");
-    assert!(
-      matches!(action, ResumeAction::Reload { reason: "flush_resume", .. }),
-      "pending flush must re-LOAD at resume, got {action:?}"
-    );
-    bridge.handle_flush("dev-skip");
-    bridge.handle_pause("dev-skip");
-    bridge.handle_resume("dev-skip");
-
-    // Wait past the original arm window; cancelled arms must not fire.
-    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(100)).await;
-    assert_eq!(loads(&fake), 1, "one re-LOAD at resume: {:?}", fake.calls());
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-skip").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert_eq!(session.flush_reload_requested, 0, "debounce never fired");
-      assert!(!session.flush_reload_owed());
-      assert!(!session.paused, "resume cleared local pause");
-      assert!(session.pause_debounce_cancel.is_none());
-      assert!(session.flush_debounce_cancel.is_none());
-      drop(devices);
-    }
-    assert!(
-      !fake.calls().iter().any(|call| matches!(call, CastCall::Pause(_))),
-      "Cast never paused: {:?}",
-      fake.calls()
-    );
-    bridge.handle_session_end("dev-skip").await;
-  }
-
-  /// Paused with no resume within the window produces exactly one Cast PAUSE path.
-  #[tokio::test]
-  async fn reanchor_pause_without_resume_issues_cast_pause() {
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    insert_playing(
-      &bridge,
-      "dev-pause-fire",
-      1,
-      test_playing_session(media, "dev-pause-fire", pool, Arc::new(PcmRing::new(2, 64))),
-    );
-
-    bridge.handle_pause("dev-pause-fire");
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-pause-fire").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert!(session.paused);
-      assert!(session.pause_debounce_cancel.is_some());
-      assert_eq!(session.pause_debounce_arm, 1);
-      drop(devices);
-    }
-
-    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(100)).await;
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-pause-fire").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert!(session.paused, "local pause remains after Cast PAUSE path");
-      assert!(
-        session.pause_debounce_cancel.is_none(),
-        "debounce consumed when timer fires Cast PAUSE"
-      );
-      assert_eq!(session.pause_debounce_arm, 1, "exactly one pause arm (not re-armed)");
-      drop(devices);
-    }
-    bridge.handle_session_end("dev-pause-fire").await;
-  }
-
-  /// Real flush-then-silence produces one re-LOAD after the window.
-  #[tokio::test]
-  async fn reanchor_flush_then_silence_reloads() {
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    insert_playing(
-      &bridge,
-      "dev-flush-fire",
-      1,
-      test_playing_session(media, "dev-flush-fire", pool, Arc::new(PcmRing::new(2, 64))),
-    );
-
-    bridge.handle_flush("dev-flush-fire");
-    bridge.handle_flush("dev-flush-fire"); // coalesce arms
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-flush-fire").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert_eq!(session.flush_reload_requested, 0);
-      assert_eq!(session.flush_debounce_arm, 2);
-      drop(devices);
-    }
-
-    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(150)).await;
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-flush-fire").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert_eq!(
-        session.flush_reload_requested, 1,
-        "silence past window must request exactly one flush re-LOAD"
-      );
-      assert!(session.flush_debounce_cancel.is_none());
-      assert_eq!(session.flush_debounce_arm, 2, "coalesced to a single fire arm");
-      drop(devices);
-    }
-    // Allow detached re-LOAD task to observe missing Cast worker and finish.
-    sleep(Duration::from_millis(50)).await;
-    bridge.handle_session_end("dev-flush-fire").await;
-  }
-
-  /// A resume that cancels a still-pending pause clears every piece of local pause state, so
-  /// the stall watchdog and re-LOAD gates are not left muted by a stale `paused`.
-  #[tokio::test]
-  async fn resume_cancelling_pending_pause_clears_pause_state() {
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    insert_playing(
-      &bridge,
-      "dev-resume-pending",
-      1,
-      test_playing_session(media, "dev-resume-pending", pool, Arc::new(PcmRing::new(2, 64))),
-    );
-
-    bridge.handle_pause("dev-resume-pending");
-    let action = bridge.plan_resume("dev-resume-pending").expect("Playing");
-    assert!(matches!(action, ResumeAction::Absorb), "pending pause absorbs: {action:?}");
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-resume-pending").expect("slot").state else {
-        panic!("expected Playing");
-      };
+    bridge.handle_pause("dev-resume-state", Instant::now());
+    let action = bridge.plan_resume("dev-resume-state").expect("Playing");
+    assert!(matches!(action, ResumeAction::Play { generation: 1, .. }), "{action:?}");
+    with_session(&bridge, "dev-resume-state", |session| {
       assert!(!session.paused);
       assert!(!session.playback_paused.load(Ordering::Acquire));
       assert!(session.paused_at.is_none());
-      assert!(session.pause_debounce_cancel.is_none());
-      drop(devices);
-    }
-    assert!(matches!(
-      bridge.reload_gate("dev-resume-pending", 1, None),
-      ReloadGate::Proceed { .. }
-    ));
-    bridge.handle_session_end("dev-resume-pending").await;
-  }
-
-  /// Track skip while paused: the flush timer fires during the pause, so its re-LOAD is owed
-  /// and the resume re-LOADs instead of resuming the pre-flush buffer tail with Cast PLAY.
-  #[tokio::test]
-  async fn flush_fired_while_paused_reloads_on_resume() {
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    insert_playing(
-      &bridge,
-      "dev-flush-paused",
-      1,
-      test_playing_session(media, "dev-flush-paused", pool, Arc::new(PcmRing::new(2, 64))),
-    );
-
-    bridge.handle_pause("dev-flush-paused");
-    bridge.handle_flush("dev-flush-paused");
-    sleep(REANCHOR_DEBOUNCE + Duration::from_millis(150)).await;
-    {
-      let devices = bridge.devices.lock();
-      let DeviceState::Playing { session, .. } = &devices.get("dev-flush-paused").expect("slot").state else {
-        panic!("expected Playing");
-      };
-      assert!(session.paused);
-      assert!(session.pause_debounce_cancel.is_none(), "Cast PAUSE path fired");
-      assert!(session.flush_reload_owed(), "flush fired while paused stays owed");
-      drop(devices);
-    }
-
-    let action = bridge.plan_resume("dev-flush-paused").expect("Playing");
-    assert!(
-      matches!(
-        action,
-        ResumeAction::Reload {
-          generation: 1,
-          flush_request: Some(1),
-          ..
-        }
-      ),
-      "resume after a paused flush must re-LOAD, got {action:?}"
-    );
-    bridge.handle_session_end("dev-flush-paused").await;
+    });
+    bridge.handle_session_end("dev-resume-state").await;
   }
 
   /// A flush re-LOAD that queued behind an in-flight re-LOAD and was then abandoned by a pause
-  /// keeps its intent: the next resume re-LOADs even though the pause never reached Cast.
+  /// keeps its intent: the next resume re-LOADs instead of sending PLAY.
   #[tokio::test]
   async fn flush_reload_abandoned_by_pause_is_owed_to_resume() {
     let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
@@ -918,7 +742,7 @@ mod tests {
       }
     });
     sleep(Duration::from_millis(20)).await;
-    bridge.handle_pause("dev-flush-race");
+    bridge.handle_pause("dev-flush-race", Instant::now());
     drop(in_flight);
     let reloaded = tokio::time::timeout(Duration::from_secs(2), queued)
       .await
@@ -926,19 +750,12 @@ mod tests {
       .expect("join");
     assert_eq!(reloaded, ReloadOutcome::Paused, "pause must abort the queued flush re-LOAD");
 
-    // Resume inside the debounce window: the pause never reached Cast, but the flush did.
     let action = bridge.plan_resume("dev-flush-race").expect("Playing");
     assert!(
       matches!(action, ResumeAction::Reload { flush_request: Some(1), .. }),
       "abandoned flush must be re-LOADed on resume, got {action:?}"
     );
     bridge.handle_session_end("dev-flush-race").await;
-  }
-
-  #[test]
-  fn resume_skips_play_when_reload_in_flight() {
-    assert!(resume_should_skip_play_for_reload(true));
-    assert!(!resume_should_skip_play_for_reload(false));
   }
 
   #[test]

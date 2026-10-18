@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -70,10 +70,12 @@ pub enum AirPlaySessionEvent {
     /// Device id this receiver is bound to.
     device_id: String,
   },
-  /// AirPlay playout rate went to 0 (or PCM idle); Cast should PAUSE promptly.
+  /// AirPlay playout rate went to 0 (or a flush); Cast should PAUSE promptly.
   Paused {
     /// Device id this receiver is bound to.
     device_id: String,
+    /// When the receiver got the rate 0 (or flush), for pause latency diagnostics.
+    at: Instant,
   },
   /// PCM flowing again after pause; Cast should PLAY.
   Resumed {
@@ -220,7 +222,10 @@ impl RingSession {
     if !self.cast_paused.swap(true, Ordering::AcqRel)
       && let Some(tx) = &self.state.event_tx
     {
-      drop(tx.send(AirPlaySessionEvent::Paused { device_id: self.state.device_id.clone() }));
+      drop(tx.send(AirPlaySessionEvent::Paused {
+        device_id: self.state.device_id.clone(),
+        at: Instant::now(),
+      }));
     }
   }
 }
@@ -240,7 +245,10 @@ impl AudioSession for RingSession {
       if !self.cast_paused.swap(true, Ordering::AcqRel)
         && let Some(tx) = &self.state.event_tx
       {
-        drop(tx.send(AirPlaySessionEvent::Paused { device_id: self.state.device_id.clone() }));
+        drop(tx.send(AirPlaySessionEvent::Paused {
+          device_id: self.state.device_id.clone(),
+          at: Instant::now(),
+        }));
       }
     } else if self.cast_paused.swap(false, Ordering::AcqRel)
       && let Some(tx) = &self.state.event_tx
@@ -1339,7 +1347,7 @@ mod tests {
       other => panic!("expected Flushed, got {other:?}"),
     }
     match rx.try_recv() {
-      Ok(AirPlaySessionEvent::Paused { device_id }) => assert_eq!(device_id, "dev-flush"),
+      Ok(AirPlaySessionEvent::Paused { device_id, .. }) => assert_eq!(device_id, "dev-flush"),
       other => panic!("expected Paused after flush, got {other:?}"),
     }
     session.audio_process(&[0.3_f32, 0.4]);
@@ -1364,7 +1372,7 @@ mod tests {
 
     session.on_rate(0);
     match rx.try_recv() {
-      Ok(AirPlaySessionEvent::Paused { device_id }) => assert_eq!(device_id, "dev-rate"),
+      Ok(AirPlaySessionEvent::Paused { device_id, .. }) => assert_eq!(device_id, "dev-rate"),
       other => panic!("expected Paused on rate 0, got {other:?}"),
     }
     // Dedupe: second pause is silent.
@@ -1392,7 +1400,7 @@ mod tests {
       other => panic!("expected Flushed, got {other:?}"),
     }
     match rx.try_recv() {
-      Ok(AirPlaySessionEvent::Paused { device_id }) => assert_eq!(device_id, "dev-rate"),
+      Ok(AirPlaySessionEvent::Paused { device_id, .. }) => assert_eq!(device_id, "dev-rate"),
       other => panic!("expected Paused after on_flush, got {other:?}"),
     }
     assert_eq!(state.current_ring().available_frames(), 0);

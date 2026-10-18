@@ -378,7 +378,7 @@ mod tests {
     let loads = |cast: &FakeCast| cast.calls().iter().filter(|call| matches!(call, CastCall::Load(_))).count();
 
     let pausing = Arc::clone(&bridge);
-    fake.on_next_load(move || pausing.handle_pause(DEV));
+    fake.on_next_load(move || pausing.handle_pause(DEV, Instant::now()));
     bridge.handle_stall_reload(DEV, 1).await;
 
     assert!(bridge.has_session(DEV), "pause during stall re-LOAD must not end the session");

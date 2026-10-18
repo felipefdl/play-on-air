@@ -168,10 +168,13 @@ mod tests {
     CastRemoteEvent { device_id: device_id.to_owned(), kind }
   }
 
-  /// Device pause: local pause first, and the sender's rate-0 echo then arms no Cast PAUSE.
+  /// Device pause: local pause first, and the sender's rate-0 echo then sends no Cast PAUSE.
   #[tokio::test]
   async fn cast_pause_pauses_locally_and_absorbs_sender_echo() {
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
+    use crate::bridge::test_support::{CastCall, FakeCast};
+
+    let fake = Arc::new(FakeCast::default());
+    let pool: Arc<dyn CastControl> = Arc::<FakeCast>::clone(&fake);
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     insert_playing(
@@ -187,16 +190,21 @@ mod tests {
     assert!(!bridge.pause_locally_for_cast("dev-rc"));
 
     // Sender honors `paus` → AirPlay rate 0 → bridge must not send Cast PAUSE back.
-    bridge.handle_pause("dev-rc");
+    bridge.handle_pause("dev-rc", Instant::now());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     {
       let devices = bridge.devices.lock();
       let Some(DeviceState::Playing { session, .. }) = devices.get("dev-rc").map(|slot| &slot.state) else {
         panic!("expected Playing");
       };
       assert!(session.playback_paused.load(Ordering::Acquire));
-      assert!(session.pause_debounce_cancel.is_none(), "no Cast PAUSE echo armed");
       drop(devices);
     }
+    assert!(
+      !fake.calls().iter().any(|call| matches!(call, CastCall::Pause(_))),
+      "no Cast PAUSE echo: {:?}",
+      fake.calls()
+    );
 
     // Device play while paused leaves local state for the sender's own resume.
     bridge.on_cast_remote(&remote("dev-rc", CastRemoteKind::Played));

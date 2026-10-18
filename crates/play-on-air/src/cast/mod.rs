@@ -14,7 +14,9 @@ pub use multizone::{
 };
 pub use pool::{CastPool, CastRemoteEvent, CastRemoteKind};
 
-use rust_cast::channels::media::{Image, Media, Metadata, MusicTrackMediaMetadata, Status, StreamType};
+use rust_cast::channels::media::{
+  Image, Media, Metadata, MusicTrackMediaMetadata, PlayerState, Status, StatusEntry, StreamType,
+};
 
 use crate::error::{Error, Result};
 
@@ -209,6 +211,24 @@ pub struct MediaSessionRef {
 /// Active Cast media session after a successful LOAD.
 pub type ActiveCastSession = MediaSessionRef;
 
+/// Player state and position a Cast receiver reported for our media session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaPlayback {
+  /// `PLAYING`, `PAUSED`, `BUFFERING`, or `IDLE`.
+  pub player_state: PlayerState,
+  /// Playback position in seconds, when the receiver reports one.
+  pub current_time: Option<f32>,
+}
+
+impl From<&StatusEntry> for MediaPlayback {
+  fn from(entry: &StatusEntry) -> Self {
+    Self {
+      player_state: entry.player_state,
+      current_time: entry.current_time,
+    }
+  }
+}
+
 /// Extract the media session (and its current queue item) from a LOAD/STATUS response.
 pub fn media_session_from_status(
   transport_id: impl Into<String>,
@@ -237,10 +257,12 @@ pub trait CastControl: Send + Sync + std::fmt::Debug {
   fn set_volume(&self, key: &str, level: f32) -> Result<()>;
   /// Read receiver volume (`0.0..=1.0`; muted is `0.0`).
   fn get_volume(&self, key: &str) -> Result<f32>;
-  /// Pause the active media session.
-  fn pause(&self, key: &str) -> Result<()>;
+  /// Pause the active media session; returns the status the receiver answered with.
+  fn pause(&self, key: &str) -> Result<MediaPlayback>;
   /// Resume the active media session.
   fn play(&self, key: &str) -> Result<()>;
+  /// Read the active media session's player state and position (`MEDIA_STATUS`).
+  fn media_playback(&self, key: &str) -> Result<MediaPlayback>;
   /// Media STOP with a wall-clock bound; `true` when acknowledged.
   fn stop_best_effort(&self, key: &str, timeout: std::time::Duration) -> bool;
   /// Bridge-initiated end: stand ownership probes down without a Cast STOP.
@@ -252,7 +274,11 @@ pub trait CastControl: Send + Sync + std::fmt::Debug {
   /// Open (or retarget) a control connection to a session host that is not a registry speaker.
   fn open_session_host(&self, key: &str, host: &str, port: u16);
   /// Hand the active media session from worker `from` to worker `to` without a Cast STOP.
-  fn move_session(&self, from: &str, to: &str) -> Result<()>;
+  ///
+  /// `session_id` is the receiver app session the move reported on `to` (`sessionEndpoint`);
+  /// `None` keeps the session id the media had on `from`. On failure `from` keeps nothing: the
+  /// session left its host.
+  fn move_session(&self, from: &str, to: &str, session_id: Option<&str>) -> Result<()>;
   /// Close a connection opened with [`CastControl::open_session_host`].
   fn close_session_host(&self, key: &str);
 }

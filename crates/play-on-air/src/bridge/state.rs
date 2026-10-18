@@ -56,13 +56,14 @@ pub(super) struct PlayingSession {
   pub(super) egress: EgressKind,
   /// AirPlay reported paused (local; stall watchdog honors this immediately).
   ///
-  /// Cast PAUSE is deferred by `REANCHOR_DEBOUNCE` so iOS re-anchors can cancel.
+  /// Each pause sends Cast PAUSE at once; Cast PAUSE / PLAY run in event order under
+  /// [`Self::transport_flight`].
   pub(super) paused: bool,
   /// Cross-thread mirror of [`Self::paused`] for in-flight re-LOAD abort checks (B2).
   pub(super) playback_paused: Arc<AtomicBool>,
   /// When the current pause began (for long-pause re-LOAD).
   pub(super) paused_at: Option<Instant>,
-  /// Flush re-LOADs requested so far (bumped when a flush debounce timer fires).
+  /// Flush re-LOADs requested so far (bumped by every AirPlay flush; the next resume owes one).
   pub(super) flush_reload_requested: u64,
   /// Highest [`Self::flush_reload_requested`] value covered by an accepted re-LOAD.
   ///
@@ -78,15 +79,10 @@ pub(super) struct PlayingSession {
   pub(super) started_at: Instant,
   /// Last FLAC failure strike for this Playing generation (pair-window late fallback).
   pub(super) flac_strike: Option<(Instant, FlacStrikeReason)>,
-  /// Arm id for pause debounce; timer callbacks must match to fire Cast PAUSE.
-  pub(super) pause_debounce_arm: u64,
-  /// Pending pause debounce timer (task in [`Self::tasks`]; abort cancels the fire).
-  pub(super) pause_debounce_cancel: Option<AbortHandle>,
-  /// Arm id for flush debounce; timer callbacks must match to fire re-LOAD.
-  pub(super) flush_debounce_arm: u64,
-  /// Pending flush debounce timer (task in [`Self::tasks`]; abort cancels the fire).
-  pub(super) flush_debounce_cancel: Option<AbortHandle>,
-  /// Detached Cast PAUSE/PLAY, re-LOADs, and debounce timers owned by this generation.
+  /// Serializes Cast PAUSE / PLAY: each re-reads [`Self::playback_paused`] under it right before
+  /// the wire command, so whichever runs last matches the latest AirPlay state.
+  pub(super) transport_flight: Arc<tokio::sync::Mutex<()>>,
+  /// Detached Cast PAUSE/PLAY and re-LOADs owned by this generation.
   pub(super) tasks: SessionTasks,
   /// Drop / send to stop the `LiveWav` Content-Length rollover re-LOAD loop.
   pub(super) rollover_cancel: Option<oneshot::Sender<()>>,
@@ -283,7 +279,7 @@ impl RingPump {
   }
 }
 
-/// Session-scoped detached work: Cast PAUSE/PLAY, re-LOADs, and re-anchor debounce timers.
+/// Session-scoped detached work: Cast PAUSE/PLAY (and the pause diagnostics probe) and re-LOADs.
 ///
 /// Owned by [`PlayingSession`] so replace and full-end teardown abort and join every task;
 /// nothing spawned for a generation can touch Cast after that generation is gone.

@@ -26,7 +26,7 @@ use crate::net::CastRelayShutdown;
 use crate::registry::Device;
 
 use super::{
-  ActiveCastSession, CastControl, CastTrack, MEDIA_NAMESPACE, MULTIZONE_NAMESPACE, MediaLoadRequest,
+  ActiveCastSession, CastControl, CastTrack, MEDIA_NAMESPACE, MULTIZONE_NAMESPACE, MediaLoadRequest, MediaPlayback,
   PlaybackSessionUpdate, SetPlaybackDevices, media_session_from_status, parse_set_playback_devices_reply,
   volume_level_clamped,
 };
@@ -446,9 +446,16 @@ enum CastWorkerCmd {
   /// Stop active media session (if any); keep TCP warm.
   Stop { reply: SyncSender<Result<()>> },
   /// Pause active media session (keep session id for later PLAY).
-  Pause { reply: SyncSender<Result<()>> },
+  ///
+  /// `queued_at` is when the caller sent it, so the worker can log how long it waited.
+  Pause {
+    queued_at: Instant,
+    reply: SyncSender<Result<MediaPlayback>>,
+  },
   /// Resume a paused media session.
   Play { reply: SyncSender<Result<()>> },
+  /// Read the active media session's `MEDIA_STATUS`.
+  MediaStatus { reply: SyncSender<Result<MediaPlayback>> },
   /// Best-effort stop; always replies after attempt (or immediately if no session).
   StopBestEffort { reply: SyncSender<()> },
   /// Bridge-initiated session end: clear ownership tracking without Cast STOP.
@@ -467,9 +474,11 @@ enum CastWorkerCmd {
   TakeSession {
     reply: SyncSender<Option<(ActiveCastSession, Option<MediaLoadRequest>)>>,
   },
-  /// Take over a session that already plays on this worker's host.
+  /// Take over a session that already plays on this worker's host, as receiver app session
+  /// `session_id` (its transport is looked up on the host).
   Adopt {
     session: ActiveCastSession,
+    session_id: String,
     load: Option<MediaLoadRequest>,
     reply: SyncSender<Result<()>>,
   },
@@ -755,11 +764,22 @@ impl CastPool {
     }
   }
 
-  fn adopt(&self, key: &str, session: ActiveCastSession, load: Option<MediaLoadRequest>) -> Result<()> {
+  fn adopt(
+    &self,
+    key: &str,
+    session: ActiveCastSession,
+    session_id: String,
+    load: Option<MediaLoadRequest>,
+  ) -> Result<()> {
     let tx = self.cmd_tx(key)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(CastWorkerCmd::Adopt { session, load, reply: reply_tx })
-      .map_err(|_send| Error::Cast(format!("warm Cast worker for {key} disconnected")))?;
+    tx.send(CastWorkerCmd::Adopt {
+      session,
+      session_id,
+      load,
+      reply: reply_tx,
+    })
+    .map_err(|_send| Error::Cast(format!("warm Cast worker for {key} disconnected")))?;
     match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
       Ok(result) => result,
       Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("session adopt timed out for {key}"))),
@@ -841,11 +861,14 @@ impl CastControl for CastPool {
   }
 
   /// Pause active media. Errors with "no active session" when none is loaded.
-  fn pause(&self, device_id: &str) -> Result<()> {
+  fn pause(&self, device_id: &str) -> Result<MediaPlayback> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(CastWorkerCmd::Pause { reply: reply_tx })
-      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    tx.send(CastWorkerCmd::Pause {
+      queued_at: Instant::now(),
+      reply: reply_tx,
+    })
+    .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
     match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
       Ok(result) => result,
       Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast pause timed out for {device_id}"))),
@@ -863,6 +886,21 @@ impl CastControl for CastPool {
       Ok(result) => result,
       Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast play timed out for {device_id}"))),
       Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast play reply dropped for {device_id}"))),
+    }
+  }
+
+  /// Read the active media session's player state and position.
+  fn media_playback(&self, device_id: &str) -> Result<MediaPlayback> {
+    let tx = self.cmd_tx(device_id)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::MediaStatus { reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    match reply_rx.recv_timeout(VOLUME_TIMEOUT) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast media status timed out for {device_id}"))),
+      Err(RecvTimeoutError::Disconnected) => {
+        Err(Error::Cast(format!("warm Cast media status reply dropped for {device_id}")))
+      },
     }
   }
 
@@ -961,8 +999,11 @@ impl CastControl for CastPool {
 
   /// Hand the active media session from worker `from` to worker `to` (no Cast STOP).
   ///
-  /// `to` re-reads the media session on its host. If it cannot, the session goes back to `from`.
-  fn move_session(&self, from: &str, to: &str) -> Result<()> {
+  /// `to` finds the receiver app running `session_id` (default: the session's own id) on its
+  /// host, joins its transport, and re-reads the media session there. A move gives the app a
+  /// new transport, so the old transport id is never reused. On failure nothing is handed back:
+  /// the session left `from`'s host, and controlling it there would address a gone endpoint.
+  fn move_session(&self, from: &str, to: &str, session_id: Option<&str>) -> Result<()> {
     let from_tx = self.cmd_tx(from)?;
     let (take_tx, take_rx) = mpsc::sync_channel(1);
     from_tx
@@ -972,15 +1013,8 @@ impl CastControl for CastPool {
       .recv_timeout(COMMAND_TIMEOUT)
       .map_err(|_recv| Error::Cast(format!("session hand-off from {from} timed out")))?
       .ok_or_else(|| Error::Cast(format!("no active session on {from} to move")))?;
-    match self.adopt(to, session.clone(), load.clone()) {
-      Ok(()) => Ok(()),
-      Err(err) => {
-        if let Err(back_err) = self.adopt(from, session, load) {
-          tracing::warn!(%from, error = %back_err, "Cast session hand-back after failed move failed");
-        }
-        Err(err)
-      },
-    }
+    let adopt_id = session_id.map_or_else(|| session.session_id.clone(), str::to_owned);
+    self.adopt(to, session, adopt_id, load)
   }
 
   /// Close a worker opened with [`Self::open_session_host`].
@@ -1158,8 +1192,8 @@ fn worker_main(
       CastWorkerCmd::TakeSession { reply } => {
         drop(reply.send(state.handle_take_session()));
       },
-      CastWorkerCmd::Adopt { session, load, reply } => {
-        let result = state.with_hard_deadline(|s| s.handle_adopt(session, load));
+      CastWorkerCmd::Adopt { session, session_id, load, reply } => {
+        let result = state.with_hard_deadline(|s| s.handle_adopt(&session, &session_id, load));
         drop(reply.send(result));
       },
       CastWorkerCmd::Shutdown => {
@@ -1234,12 +1268,16 @@ fn worker_main(
         let result = state.with_hard_deadline(WorkerState::handle_stop);
         drop(reply.send(result));
       },
-      CastWorkerCmd::Pause { reply } => {
-        let result = state.with_hard_deadline(WorkerState::handle_pause);
+      CastWorkerCmd::Pause { queued_at, reply } => {
+        let result = state.with_hard_deadline(|s| s.handle_pause(queued_at));
         drop(reply.send(result));
       },
       CastWorkerCmd::Play { reply } => {
         let result = state.with_hard_deadline(WorkerState::handle_play);
+        drop(reply.send(result));
+      },
+      CastWorkerCmd::MediaStatus { reply } => {
+        let result = state.with_hard_deadline(|s| s.handle_media_status());
         drop(reply.send(result));
       },
       CastWorkerCmd::StopBestEffort { reply } => {
@@ -2292,38 +2330,34 @@ impl WorkerState {
 
   /// Take over a media session that already plays on this worker's host (moved by multizone).
   ///
-  /// The media session id is re-read from the host, since a move may renumber it.
-  fn handle_adopt(&mut self, session: ActiveCastSession, load: Option<MediaLoadRequest>) -> Result<()> {
+  /// Joins the session the way a Cast sender joins by session id: `RECEIVER_STATUS` on this
+  /// host, the app running `session_id`, `CONNECT` to that app's transport, then media
+  /// `GET_STATUS` for the (possibly renumbered) media session. A move gives the app a new
+  /// transport on the new host; a message to the old one makes the receiver close the
+  /// connection. A failed read drops the connection so the next command reconnects.
+  fn handle_adopt(
+    &mut self,
+    session: &ActiveCastSession,
+    session_id: &str,
+    load: Option<MediaLoadRequest>,
+  ) -> Result<()> {
     if self.device.is_none() {
       self.ensure_connected(true)?;
     }
-    let device = self
-      .device
-      .as_ref()
-      .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
-    device
-      .connection
-      .connect(session.transport_id.as_str())
-      .map_err(|err| Error::Cast(format!("adopt app connection: {err}")))?;
-    let status = device
-      .media
-      .get_status(session.transport_id.as_str(), None)
-      .map_err(|err| Error::Cast(format!("adopt media status: {err}")))?;
-    let entry = status
-      .entries
-      .first()
-      .ok_or_else(|| Error::Cast("adopt: host reports no media session".to_owned()))?;
-    let adopted = ActiveCastSession {
-      transport_id: session.transport_id,
-      session_id: session.session_id,
-      media_session_id: entry.media_session_id,
-      queue_item_id: entry.current_item_id.map(i32::from).or(session.queue_item_id),
+    let adopted = match self.read_adopted_session(session, session_id) {
+      Ok(adopted) => adopted,
+      Err(err) => {
+        self.drop_device();
+        return Err(err);
+      },
     };
     tracing::info!(
       device_id = %self.device_id,
       host = %self.host,
       port = self.port,
+      session_id = %adopted.session_id,
       transport_id = %adopted.transport_id,
+      previous_transport_id = %session.transport_id,
       media_session_id = adopted.media_session_id,
       "Cast media session adopted on session host"
     );
@@ -2331,6 +2365,37 @@ impl WorkerState {
     self.last_load_at = Some(Instant::now());
     self.set_active_session(adopted);
     Ok(())
+  }
+
+  /// Wire half of [`Self::handle_adopt`]: find, join, and read the moved media session.
+  fn read_adopted_session(&self, session: &ActiveCastSession, session_id: &str) -> Result<ActiveCastSession> {
+    let device = self
+      .device
+      .as_ref()
+      .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
+    let receiver = device
+      .receiver
+      .get_status()
+      .map_err(|err| Error::Cast(format!("adopt receiver status: {err}")))?;
+    let app = adoptable_app(&receiver.applications, session_id)?;
+    device
+      .connection
+      .connect(app.transport_id.as_str())
+      .map_err(|err| Error::Cast(format!("adopt app connection: {err}")))?;
+    let status = device
+      .media
+      .get_status(app.transport_id.as_str(), None)
+      .map_err(|err| Error::Cast(format!("adopt media status: {err}")))?;
+    let entry = status
+      .entries
+      .first()
+      .ok_or_else(|| Error::Cast("adopt: host reports no media session".to_owned()))?;
+    Ok(ActiveCastSession {
+      transport_id: app.transport_id.clone(),
+      session_id: app.session_id.clone(),
+      media_session_id: entry.media_session_id,
+      queue_item_id: entry.current_item_id.map(i32::from).or(session.queue_item_id),
+    })
   }
 
   fn handle_set_volume(&mut self, level: f32) -> Result<()> {
@@ -2477,7 +2542,8 @@ impl WorkerState {
     Ok(())
   }
 
-  fn handle_pause(&mut self) -> Result<()> {
+  fn handle_pause(&mut self, queued_at: Instant) -> Result<MediaPlayback> {
+    let started = Instant::now();
     let Some((transport_id, media_session_id)) =
       self.active.as_ref().map(|s| (s.transport_id.clone(), s.media_session_id))
     else {
@@ -2500,18 +2566,44 @@ impl WorkerState {
       }
     }
     // Socket timeouts bound receive_status_entry; empty status replies fail the command.
-    drop(
-      device
-        .media
-        .pause(transport_id.as_str(), media_session_id)
-        .map_err(|err| Error::Cast(format!("warm pause: {err}")))?,
-    );
-    tracing::debug!(
+    let entry = device
+      .media
+      .pause(transport_id.as_str(), media_session_id)
+      .map_err(|err| Error::Cast(format!("warm pause: {err}")))?;
+    let playback = MediaPlayback::from(&entry);
+    tracing::info!(
       device_id = %self.device_id,
       media_session_id,
+      queue_wait_ms = started.duration_since(queued_at).as_millis(),
+      wire_ms = started.elapsed().as_millis(),
+      player_state = ?playback.player_state,
+      current_time = ?playback.current_time,
       "warm Cast PAUSE ok"
     );
-    Ok(())
+    Ok(playback)
+  }
+
+  /// `MEDIA_STATUS` of the active media session (diagnostics after a PAUSE).
+  fn handle_media_status(&self) -> Result<MediaPlayback> {
+    let Some((transport_id, media_session_id)) =
+      self.active.as_ref().map(|s| (s.transport_id.clone(), s.media_session_id))
+    else {
+      return Err(Error::Cast("no active session".to_owned()));
+    };
+    let device = self
+      .device
+      .as_ref()
+      .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
+    let status = device
+      .media
+      .get_status(transport_id.as_str(), Some(media_session_id))
+      .map_err(|err| Error::Cast(format!("warm media status: {err}")))?;
+    status
+      .entries
+      .iter()
+      .find(|entry| entry.media_session_id == media_session_id)
+      .map(MediaPlayback::from)
+      .ok_or_else(|| Error::Cast("media status has no entry for our media session".to_owned()))
   }
 
   fn handle_play(&mut self) -> Result<()> {
@@ -2564,6 +2656,33 @@ fn running_media_receiver(device: &WarmCastDevice) -> Option<rust_cast::channels
     .applications
     .into_iter()
     .find(|app| app.app_id == DEFAULT_MEDIA_RECEIVER_APP_ID)
+}
+
+/// The receiver app running `session_id` on a host, if it speaks the media namespace.
+///
+/// Match by session id only (the id `sessionEndpoint` reports, or the one the media had): a
+/// moved session keeps its id but gets a new transport, and another sender's app on the same
+/// host must never be taken over.
+fn adoptable_app<'a>(
+  applications: &'a [rust_cast::channels::receiver::Application],
+  session_id: &str,
+) -> Result<&'a rust_cast::channels::receiver::Application> {
+  let app = applications.iter().find(|app| app.session_id == session_id).ok_or_else(|| {
+    let running: Vec<(&str, &str)> = applications
+      .iter()
+      .map(|app| (app.app_id.as_str(), app.session_id.as_str()))
+      .collect();
+    Error::Cast(format!(
+      "adopt: no receiver app runs session {session_id} on the host (apps: {running:?})"
+    ))
+  })?;
+  if !app.namespaces.iter().any(|namespace| namespace == MEDIA_NAMESPACE) {
+    return Err(Error::Cast(format!(
+      "adopt: app {} running session {session_id} has no media namespace",
+      app.app_id
+    )));
+  }
+  Ok(app)
 }
 
 struct MediaProbe {
@@ -2795,6 +2914,48 @@ mod tests {
   use super::*;
   use crate::cast::CastStreamKind;
   use std::time::Instant;
+
+  fn app(
+    app_id: &str,
+    session_id: &str,
+    transport_id: &str,
+    media: bool,
+  ) -> rust_cast::channels::receiver::Application {
+    rust_cast::channels::receiver::Application {
+      app_id: app_id.to_owned(),
+      session_id: session_id.to_owned(),
+      transport_id: transport_id.to_owned(),
+      namespaces: if media {
+        vec![MEDIA_NAMESPACE.to_owned()]
+      } else {
+        Vec::new()
+      },
+      display_name: "Default Media Receiver".to_owned(),
+      status_text: String::new(),
+    }
+  }
+
+  /// A moved session is found by its session id and controlled on the transport the new host
+  /// reports, never the old one; other apps and media-less stubs are never adopted.
+  #[test]
+  fn adoptable_app_matches_session_id_and_needs_media() {
+    let apps = vec![
+      app("CC1AD845", "other-sender", "t-other", true),
+      app("CC1AD845", "session-a", "t-new", true),
+    ];
+    let found = adoptable_app(&apps, "session-a").expect("session-a runs");
+    assert_eq!(found.transport_id, "t-new");
+
+    let missing = adoptable_app(&apps, "session-b").expect_err("no such session");
+    assert!(
+      missing.to_string().contains("no receiver app runs session session-b"),
+      "{missing}"
+    );
+
+    let stub = vec![app("531A4F84", "session-a", "t-stub", false)];
+    let no_media = adoptable_app(&stub, "session-a").expect_err("stub app has no media");
+    assert!(no_media.to_string().contains("no media namespace"), "{no_media}");
+  }
 
   mod remote_tracker {
     use super::super::{CastRemoteKind, OWN_COMMAND_SETTLE, PlayerIntent, RemoteTracker};

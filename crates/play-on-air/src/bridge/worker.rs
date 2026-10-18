@@ -94,7 +94,7 @@ const fn event_device_id(event: &AirPlaySessionEvent) -> &str {
   match event {
     AirPlaySessionEvent::Started { device_id, .. }
     | AirPlaySessionEvent::Ended { device_id }
-    | AirPlaySessionEvent::Paused { device_id }
+    | AirPlaySessionEvent::Paused { device_id, .. }
     | AirPlaySessionEvent::Resumed { device_id }
     | AirPlaySessionEvent::Flushed { device_id }
     | AirPlaySessionEvent::Volume { device_id, .. }
@@ -145,15 +145,15 @@ async fn device_worker_loop(
       },
       // Transport and metadata of a group follower belong to the group owner's session: every
       // member gets the same sender command, and only the owner turns it into a Cast command.
-      AirPlaySessionEvent::Paused { device_id: event_device }
+      AirPlaySessionEvent::Paused { device_id: event_device, .. }
       | AirPlaySessionEvent::Resumed { device_id: event_device }
       | AirPlaySessionEvent::Flushed { device_id: event_device }
         if bridge.is_following(&event_device) =>
       {
         tracing::debug!(device_id = %event_device, "group follower transport event; the group owner acts on Cast");
       },
-      AirPlaySessionEvent::Paused { device_id: event_device } => {
-        bridge.handle_pause(&event_device);
+      AirPlaySessionEvent::Paused { device_id: event_device, at } => {
+        bridge.handle_pause(&event_device, at);
       },
       AirPlaySessionEvent::Resumed { device_id: event_device } => {
         bridge.handle_resume(&event_device);

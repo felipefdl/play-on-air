@@ -458,8 +458,8 @@ mod tests {
     assert!(!http_get_status_ok(&health_url).await);
   }
 
-  /// Replace and full end abort the generation's session tasks (Cast PAUSE/PLAY, re-LOAD,
-  /// debounce timers) instead of leaving them detached; stale-generation spawns never run.
+  /// Replace and full end abort the generation's session tasks (Cast PAUSE/PLAY, re-LOAD, the
+  /// pause probe) instead of leaving them detached; stale-generation spawns never run.
   #[tokio::test]
   async fn teardown_aborts_session_tasks_on_replace_and_end() {
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None))));
