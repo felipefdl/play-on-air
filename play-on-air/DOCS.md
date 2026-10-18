@@ -4,7 +4,7 @@ Chromecast devices as AirPlay 2 speakers on the local network. Zero setup by def
 
 ## Install
 
-1. In Home Assistant: **Settings → Add-ons → Add-on store**.
+1. In Home Assistant: **Settings → Apps → Install app**.
 2. Open the three-dot menu → **Repositories**.
 3. Add `https://github.com/felipefdl/play-on-air` and wait for the store to refresh.
 4. Find **PlayOnAir**, install, then **Start**.

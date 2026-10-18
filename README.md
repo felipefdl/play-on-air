@@ -1,6 +1,6 @@
 <br/>
 <p align="center">
-  <img src="play-on-air/logo.png" width="200px" alt="PlayOnAir"></img>
+  <img src="play-on-air/mark.svg" width="200px" alt="PlayOnAir"></img>
 </p>
 
 # PlayOnAir
@@ -19,7 +19,7 @@ Pick one path. All need the same LAN as your Chromecasts. Containers need **host
 
 ### Home Assistant OS
 
-1. **Settings → Add-ons → Add-on store → ⋮ → Repositories**
+1. **Settings → Apps → Install app → ⋮ → Repositories**
 2. Add `https://github.com/felipefdl/play-on-air`
 3. Install **PlayOnAir**, then **Start**
 
@@ -39,11 +39,10 @@ docker run --rm --network host ghcr.io/felipefdl/play-on-air:latest
 
 Architectures: `linux/amd64`, `linux/arm64`.
 
-Optional config via env and a volume when you need rename/hide (not required to play):
+Optional config via a volume when you need rename/hide (not required to play). The image reads `/config/play-on-air.toml`, so put the file at `./config/play-on-air.toml`:
 
 ```bash
 docker run --rm --network host \
-  -e PLAY_ON_AIR_CONFIG=/config/play-on-air.toml \
   -v "$PWD/config:/config" \
   ghcr.io/felipefdl/play-on-air:latest
 ```
@@ -54,7 +53,8 @@ docker run --rm --network host \
 # From the repository root (Rust 1.88+):
 cargo run -p play-on-air
 
-# Or after install:
+# Or install the binary, then run it:
+cargo install --path crates/play-on-air
 play-on-air
 ```
 
@@ -98,8 +98,9 @@ Two Chromecasts with the same name get distinct AirPlay names: the model is appe
 
 **If something else takes the speaker:** Google Assistant, YouTube, or another Cast app ends the bridge and disconnects AirPlay so the phone leaves Now Playing. Another phone AirPlaying to the same speaker wins; prior audio stops (iOS may take a moment to clear Now Playing).
 
-## Security and contributing
+## More
 
+- [VISION.md](VISION.md): product intent and scope
 - [SECURITY.md](SECURITY.md): LAN-only model, host network tradeoff, reporting issues
 - [CONTRIBUTING.md](CONTRIBUTING.md): MSRV, quality gate, conventions
 

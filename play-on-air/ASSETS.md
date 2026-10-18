@@ -16,3 +16,18 @@ Home Assistant Apps presentation expects two PNG files **next to** `config.yaml`
 - Filenames are fixed: `icon.png` and `logo.png` (lowercase).
 
 Until both files exist, the store may show a generic puzzle icon. That does not block install or runtime.
+
+## Sources
+
+| File | Role |
+|------|------|
+| `logo.svg` | The logo: black art on white |
+| `mark.svg` | The logo on a rounded espresso tile (`#3d2618` → `#1e120b`, border `#5a3a24`): amber-to-orange art (`#ffc46b` → `#f0703a`), cream play button (`#fff1dc`); the README banner links to it |
+
+`icon.png` and `logo.png` render from `mark.svg`:
+
+```bash
+resvg -w 512 mark.svg icon.png
+resvg -w 180 mark.svg /tmp/mark-180.png
+magick -size 500x200 xc:none /tmp/mark-180.png -gravity center -composite logo.png
+```
