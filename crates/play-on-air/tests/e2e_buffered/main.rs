@@ -273,7 +273,8 @@ async fn burst_ahead_plays_continuously_in_real_time() {
 
   harness.wait_for_tone(Tone::Low, 3.0, START_DEADLINE).await;
   harness.wait_for_tone(Tone::High, 3.0, START_DEADLINE).await;
-  tokio::time::sleep(Duration::from_secs(6)).await;
+  // Long enough for a slow CI runner to finish the LOAD burst and show steady real time.
+  tokio::time::sleep(Duration::from_secs(10)).await;
   let overflow = harness.ring_overflow_frames();
 
   let captures = harness.cast.captures();
@@ -306,14 +307,32 @@ async fn burst_ahead_plays_continuously_in_real_time() {
     burst_ahead >= 1.0,
     "Cast only {burst_ahead:.2} s ahead 3 s after onset; a LOAD burst must run ahead of real time"
   );
-  // Then real time within scheduling jitter of a loaded CI box: releasing the 60 s burst on
-  // arrival would read as many times real time (or overflow the host ring).
-  let ratio = realtime_ratio(capture, onset_at + Duration::from_secs(6));
-  assert!((0.8..=1.25).contains(&ratio), "playout rate {ratio:.3}× real time");
+  // Once the burst has filled the read-ahead, playout is real time within scheduling jitter of
+  // a loaded CI box: releasing the 60 s burst on arrival would read as many times real time (or
+  // overflow the host ring). The burst ends at a speed-dependent time, so measure after it.
+  let settled_at = capture
+    .marks
+    .iter()
+    .map(|(at, _)| *at)
+    .find(|at| *at >= onset_at && ahead_s(*at) >= expected_ahead - 0.5)
+    .unwrap_or_else(|| panic!("Cast never reached ~{expected_ahead} s of read-ahead"));
+  let window = capture
+    .marks
+    .last()
+    .map_or(Duration::ZERO, |(last, _)| last.duration_since(settled_at));
+  assert!(
+    window >= Duration::from_secs(3),
+    "only {window:?} of playout after the burst settled"
+  );
+  let ratio = realtime_ratio(capture, settled_at);
+  assert!(
+    (0.8..=1.25).contains(&ratio),
+    "playout rate {ratio:.3}× real time after the burst"
+  );
   // Steady state holds Cast near the read-ahead, never unbounded.
   let steady_ahead = ahead_s(Instant::now());
   assert!(
-    (2.0..=lead_s + 0.5).contains(&steady_ahead),
+    (expected_ahead - 1.0..=lead_s + 0.5).contains(&steady_ahead),
     "Cast {steady_ahead:.2} s ahead of real time in steady state; expected ~{expected_ahead} s"
   );
   assert!(
