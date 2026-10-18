@@ -9,8 +9,8 @@ mod pool;
 mod tls;
 
 pub use multizone::{
-  MULTIZONE_NAMESPACE, PlaybackDevice, PlaybackSessionUpdate, SessionEndpoint, SetPlaybackDevices, normalize_device_id,
-  parse_set_playback_devices_reply,
+  MULTIZONE_NAMESPACE, MultizoneMember, PlaybackDevice, PlaybackSessionUpdate, SessionEndpoint, SetPlaybackDevices,
+  get_status_payload, normalize_device_id, parse_multizone_status_reply, parse_set_playback_devices_reply,
 };
 pub use pool::{CastPool, CastRemoteEvent, CastRemoteKind};
 
@@ -271,6 +271,9 @@ pub trait CastControl: Send + Sync + std::fmt::Debug {
   fn update_metadata(&self, key: &str, track: CastTrack);
   /// Send `SET_PLAYBACK_DEVICES` for the active session hosted on `key` and await the answer.
   fn set_playback_devices(&self, key: &str, request: SetPlaybackDevices) -> Result<PlaybackSessionUpdate>;
+  /// Read the member speakers of group endpoint `key` (multizone `GET_STATUS`), whether or not
+  /// it hosts a session.
+  fn multizone_members(&self, key: &str) -> Result<Vec<MultizoneMember>>;
   /// Open (or retarget) a control connection to a session host that is not a registry speaker.
   fn open_session_host(&self, key: &str, host: &str, port: u16);
   /// Hand the active media session from worker `from` to worker `to` without a Cast STOP.

@@ -187,8 +187,8 @@ impl PlayingSession {
 /// Pool worker keys a session's Cast commands go to.
 ///
 /// Media commands (LOAD, PAUSE, PLAY, STOP, metadata) follow the Cast session: the owner's
-/// speaker, then the multizone session host once the group expanded. Volume always goes to
-/// the owner's own speaker.
+/// speaker, then the multizone session host once the group expanded. The volume a re-LOAD
+/// reapplies goes to the owner's own receiver; AirPlay volume events route in `volume`.
 #[derive(Debug)]
 pub(super) struct CastRoute {
   media: Mutex<String>,

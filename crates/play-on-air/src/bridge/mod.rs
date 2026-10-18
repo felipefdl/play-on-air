@@ -10,10 +10,11 @@
 //!   [`Bridge::run`] joins (bounded) on exit after ending every live session.
 //!
 //! Module map: `worker` (event routing + shutdown drain), `start` (prebuffer, initial LOAD),
-//! `playback` (pause / resume / flush / volume), `load` (re-LOAD coordination), `stall`
-//! (watchdog), `fallback` (FLAC → WAV), `teardown` (session end), `state` (slots + session),
-//! `remote` (now-playing metadata to Cast, Cast-side play / pause / volume to the sender),
-//! `group` (AirPlay multi-select played as one Google Cast multizone session).
+//! `playback` (pause / resume / flush), `volume` (AirPlay volume to a speaker or to a speaker
+//! group's members), `load` (re-LOAD coordination), `stall` (watchdog), `fallback`
+//! (FLAC → WAV), `teardown` (session end), `state` (slots + session), `remote` (now-playing
+//! metadata to Cast, Cast-side play / pause / volume to the sender), `group` (AirPlay
+//! multi-select played as one Google Cast multizone session).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use crate::registry::DeviceRegistry;
 
 use self::group::CastGroup;
 use self::state::{DeviceSlot, DeviceState};
+use self::volume::GroupVolume;
 
 mod fallback;
 mod group;
@@ -42,6 +44,7 @@ mod state;
 mod teardown;
 #[cfg(test)]
 mod test_support;
+mod volume;
 mod worker;
 
 pub use self::teardown::{SessionEndStep, session_end_steps};
@@ -79,6 +82,10 @@ pub struct Bridge {
   /// routed through [`Bridge::run`] to the member's device worker.
   redispatch: mpsc::UnboundedSender<AirPlaySessionEvent>,
   redispatch_rx: Mutex<Option<mpsc::UnboundedReceiver<AirPlaySessionEvent>>>,
+  /// Member volume of speaker-group receivers whose session plays elsewhere, by registry id.
+  ///
+  /// Never held together with another bridge lock.
+  group_volumes: Mutex<HashMap<String, GroupVolume>>,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -126,6 +133,7 @@ impl Bridge {
       groups: Mutex::new(HashMap::new()),
       redispatch,
       redispatch_rx: Mutex::new(Some(redispatch_rx)),
+      group_volumes: Mutex::new(HashMap::new()),
     }
   }
 

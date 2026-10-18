@@ -243,9 +243,24 @@ other pending selections. Requires `playbackSession.streamTransferSupported`. (M
 The multizone channel has no volume command in the Home app; it only reads member volume from
 `MULTIZONE_STATUS` and `DEVICE_UPDATED`. A member's volume is set the usual way, receiver
 `SET_VOLUME` on that member's own `receiver-0` at port 8009, which stays reachable while it follows
-(the Gym speaker answered status on 8009 while grouped). The group endpoint reports a `master`
-volume of its own; setting it is expected to scale the group. (Low; volume path through the Home
-app's device controller not traced) [INFERENCE]
+(the Gym speaker answered status on 8009 while grouped). (High)
+
+A Google Home speaker group's own endpoint (the "Gym and Pool" group, port 32128) reports a
+`master` volume. Setting it scales the members only while that endpoint hosts the session. Live,
+after the group joined a session that Cast then hosted on a dynamic endpoint (`172.27.10.213:32230`),
+`SET_VOLUME` 0.398 on the group endpoint left the members at 0.616 and 0.766, and the session
+host reported 0.691, their mean. The idle group endpoint still answers multizone `GET_STATUS`
+(`apps` empty) with its members and their levels:
+
+```json
+{"requestId":901,"type":"MULTIZONE_STATUS","status":{"devices":[
+  {"deviceId":"d417a9b9-bf1e-be21-1639-512dad18be1d","name":"Pool Bathroom speaker","capabilities":196612,"volume":{"level":0.766,"muted":false}},
+  {"deviceId":"56cb7fe7-e13f-3256-2532-5c4a304c57fa","name":"Gym speaker","capabilities":196612,"volume":{"level":0.616,"muted":false}}]}}
+```
+
+(High) So PlayOnAir sets a speaker group's volume on its endpoint only while its session plays
+there; otherwise it reads the members from that status and sets each member so their mean is the
+target, scaling all levels by the same factor (`crates/play-on-air/src/bridge/volume.rs`).
 
 ### LIVE Default Media Receiver sessions
 

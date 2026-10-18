@@ -24,6 +24,7 @@ mod rtsp;
 pub mod video;
 #[cfg(feature = "video")]
 pub(crate) mod video_stream;
+pub(crate) mod volume;
 
 pub(crate) mod config;
 

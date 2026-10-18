@@ -45,6 +45,9 @@ pub(crate) struct RaopConnection {
     pub(crate) timing: crate::net::ptp::SessionTiming,
     /// Sender client version from `User-Agent` (gates `dvlc` volume reports).
     pub(crate) sender_version: Option<crate::raop::remote::SenderVersion>,
+    /// SETUP carried `isMultiSelectAirPlay = true`: sender volume gets the 0.01 slider dead
+    /// band and a `dvlc` acknowledgement (`crate::raop::volume`).
+    pub(crate) multi_select: bool,
     /// Merged `updateMRNowPlayingInfo` state (`mergePolicy = update` overlays it).
     pub(crate) now_playing: crate::proto::dmap::TrackMetadata,
     #[cfg(feature = "video")]
@@ -90,6 +93,7 @@ impl RaopConnection {
             playout: None,
             timing: crate::net::ptp::SessionTiming::default(),
             sender_version: None,
+            multi_select: false,
             now_playing: crate::proto::dmap::TrackMetadata::default(),
             #[cfg(feature = "video")]
             ekey: None,
@@ -269,10 +273,8 @@ fn apply_text_parameter(conn: &RaopConnection, line: &str) {
             if let Ok(volume_db) = value.parse::<f32>()
                 && volume_db.is_finite()
             {
-                if let Ok(mut guard) = conn.shared.reported_volume_db.lock() {
-                    *guard = volume_db.clamp(crate::raop::connection::AIRPLAY_VOLUME_DB_MIN, 0.0);
-                }
-                conn.shared.handler.on_volume(volume_db);
+                tracing::debug!(volume_db, multi_select = conn.multi_select, "SET_PARAMETER volume");
+                apply_sender_volume(conn, volume_db);
             }
         }
         "progress" => {
@@ -284,6 +286,36 @@ fn apply_text_parameter(conn: &RaopConnection, line: &str) {
             }
         }
         other => tracing::trace!(name = other, "SET_PARAMETER: unhandled text parameter"),
+    }
+}
+
+/// Apply sender volume `volume_db` (`SET_PARAMETER volume`).
+///
+/// Multi-select sessions follow Apple's receiver: a value within 0.01 slider of the current
+/// volume is ignored, and an applied one is acknowledged to the sender with `dvlc`. The
+/// current volume (`GET_PARAMETER volume`, `/info` `initialVolume`) only ever holds applied
+/// values.
+fn apply_sender_volume(conn: &RaopConnection, volume_db: f32) {
+    let applied = volume_db.clamp(crate::raop::connection::AIRPLAY_VOLUME_DB_MIN, 0.0);
+    {
+        let mut current = conn
+            .shared
+            .reported_volume_db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if conn.multi_select && !crate::raop::volume::noticeably_different(*current, applied) {
+            tracing::debug!(
+                volume_db,
+                current = *current,
+                "SET_PARAMETER volume within the dead band; ignored"
+            );
+            return;
+        }
+        *current = applied;
+    }
+    conn.shared.handler.on_volume(volume_db);
+    if conn.multi_select {
+        conn.shared.ack_sender_volume(applied);
     }
 }
 
@@ -448,5 +480,117 @@ mod tests {
             *handler.artwork.lock().unwrap(),
             vec![("image/png".to_owned(), vec![1, 2, 3])]
         );
+    }
+
+    #[derive(Default)]
+    struct VolumeHandler {
+        volumes: Mutex<Vec<f32>>,
+    }
+
+    impl AudioHandler for VolumeHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            unreachable!("not exercised")
+        }
+        fn on_volume(&self, volume: f32) {
+            self.volumes.lock().unwrap().push(volume);
+        }
+    }
+
+    /// Connection with a dvlc-capable sender's event channel, as SETUP leaves it.
+    fn volume_connection(
+        handler: Arc<VolumeHandler>,
+        multi_select: bool,
+    ) -> (RaopConnection, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut conn = RaopConnection::new(test_shared(handler), 1, addr, addr);
+        conn.sender_version = Some(crate::raop::remote::SenderVersion([860, 7, 1]));
+        conn.multi_select = multi_select;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        conn.register_event_sender(tx);
+        (conn, rx)
+    }
+
+    fn set_volume(conn: &mut RaopConnection, volume_db: f32) {
+        let body = format!("volume: {volume_db:.6}\r\n");
+        let msg = format!(
+            "SET_PARAMETER rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 9\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut req = HttpRequest::new();
+        req.add_data(msg.as_bytes()).unwrap();
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        handle_set_parameter(conn, &req, &mut resp);
+    }
+
+    /// `dvlc` slider values sent on the event channel so far.
+    fn acks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<f64> {
+        let mut sliders = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            let split = message.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let body: plist::Value = plist::from_bytes(&message[split..]).unwrap();
+            let body = body.into_dictionary().unwrap();
+            assert_eq!(body.get("value").and_then(plist::Value::as_string), Some("dvlc"));
+            sliders.push(body.get("volume").and_then(plist::Value::as_real).unwrap());
+        }
+        sliders
+    }
+
+    fn initial_volume(conn: &mut RaopConnection) -> f64 {
+        let req = HttpRequest::new();
+        let mut resp = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let body = crate::raop::handlers_ap2::handle_info(conn, &req, &mut resp).unwrap();
+        let info: plist::Value = plist::from_bytes(&body).unwrap();
+        info.into_dictionary()
+            .unwrap()
+            .get("initialVolume")
+            .and_then(plist::Value::as_real)
+            .unwrap()
+    }
+
+    /// Multi-select: values within 0.01 slider of the current volume are ignored, applied ones
+    /// are acknowledged with `dvlc`, and `/info` reports the applied volume.
+    #[tokio::test]
+    async fn multi_select_volume_has_a_dead_band_and_is_acknowledged() {
+        let handler = Arc::new(VolumeHandler::default());
+        let (mut conn, mut rx) = volume_connection(handler.clone(), true);
+
+        set_volume(&mut conn, -15.0);
+        assert_eq!(*handler.volumes.lock().unwrap(), vec![-15.0]);
+        assert_eq!(acks(&mut rx), vec![0.5], "first value acknowledged at once");
+
+        // Same value and a 0.2 dB step (under 0.01 slider): ignored, no ack, /info unchanged.
+        set_volume(&mut conn, -15.0);
+        set_volume(&mut conn, -15.2);
+        assert_eq!(*handler.volumes.lock().unwrap(), vec![-15.0]);
+        assert!((initial_volume(&mut conn) - -15.0).abs() < 1e-6);
+
+        // A drag inside the throttle window: applied at once, acknowledged once at its end.
+        set_volume(&mut conn, -21.0);
+        set_volume(&mut conn, -9.0);
+        set_volume(&mut conn, -6.0);
+        assert_eq!(*handler.volumes.lock().unwrap(), vec![-15.0, -21.0, -9.0, -6.0]);
+        assert!((initial_volume(&mut conn) - -6.0).abs() < 1e-6);
+        assert_eq!(acks(&mut rx), Vec::<f64>::new(), "throttled");
+        tokio::time::sleep(crate::raop::volume::VOLUME_ACK_INTERVAL + std::time::Duration::from_millis(100)).await;
+        let trailing = acks(&mut rx);
+        assert_eq!(trailing.len(), 1, "one trailing ack: {trailing:?}");
+        assert!(
+            (trailing[0] - 0.8).abs() < 1e-6,
+            "trailing ack carries the last value: {trailing:?}"
+        );
+    }
+
+    /// A single-receiver session keeps applying every value and never acknowledges it.
+    #[tokio::test]
+    async fn single_receiver_volume_is_applied_as_sent_without_ack() {
+        let handler = Arc::new(VolumeHandler::default());
+        let (mut conn, mut rx) = volume_connection(handler.clone(), false);
+        set_volume(&mut conn, -15.0);
+        set_volume(&mut conn, -15.0);
+        set_volume(&mut conn, -15.2);
+        assert_eq!(*handler.volumes.lock().unwrap(), vec![-15.0, -15.0, -15.2]);
+        tokio::time::sleep(crate::raop::volume::VOLUME_ACK_INTERVAL + std::time::Duration::from_millis(100)).await;
+        assert_eq!(acks(&mut rx), Vec::<f64>::new());
+        assert!((initial_volume(&mut conn) - -15.2).abs() < 1e-6);
     }
 }

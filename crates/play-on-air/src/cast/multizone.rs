@@ -1,10 +1,13 @@
-//! Google Cast multizone (dynamic group) messages: `SET_PLAYBACK_DEVICES` and its answers.
+//! Google Cast multizone (dynamic group) messages: `SET_PLAYBACK_DEVICES`, `GET_STATUS`, and
+//! their answers.
 //!
 //! Wire shapes follow `docs/cast-multizone-spec.md`. A playing Cast session is expanded,
 //! shrunk, or moved by sending the complete desired member list to `receiver-0` of the device
 //! that hosts the session; the device answers `PLAYBACK_SESSION_UPDATED` (per-member failures in
-//! `failedDevices`, a new host in `sessionEndpoint`) or `INVALID_REQUEST`.
+//! `failedDevices`, a new host in `sessionEndpoint`) or `INVALID_REQUEST`. `GET_STATUS` on a
+//! group endpoint answers `MULTIZONE_STATUS` with its member speakers and their volume levels.
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -82,6 +85,77 @@ pub struct PlaybackSessionUpdate {
   pub failed_devices: Vec<String>,
   /// New session host, when the session moved.
   pub endpoint: Option<SessionEndpoint>,
+}
+
+/// One member speaker of a group endpoint, from `MULTIZONE_STATUS`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultizoneMember {
+  /// Member device id as [`normalize_device_id`] forms it (`MULTIZONE_STATUS` sends it dashed).
+  pub device_id: String,
+  /// The member's own receiver volume level (`0.0..=1.0`).
+  pub level: f32,
+}
+
+/// Multizone `GET_STATUS` request body.
+#[must_use]
+pub fn get_status_payload(request_id: u32) -> Value {
+  serde_json::json!({ "requestId": request_id, "type": "GET_STATUS" })
+}
+
+#[derive(Deserialize)]
+struct StatusBody {
+  #[serde(default)]
+  devices: Vec<StatusDevice>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusDevice {
+  device_id: String,
+  volume: Option<StatusVolume>,
+}
+
+#[derive(Deserialize)]
+struct StatusVolume {
+  level: Option<f32>,
+}
+
+/// Parse a multizone message as the `MULTIZONE_STATUS` answer to `request_id`.
+///
+/// Returns `None` for messages that are not the answer, `Some(Ok)` with the members that carry
+/// a volume level, and `Some(Err)` for `INVALID_REQUEST` or a status without a member list.
+#[must_use]
+pub fn parse_multizone_status_reply(payload: &str, request_id: u32) -> Option<Result<Vec<MultizoneMember>>> {
+  let value: Value = serde_json::from_str(payload).ok()?;
+  if value.get("requestId").and_then(Value::as_u64) != Some(u64::from(request_id)) {
+    return None;
+  }
+  match value.get("type").and_then(Value::as_str)? {
+    "MULTIZONE_STATUS" => Some(
+      value
+        .get("status")
+        .cloned()
+        .and_then(|status| serde_json::from_value::<StatusBody>(status).ok())
+        .map(|status| {
+          status
+            .devices
+            .into_iter()
+            .filter_map(|device| {
+              Some(MultizoneMember {
+                device_id: normalize_device_id(&device.device_id),
+                level: device.volume?.level?,
+              })
+            })
+            .collect()
+        })
+        .ok_or_else(|| Error::Cast("MULTIZONE_STATUS without a member list".to_owned())),
+    ),
+    "INVALID_REQUEST" => {
+      let reason = value.get("reason").and_then(Value::as_str).unwrap_or("unknown");
+      Some(Err(Error::Cast(format!("multizone INVALID_REQUEST: {reason}"))))
+    },
+    _ => None,
+  }
 }
 
 /// Device id in the form members are keyed by: lowercase hex without dashes.
@@ -219,6 +293,45 @@ mod tests {
     assert!(parse_set_playback_devices_reply(r#"{"type":"DEVICE_UPDATED","device":{}}"#, 6).is_none());
     assert!(parse_set_playback_devices_reply(r#"{"requestId":6,"type":"MULTIZONE_STATUS"}"#, 6).is_none());
     assert!(parse_set_playback_devices_reply("not json", 6).is_none());
+  }
+
+  #[test]
+  fn get_status_matches_wire_shape() {
+    assert_eq!(
+      get_status_payload(901),
+      serde_json::json!({"requestId": 901, "type": "GET_STATUS"})
+    );
+  }
+
+  /// Live answer of the "Gym and Pool" static group endpoint while it hosted nothing.
+  #[test]
+  fn parses_live_multizone_status() {
+    let live = r#"{"requestId":901,"status":{"devices":[{"capabilities":196612,"deviceId":"d417a9b9-bf1e-be21-1639-512dad18be1d","name":"Pool Bathroom speaker","volume":{"level":0.7659151554107666,"muted":false}},{"capabilities":196612,"deviceId":"56cb7fe7-e13f-3256-2532-5c4a304c57fa","name":"Gym speaker","volume":{"level":0.6158643364906311,"muted":false}}]},"type":"MULTIZONE_STATUS"}"#;
+    let members = parse_multizone_status_reply(live, 901).expect("answer").expect("ok");
+    let ids: Vec<&str> = members.iter().map(|member| member.device_id.as_str()).collect();
+    assert_eq!(ids, ["d417a9b9bf1ebe211639512dad18be1d", "56cb7fe7e13f325625325c4a304c57fa"]);
+    assert!((members[0].level - 0.765_9).abs() < 1e-4, "{members:?}");
+    assert!((members[1].level - 0.615_9).abs() < 1e-4, "{members:?}");
+  }
+
+  #[test]
+  fn multizone_status_skips_members_without_level() {
+    let reply = r#"{"requestId":2,"type":"MULTIZONE_STATUS","status":{"devices":[{"deviceId":"a-b"},{"deviceId":"c-d","volume":{"level":0.5}}]}}"#;
+    let members = parse_multizone_status_reply(reply, 2).expect("answer").expect("ok");
+    assert_eq!(members, vec![MultizoneMember { device_id: "cd".to_owned(), level: 0.5 }]);
+  }
+
+  #[test]
+  fn multizone_status_errors_and_non_answers() {
+    let refused = r#"{"requestId":3,"type":"INVALID_REQUEST","reason":"INVALID_COMMAND"}"#;
+    let err = parse_multizone_status_reply(refused, 3).expect("answer").expect_err("refused");
+    assert!(err.to_string().contains("INVALID_COMMAND"));
+    let _no_members = parse_multizone_status_reply(r#"{"requestId":3,"type":"MULTIZONE_STATUS"}"#, 3)
+      .expect("answer")
+      .expect_err("no member list");
+    assert!(parse_multizone_status_reply(r#"{"requestId":4,"type":"MULTIZONE_STATUS","status":{}}"#, 3).is_none());
+    assert!(parse_multizone_status_reply(r#"{"requestId":3,"type":"PLAYBACK_SESSION_UPDATED"}"#, 3).is_none());
+    assert!(parse_multizone_status_reply("not json", 3).is_none());
   }
 
   #[test]

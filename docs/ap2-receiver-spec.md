@@ -604,6 +604,75 @@ mutes, and makes the bottom half of the iPhone slider nearly silent on a Cast de
 already perceptual. Mapping Cast level to Apple's slider value, `(dB + 30) / 30` clamped to `0..1`
 with `-144` as 0, follows the iPhone slider one to one. `volumeControlType` is not advertised.
 
+### Volume in multi-select groups
+
+Question from live traces: in a multi-select session (`isMultiSelectAirPlay = true`, `groupUUID`
+kept across a speaker switch) the iPhone streams `volume: <dB>` at about 100 Hz during a drag and
+interleaves a constant `volume: -21.0` every 0.3 to 1 s on the same RTSP session.
+
+**Receiver side (AirPlayReceiver).** Confidence: High.
+
+- `SET_PARAMETER` `volume:` is parsed with `strtod` and written as the session property `volume`
+  (`airplayReqProcessor_requestProcessSetParameter`, volume branch near `0x229fd9000`). With no
+  session it goes to the system `VolumeDB`. A remote-control-only session refuses it.
+- `AirPlayReceiverSessionPlatformSetProperty` (`0x229fabbb4`) converts dB to slider and calls
+  `_SetSWVolumeSliderValue` (`0x229facc88`) with "not programmatic". That function ignores a value
+  whose slider position differs from the current one by less than 0.01 (about 0.3 dB,
+  `APSVolumeSliderValuesAreNoticeablyDifferent`), otherwise stores it, writes the system
+  `VolumeDB`, and applies linear gain to every audio session of the receiver session
+  (`_SetSessionSoftwareVolumeSliderValue`, `_ProcessSWVolumeChanged`).
+- There is one volume per receiver session. No group or master volume, no multi-select branch
+  (`isMultiSelectAirPlay` is only read at SETUP for parent-group bookkeeping), no ramp or
+  smoothing on volume writes (the only fade is the 30 ms fade-in at a rate-1 anchor), and no
+  filtering of repeated or stale values beyond the 0.01 slider dead band. Last write wins.
+- Reporting back: `AirPlayReceiverSessionHandleVolumeUpdate` (`0x22a014a04`) sends `dvlc`
+  (section 5) when the receiver volume changes and differs from the last value reported. It first
+  checks an echo-suppression list (`_RemoveVolumeOrMuteRequest`, session offset `0x2d8`), but no
+  code in this build appends to that list (only cleanup releases it), so suppression never hits.
+  `[INFERENCE]` A sender-driven change therefore comes back to the sender as a `dvlc` report once
+  the system volume notification fires. Confidence for the echo: Medium (the notification path
+  from `VolumeDB` to `sendVolumeUpdate` was not traced end to end).
+
+**Sender side (AirPlaySender, extracted for this question).** Confidence: Medium.
+
+- Group volume lives entirely in the sender. A multi-select route is an aggregate endpoint
+  (`APEndpointCluster`) that fans volume out per sub-endpoint (`<AirPlayVolumeSync> Setting %@ to
+  %@ on subEndpoint`), and also listens for volume changes coming from each sub-endpoint
+  (`endpointCluster_handleSubEndpointVolumeDidChange`: `received volume change ... from
+  subEndpoint`, then either forwards or ignores it).
+- The sender keeps a per-room volume: `Saving the volume level %@ from subEndpoint as room volume
+  for room %@` and `Setting the subEndpoint volume level to %@ to match the room volume for room
+  %@`. On activation it applies an initial volume to the volume leader and fixes zero, loud or
+  invalid initial volumes to defaults of -20 dB or -27 dB
+  (`endpointdelegate_getInitialVolumeDBAndIsMuted`). -21.0 is not one of those defaults.
+- Per-endpoint send path drops duplicates (`Volume %.3f dB already sent to endpoint; Dropping`)
+  and older values (`Newer volumeDB ... set on endpoint; Dropping`), so a value that keeps coming
+  back is being re-set by a different owner, not retransmitted.
+- `[INFERENCE]` The interleaved constant is the sender's stored room or sub-endpoint volume being
+  re-asserted by its sync loop while the slider stream writes the live value. A receiver that
+  never reports its own volume (`dvlc`) leaves that stored value unchanged, which matches the
+  observation that it does not happen when a single receiver is picked directly (no cluster).
+
+**volumeControlType.** 3 is absolute hardware, 4 absolute software. Both are absolute, so the
+sender sends `volume:` dB either way; the sender uses the type for its supported-control flags
+and mute handling. No code path found that would change the multi-select resend. Confidence:
+Medium-low.
+
+**Rule for PlayOnAir.**
+
+1. Apply volume exactly as Apple does: last write wins, ignore changes under 0.01 slider
+   (`|(dB1 - dB2) / 30| < 0.01`), no group special case.
+2. After applying a sender volume, report it back with `sendMediaRemoteCommand` `value: "dvlc"`,
+   `volume: <slider 0..1>` (section 5) on the event channel, coalesced so at most one report goes
+   out per 250 ms and the final value of a drag is always reported. This is the only receiver
+   output that feeds the sender's sub-endpoint and room volume state.
+3. Advertise `initialVolume` as the volume actually applied, so the sender's stored value starts
+   in sync.
+
+Rule 2 is the untested part. To settle: run the multi-select switch with rule 2 enabled and check
+that the constant stops; or capture the event channel of an Apple TV in the same multi-select
+scenario and confirm it emits `dvlc` after sender-driven changes.
+
 ## Open questions
 
 | Question | How to settle |

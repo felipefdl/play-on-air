@@ -95,6 +95,15 @@ pub(crate) fn slider_to_db(slider: f32) -> f32 {
     VOLUME_DB_FLOOR + slider * -VOLUME_DB_FLOOR
 }
 
+/// iOS slider position (`0..=1`) of AirPlay `volume_db`: linear over `-30..=0` dB, mute (and
+/// anything at or below -30 dB) at 0.
+pub(crate) fn db_to_slider(volume_db: f32) -> f32 {
+    if !volume_db.is_finite() {
+        return 0.0;
+    }
+    ((volume_db - VOLUME_DB_FLOOR) / -VOLUME_DB_FLOOR).clamp(0.0, 1.0)
+}
+
 /// `{type: "sendMediaRemoteCommand", value: <code>}`.
 pub(crate) fn media_remote_command_body(command: MediaRemoteCommand) -> plist::Dictionary {
     let mut body = plist::Dictionary::new();

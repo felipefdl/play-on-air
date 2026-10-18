@@ -114,6 +114,14 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
     SETUP and `audio_init` of that session. A SETUP without the keys reports
     `SessionGroup::default()` (no group). PlayOnAir uses it to map AirPlay multi-room sessions onto
     Google multizone groups.
+26. **Multi-select sender volume follows `docs/ap2-receiver-spec.md` section 6** (module
+    `raop::volume`). On a connection whose SETUP had `isMultiSelectAirPlay = true`, a
+    `SET_PARAMETER volume` within 0.01 slider (0.3 dB) of the current volume is ignored (no
+    `on_volume`, current volume unchanged), and an applied one is acknowledged to the sender with
+    `dvlc` (`RaopShared::ack_sender_volume`, same version gate, no equal-value skip): the first at
+    once, then at most one per 250 ms, the last value of a burst always sent by a trailing timer.
+    The current volume (`GET_PARAMETER volume`, `/info` `initialVolume`) only holds applied values.
+    Single-receiver sessions apply every value and send no acknowledgement.
 
 ### AirPlay 2 dependencies kept
 

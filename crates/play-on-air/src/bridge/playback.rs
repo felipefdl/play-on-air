@@ -1,4 +1,4 @@
-//! AirPlay pause / resume / flush / volume handling.
+//! AirPlay pause / resume / flush handling.
 //!
 //! A pause sends Cast PAUSE at once: with the Cast read-ahead buffered on the speaker, every
 //! moment PAUSE waits is audible. A flush owes a re-LOAD to the next resume, when the sender's
@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
-use crate::airplay::airplay_db_to_cast_linear;
 use crate::cast::{CastControl, MediaPlayback};
 
 use super::Bridge;
@@ -265,42 +264,6 @@ async fn cast_play_command(bridge: Arc<Bridge>, device_id: String, generation: u
 }
 
 impl Bridge {
-  pub(super) async fn handle_volume(&self, device_id: &str, volume_db: f32) {
-    let level = airplay_db_to_cast_linear(volume_db);
-    // Volume applies while this device plays (as group owner or follower) and always goes to
-    // the device's own speaker: in a Cast multizone group each member keeps its own volume.
-    let has_session = {
-      let mut devices = self.devices.lock();
-      let found = devices.get_mut(device_id).is_some_and(|slot| match &mut slot.state {
-        DeviceState::Playing { session, .. } => {
-          *session.last_volume_linear.lock() = Some(level);
-          true
-        },
-        DeviceState::Following { .. } => true,
-        DeviceState::Idle | DeviceState::Starting { .. } => false,
-      });
-      drop(devices);
-      found
-    };
-    if !has_session {
-      return;
-    }
-    // Bounded pool call; volume is coalesced in the Cast worker. Await keeps
-    // volume ordered after prior events on this device worker without blocking
-    // other devices (per-device workers).
-    let pool = Arc::clone(&self.cast_pool);
-    let id = device_id.to_owned();
-    match tokio::task::spawn_blocking(move || pool.set_volume(&id, level)).await {
-      Ok(Ok(())) => {},
-      Ok(Err(err)) => {
-        tracing::debug!(device_id = %device_id, error = %err, "Cast volume sync failed");
-      },
-      Err(err) => {
-        tracing::debug!(device_id = %device_id, error = %err, "Cast volume task join failed");
-      },
-    }
-  }
-
   /// Pause Cast media (AirPlay rate 0, received at `rate0_at`). Keeps HTTP + session in
   /// `Playing { paused }`.
   ///
@@ -464,10 +427,9 @@ mod tests {
   use super::*;
   use crate::cast::CastControl;
   use crate::cast::CastPool;
-  use parking_lot::Mutex;
 
   use crate::audio::PcmRing;
-  use crate::bridge::load::{LoadVolumePolicy, ReloadOutcome, volume_after_load};
+  use crate::bridge::load::ReloadOutcome;
   use crate::bridge::teardown::{TeardownCastPolicy, teardown_playing};
   use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, test_playing_session};
   use crate::media::MediaServer;
@@ -666,27 +628,6 @@ mod tests {
     sleep(PAUSE_PROBE_DELAY + Duration::from_millis(300)).await;
     assert_eq!(probes(&fake), 1, "no probe once resumed: {:?}", fake.calls());
     bridge.handle_session_end("dev-probe").await;
-  }
-
-  #[tokio::test]
-  async fn handle_volume_updates_last_volume_on_active_session() {
-    let registry = Arc::new(DeviceRegistry::new());
-    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
-    let bridge = Bridge::new(registry, Arc::clone(&pool));
-    let media = MediaServer::start("127.0.0.1").await.expect("media");
-    let last_volume_linear = Arc::new(Mutex::new(None));
-
-    let mut session = test_playing_session(media, "dev-vol", pool, Arc::new(PcmRing::new(2, 64)));
-    session.last_volume_linear = Arc::clone(&last_volume_linear);
-    insert_playing(&bridge, "dev-vol", 1, session);
-
-    bridge.handle_volume("dev-vol", 0.0).await;
-    let stored = *last_volume_linear.lock();
-    assert_eq!(stored, Some(1.0));
-    assert_eq!(volume_after_load(LoadVolumePolicy::PreserveDevice), None);
-    assert_eq!(volume_after_load(LoadVolumePolicy::Rollover { last_volume: stored }), Some(1.0));
-
-    bridge.handle_session_end("dev-vol").await;
   }
 
   #[test]

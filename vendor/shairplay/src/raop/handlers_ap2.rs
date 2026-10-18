@@ -502,6 +502,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
 
     let group = super::types::SessionGroup::from_setup(dict);
     tracing::info!(group_uuid = ?group.group_uuid, multi_select = group.is_multi_select, "SETUP AirPlay group");
+    conn.multi_select = group.is_multi_select;
     conn.shared.handler.on_session_group(&group);
 
     conn.timing.configure_from_setup(dict);

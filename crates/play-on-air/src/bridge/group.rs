@@ -9,8 +9,8 @@
 //! - Every other member **follows**: its AirPlay session stays healthy (audio accepted and
 //!   drained, RTSP answered) and nothing of it reaches Cast; the owner's session is expanded to
 //!   its speaker instead. Transport commands (pause, resume, flush) arrive on every member and
-//!   only the owner turns them into Cast commands. Volume stays per speaker (each member's own
-//!   `SET_VOLUME`).
+//!   only the owner turns them into Cast commands. Volume stays per receiver (`volume`): a
+//!   speaker's own `SET_VOLUME`, a Google Home speaker group's member speakers.
 //! - Membership changes are reconciled: the full desired speaker list goes to the session host
 //!   (the owner's speaker first, the multizone group endpoint once the session moved there), one
 //!   request at a time, debounced so a burst of joins or leaves becomes one request.
@@ -69,6 +69,12 @@ impl CastGroup {
   fn is_empty(&self) -> bool {
     self.owner.is_none() && self.followers.is_empty() && self.excluded.is_empty()
   }
+
+  /// Pool worker hosting the group's Cast media session: the multizone session host once the
+  /// session moved there, else the owner's speaker.
+  pub(super) fn media_key(&self) -> Option<String> {
+    self.host_key.clone().or_else(|| self.owner.clone())
+  }
 }
 
 /// How a member's AirPlay session joins its group (decided and installed atomically).
@@ -123,7 +129,12 @@ fn session_name(names: &[String]) -> Option<String> {
 
 /// Pool worker key for a multizone session host at `ip:port`.
 fn session_host_key(endpoint: &SessionEndpoint) -> String {
-  format!("cast-session:{}:{}", endpoint.ip_address, endpoint.port)
+  session_host_key_at(&endpoint.ip_address, endpoint.port)
+}
+
+/// Pool worker key a multizone session hosted at `ip:port` is controlled through.
+pub(super) fn session_host_key_at(ip: &str, port: u16) -> String {
+  format!("cast-session:{ip}:{port}")
 }
 
 impl Bridge {
@@ -799,7 +810,7 @@ mod tests {
   use crate::bridge::RingLookup;
   use crate::bridge::start::PREBUFFER_FRAMES;
   use crate::bridge::test_support::{CastCall, FakeCast, SwapRingLookup, test_device};
-  use crate::cast::{CastControl, PlaybackSessionUpdate};
+  use crate::cast::{CastControl, MultizoneMember, PlaybackSessionUpdate};
   use crate::registry::DeviceRegistry;
 
   const GROUP: &str = "group-uuid";
@@ -1133,6 +1144,46 @@ mod tests {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let plays = h.cast.calls().iter().filter(|c| matches!(c, CastCall::Play(_))).count();
     assert_eq!(plays, 1, "one Cast PLAY for the group");
+    h.stop().await;
+  }
+
+  /// Live case: a Google Home speaker group joins a speaker's session, then owns it after the
+  /// speaker leaves. Its session never plays on its own endpoint, so its volume goes to its
+  /// member speakers, never to its master volume.
+  #[tokio::test]
+  async fn speaker_group_volume_goes_to_its_members_while_its_session_plays_elsewhere() {
+    let h = Harness::start();
+    let mut group = test_device(B, "Gym and Pool").with_model(crate::registry::CAST_GROUP_MODEL);
+    group.port = 32_128;
+    let _known = h.bridge.registry.appear(group);
+    h.cast.set_members(
+      B,
+      vec![
+        MultizoneMember { device_id: A.to_owned(), level: 0.2 },
+        MultizoneMember { device_id: C.to_owned(), level: 0.6 },
+      ],
+    );
+    let _rings = form_group(&h).await;
+    assert!(h.bridge.is_following(B));
+
+    let volume = |volume_db: f32| AirPlaySessionEvent::Volume { device_id: B.to_owned(), volume_db };
+    let member_keys = |it: &Harness| {
+      let mut keys: Vec<String> = it.cast.volumes().into_iter().map(|(key, _)| key).collect();
+      keys.sort();
+      keys
+    };
+    h.send(volume(-6.0));
+    h.wait_for("following group's members set", |it| it.cast.volumes().len() == 2)
+      .await;
+    assert_eq!(member_keys(&h), ids(&[A, C]));
+
+    h.airplay_end(A);
+    h.wait_for("group receiver owns the session", |it| it.playing_owner(B)).await;
+    h.send(volume(-12.0));
+    h.wait_for("owning group's members set", |it| it.cast.volumes().len() == 4)
+      .await;
+    assert_eq!(member_keys(&h), ids(&[A, A, C, C]));
+    assert!(!h.cast.calls().contains(&CastCall::SetVolume(B.to_owned())));
     h.stop().await;
   }
 

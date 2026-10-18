@@ -69,6 +69,8 @@ pub(crate) struct RaopShared {
     /// Open event channels by owning connection id, oldest first. Receiver-initiated
     /// commands go to the active-audio owner's channel, else the newest.
     pub(crate) event_senders: std::sync::Mutex<Vec<(u64, crate::raop::event_channel::EventSender)>>,
+    /// Throttle for `dvlc` acknowledgements of multi-select sender volume.
+    pub(crate) volume_ack: std::sync::Mutex<crate::raop::volume::VolumeAck>,
     /// PTP follower acquired by [`crate::RaopServer::start`] (shared per process for fixed ports).
     pub(crate) ptp: std::sync::Mutex<Option<Arc<crate::net::ptp::PtpService>>>,
 }
@@ -187,15 +189,59 @@ impl RaopShared {
             }
             *reported = volume_db;
         }
+        self.send_volume_report(slider, muted)?;
+        tracing::debug!(slider, muted, volume_db, "Reported volume to sender (dvlc)");
+        Ok(())
+    }
+
+    /// Acknowledge sender volume `volume_db` that a multi-select session applied: `dvlc` back to
+    /// the sender, throttled by [`crate::raop::volume::VolumeAck`] (a trailing report carries
+    /// the last value of a burst). Unlike [`Self::report_volume`] it does not skip a value
+    /// equal to the current one: the sender set it, and the report is its acknowledgement.
+    pub(crate) fn ack_sender_volume(self: &Arc<Self>, volume_db: f32) {
+        let step = self
+            .volume_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .applied(volume_db, std::time::Instant::now());
+        self.run_volume_ack(step);
+    }
+
+    fn run_volume_ack(self: &Arc<Self>, step: crate::raop::volume::AckStep) {
+        use crate::raop::volume::{AckStep, db_to_slider_and_mute};
+        match step {
+            AckStep::Send(volume_db) => {
+                let (slider, muted) = db_to_slider_and_mute(volume_db);
+                match self.send_volume_report(slider, muted) {
+                    Ok(()) => tracing::debug!(volume_db, slider, muted, "Acknowledged sender volume (dvlc)"),
+                    Err(err) => tracing::debug!(volume_db, error = %err, "Sender volume not acknowledged"),
+                }
+            }
+            AckStep::Arm(deadline) => {
+                let shared = Arc::clone(self);
+                drop(tokio::spawn(async move {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    let step = shared
+                        .volume_ack
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .fire(std::time::Instant::now());
+                    shared.run_volume_ack(step);
+                }));
+            }
+            AckStep::Idle => {}
+        }
+    }
+
+    /// Send a `dvlc` report on the command event channel (senders before 354.54.6 refused).
+    fn send_volume_report(&self, slider: f32, muted: bool) -> Result<(), RemoteError> {
         let sender = self.command_event_sender().ok_or(RemoteError::NoEventChannel)?;
         if let Some(version) = sender.sender_version()
             && version < remote::DVLC_MIN_SENDER_VERSION
         {
             return Err(RemoteError::SenderTooOld(version.to_string()));
         }
-        sender.send_command(&remote::volume_report_body(slider, muted))?;
-        tracing::debug!(slider, muted, volume_db, "Reported volume to sender (dvlc)");
-        Ok(())
+        sender.send_command(&remote::volume_report_body(slider, muted))
     }
 
     /// Stop active audio and abort **all** registered AP2 session tasks.
@@ -354,6 +400,7 @@ pub(crate) fn test_shared(handler: Arc<dyn AudioHandler>) -> Arc<RaopShared> {
         hls_handler: None,
         reported_volume_db: std::sync::Mutex::new(0.0),
         event_senders: std::sync::Mutex::new(Vec::new()),
+        volume_ack: std::sync::Mutex::new(crate::raop::volume::VolumeAck::default()),
         ptp: std::sync::Mutex::new(None),
     })
 }

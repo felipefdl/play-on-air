@@ -290,6 +290,7 @@ impl RaopServerBuilder {
             hls_handler: self.hls_handler,
             reported_volume_db: std::sync::Mutex::new(0.0),
             event_senders: std::sync::Mutex::new(Vec::new()),
+            volume_ack: std::sync::Mutex::new(crate::raop::volume::VolumeAck::default()),
             ptp: std::sync::Mutex::new(None),
         });
 

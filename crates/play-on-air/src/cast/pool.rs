@@ -27,8 +27,8 @@ use crate::registry::Device;
 
 use super::{
   ActiveCastSession, CastControl, CastTrack, MEDIA_NAMESPACE, MULTIZONE_NAMESPACE, MediaLoadRequest, MediaPlayback,
-  PlaybackSessionUpdate, SetPlaybackDevices, media_session_from_status, parse_set_playback_devices_reply,
-  volume_level_clamped,
+  MultizoneMember, PlaybackSessionUpdate, SetPlaybackDevices, get_status_payload, media_session_from_status,
+  parse_multizone_status_reply, parse_set_playback_devices_reply, volume_level_clamped,
 };
 
 /// Map Cast `Volume` from `get_status` to linear `0.0..=1.0` (muted → `0.0`).
@@ -498,6 +498,10 @@ enum CastWorkerCmd {
   SetPlaybackDevices {
     request: SetPlaybackDevices,
     reply: SyncSender<Result<PlaybackSessionUpdate>>,
+  },
+  /// Send multizone `GET_STATUS` and return the members `MULTIZONE_STATUS` lists.
+  MultizoneStatus {
+    reply: SyncSender<Result<Vec<MultizoneMember>>>,
   },
   /// Release the active session (and its LOAD request) without a Cast STOP.
   TakeSession {
@@ -1018,6 +1022,21 @@ impl CastControl for CastPool {
     }
   }
 
+  /// Read the members of group endpoint `key` (multizone `GET_STATUS`).
+  ///
+  /// Blocks up to [`COMMAND_TIMEOUT`] for `MULTIZONE_STATUS`; needs no active session.
+  fn multizone_members(&self, key: &str) -> Result<Vec<MultizoneMember>> {
+    let tx = self.cmd_tx(key)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::MultizoneStatus { reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {key} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT.saturating_add(VOLUME_TIMEOUT)) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("multizone status timed out for {key}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("multizone status reply dropped for {key}"))),
+    }
+  }
+
   /// Open (or retarget) a worker for a multizone session host at `host:port`.
   ///
   /// Session hosts are not registry speakers: [`Self::device_ids`] leaves them out, and LOAD
@@ -1216,6 +1235,10 @@ fn worker_main(
     match cmd {
       CastWorkerCmd::SetPlaybackDevices { request, reply } => {
         let result = state.with_hard_deadline(|s| s.handle_set_playback_devices(&request));
+        drop(reply.send(result));
+      },
+      CastWorkerCmd::MultizoneStatus { reply } => {
+        let result = state.with_hard_deadline(WorkerState::handle_multizone_status);
         drop(reply.send(result));
       },
       CastWorkerCmd::TakeSession { reply } => {
@@ -2300,6 +2323,39 @@ impl WorkerState {
       .as_ref()
       .map(|session| session.session_id.clone())
       .ok_or_else(|| Error::Cast("no active session".to_owned()))?;
+    let (device_id, host, port) = (self.device_id.clone(), self.host.clone(), self.port);
+    let update = self.multizone_request(
+      |request_id| {
+        let body = request.payload(request_id, &session_id);
+        tracing::info!(%device_id, %host, port, %body, "Cast multizone SET_PLAYBACK_DEVICES");
+        body
+      },
+      parse_set_playback_devices_reply,
+    )?;
+    tracing::info!(
+      device_id = %self.device_id,
+      name = ?update.name,
+      failed = ?update.failed_devices,
+      endpoint = ?update.endpoint,
+      "Cast multizone PLAYBACK_SESSION_UPDATED"
+    );
+    Ok(update)
+  }
+
+  /// Send multizone `GET_STATUS` to `receiver-0` and return the members it lists.
+  fn handle_multizone_status(&mut self) -> Result<Vec<MultizoneMember>> {
+    let members = self.multizone_request(get_status_payload, parse_multizone_status_reply)?;
+    tracing::debug!(device_id = %self.device_id, ?members, "Cast multizone MULTIZONE_STATUS");
+    Ok(members)
+  }
+
+  /// Send the multizone request `build(request_id)` to `receiver-0` and await the message
+  /// `parse(payload, request_id)` recognizes as its answer, up to [`COMMAND_TIMEOUT`].
+  fn multizone_request<T>(
+    &mut self,
+    build: impl FnOnce(u32) -> serde_json::Value,
+    parse: impl Fn(&str, u32) -> Option<Result<T>>,
+  ) -> Result<T> {
     if self.device.is_none() {
       self.ensure_connected(true)?;
     }
@@ -2308,8 +2364,7 @@ impl WorkerState {
       .as_ref()
       .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
     let request_id = device.message_manager.generate_request_id().get();
-    let body = request.payload(request_id, &session_id);
-    tracing::info!(device_id = %self.device_id, host = %self.host, port = self.port, %body, "Cast multizone SET_PLAYBACK_DEVICES");
+    let body = build(request_id);
     device
       .message_manager
       .send(rust_cast::message_manager::CastMessage {
@@ -2330,17 +2385,9 @@ impl WorkerState {
       let rust_cast::message_manager::CastMessagePayload::String(text) = &message.payload else {
         return Ok(None);
       };
-      Ok(parse_set_playback_devices_reply(text, request_id))
+      Ok(parse(text, request_id))
     });
-    let update = answer.map_err(|err| Error::Cast(format!("multizone answer: {err}")))??;
-    tracing::info!(
-      device_id = %self.device_id,
-      name = ?update.name,
-      failed = ?update.failed_devices,
-      endpoint = ?update.endpoint,
-      "Cast multizone PLAYBACK_SESSION_UPDATED"
-    );
-    Ok(update)
+    answer.map_err(|err| Error::Cast(format!("multizone answer: {err}")))?
   }
 
   /// Release the active session to another worker: no Cast STOP, probes stand down.

@@ -139,6 +139,7 @@ pub(super) enum CastCall {
     session_id: Option<String>,
   },
   CloseHost(String),
+  MultizoneStatus(String),
 }
 
 /// One-shot callback run inside the next [`FakeCast`] LOAD (simulates an event racing it).
@@ -160,6 +161,10 @@ pub(super) struct FakeCast {
   load_hook: Mutex<Option<LoadHook>>,
   /// Results of the next `move_session` calls, in order; an empty queue moves successfully.
   moves: Mutex<std::collections::VecDeque<crate::error::Result<()>>>,
+  /// `MULTIZONE_STATUS` members per group endpoint key; a key without an entry answers an error.
+  members: Mutex<HashMap<String, Vec<crate::cast::MultizoneMember>>>,
+  /// Every `set_volume` as `(key, level)`, in call order.
+  volumes: Mutex<Vec<(String, f32)>>,
 }
 
 impl FakeCast {
@@ -175,6 +180,16 @@ impl FakeCast {
   /// Run `hook` during the next LOAD, before it returns.
   pub(super) fn on_next_load(&self, hook: impl FnOnce() + Send + 'static) {
     *self.load_hook.lock() = Some(LoadHook(Box::new(hook)));
+  }
+
+  /// Members the group endpoint `key` lists in `MULTIZONE_STATUS`.
+  pub(super) fn set_members(&self, key: &str, members: Vec<crate::cast::MultizoneMember>) {
+    drop(self.members.lock().insert(key.to_owned(), members));
+  }
+
+  /// Levels `set_volume` was called with, in call order.
+  pub(super) fn volumes(&self) -> Vec<(String, f32)> {
+    self.volumes.lock().clone()
   }
 
   pub(super) fn calls(&self) -> Vec<CastCall> {
@@ -205,8 +220,9 @@ impl CastControl for FakeCast {
     })
   }
 
-  fn set_volume(&self, key: &str, _level: f32) -> crate::error::Result<()> {
+  fn set_volume(&self, key: &str, level: f32) -> crate::error::Result<()> {
     self.record(CastCall::SetVolume(key.to_owned()));
+    self.volumes.lock().push((key.to_owned(), level));
     Ok(())
   }
 
@@ -263,6 +279,16 @@ impl CastControl for FakeCast {
       .lock()
       .pop_front()
       .unwrap_or_else(|| Ok(crate::cast::PlaybackSessionUpdate::default()))
+  }
+
+  fn multizone_members(&self, key: &str) -> crate::error::Result<Vec<crate::cast::MultizoneMember>> {
+    self.record(CastCall::MultizoneStatus(key.to_owned()));
+    self
+      .members
+      .lock()
+      .get(key)
+      .cloned()
+      .ok_or_else(|| crate::error::Error::Cast(format!("no multizone status for {key}")))
   }
 
   fn open_session_host(&self, key: &str, host: &str, port: u16) {
