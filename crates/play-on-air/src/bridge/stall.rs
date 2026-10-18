@@ -1,6 +1,7 @@
 //! Stall watchdog: detect Cast no longer pulling the HTTP body and recover or end the session.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
@@ -8,6 +9,7 @@ use tokio::time::sleep;
 
 use super::Bridge;
 use super::fallback::{FLAC_FALLBACK_WINDOW, FlacStrikeDecision, FlacStrikeReason, apply_flac_strike};
+use super::load::ReloadOutcome;
 use super::state::{DeviceState, EgressKind};
 use super::teardown::{TeardownCastPolicy, teardown_playing};
 
@@ -195,9 +197,33 @@ impl Bridge {
     }
 
     tracing::warn!(%device_id, generation, "media stall detected; re-LOADing Cast media");
-    let ok = self.reload_playing_media(device_id, generation, "stall", None).await;
-    if !ok {
-      self.terminal_stall_end(device_id, generation, "stall re-LOAD failed");
+    match self.reload_playing_media(device_id, generation, "stall", None).await {
+      ReloadOutcome::Loaded => {},
+      ReloadOutcome::Paused => self.owe_stall_reload(device_id, generation),
+      ReloadOutcome::Failed => self.terminal_stall_end(device_id, generation, "stall re-LOAD failed"),
+    }
+  }
+
+  /// A pause abandoned the stall re-LOAD: the session stays, and the re-LOAD is owed to the
+  /// next resume (like a flush that fired while paused). When the client already resumed while
+  /// the abandoned LOAD unwound, that resume could not know, so re-LOAD now.
+  fn owe_stall_reload(self: &Arc<Self>, device_id: &str, generation: u64) {
+    let mut devices = self.devices.lock();
+    let Some(DeviceState::Playing { generation: live_gen, session }) = devices.get_mut(device_id).map(|s| &mut s.state)
+    else {
+      return;
+    };
+    if *live_gen != generation || !session.session_alive.load(Ordering::Acquire) {
+      return;
+    }
+    session.stall_reload_owed = true;
+    let paused = session.paused;
+    drop(devices);
+    if paused {
+      tracing::info!(%device_id, generation, "stall re-LOAD abandoned by pause; re-LOAD owed to resume");
+    } else {
+      tracing::info!(%device_id, generation, "stall re-LOAD abandoned by a pause that already ended; re-LOADing");
+      self.spawn_reload_playing_media(device_id, generation, "stall_owed_resume", None);
     }
   }
 
@@ -236,8 +262,12 @@ impl Bridge {
   /// await (no Cast STOP, no kick).
   fn terminal_stall_end(&self, device_id: &str, generation: u64, reason: &'static str) {
     tracing::warn!(%device_id, generation, reason, "terminal media stall; ending session");
+    let group = self.session_group(device_id);
     let taken = self.take_live_session_if_gen(device_id, generation);
+    // The Cast session played for the whole multizone group; its members go down with it.
+    let (followers, session_host) = group.map(|uuid| self.end_group(&uuid)).unwrap_or_default();
     let kick_target = self.airplay.clone();
+    let pool = Arc::clone(&self.cast_pool);
     let id = device_id.to_owned();
     self.spawn_detached(async move {
       if let Some(session) = taken {
@@ -252,11 +282,17 @@ impl Bridge {
           "terminal stall but no live session to tear down"
         );
       }
+      // Close the group's session host only after the STOP above went through it.
+      if let Some(key) = session_host {
+        drop(tokio::task::spawn_blocking(move || pool.close_session_host(&key)));
+      }
       // Always kick even when take returned None so AirPlay clients do not keep streaming.
-      if let Some(airplay) = kick_target
-        && let Err(err) = airplay.kick_clients(&id).await
-      {
-        tracing::warn!(device_id = %id, error = %err, "AirPlay kick after terminal stall failed");
+      if let Some(airplay) = kick_target {
+        for kicked in std::iter::once(id).chain(followers) {
+          if let Err(err) = airplay.kick_clients(&kicked).await {
+            tracing::warn!(device_id = %kicked, error = %err, "AirPlay kick after terminal stall failed");
+          }
+        }
       }
     });
   }
@@ -319,5 +355,70 @@ mod tests {
       stall_action(false, true, 500, EgressKind::FlacLive, true, true),
       StallAction::EarlyFlacFallback
     );
+  }
+
+  /// Live journal: a pause landed while the stall re-LOAD was on the wire ("re-LOAD aborted:
+  /// paused during LOAD") and the session was ended as a terminal stall. The pause must instead
+  /// owe the re-LOAD to resume, like a flush that fires while paused.
+  #[tokio::test]
+  async fn pause_during_stall_reload_owes_reload_to_resume() {
+    use crate::audio::PcmRing;
+    use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, test_playing_session};
+    use crate::cast::CastControl;
+    use crate::media::MediaServer;
+    use crate::registry::DeviceRegistry;
+
+    const DEV: &str = "dev-stall-pause";
+    let fake = Arc::new(FakeCast::default());
+    let pool: Arc<dyn CastControl> = Arc::<FakeCast>::clone(&fake);
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let ring = Arc::new(PcmRing::new(2, 64));
+    insert_playing(&bridge, DEV, 1, test_playing_session(media, DEV, pool, ring));
+    let loads = |cast: &FakeCast| cast.calls().iter().filter(|call| matches!(call, CastCall::Load(_))).count();
+
+    let pausing = Arc::clone(&bridge);
+    fake.on_next_load(move || pausing.handle_pause(DEV));
+    bridge.handle_stall_reload(DEV, 1).await;
+
+    assert!(bridge.has_session(DEV), "pause during stall re-LOAD must not end the session");
+    {
+      let devices = bridge.devices.lock();
+      let Some(DeviceState::Playing { session, .. }) = devices.get(DEV).map(|slot| &slot.state) else {
+        panic!("expected Playing");
+      };
+      assert!(session.paused);
+      assert!(session.stall_reload_owed, "abandoned stall re-LOAD is owed to resume");
+      drop(devices);
+    }
+    assert_eq!(loads(&fake), 1);
+
+    bridge.handle_resume(DEV);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while loads(&fake) < 2 {
+      assert!(
+        Instant::now() < deadline,
+        "resume must re-LOAD the owed stall: {:?}",
+        fake.calls()
+      );
+      sleep(Duration::from_millis(10)).await;
+    }
+    let owed_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      let owed = {
+        let devices = bridge.devices.lock();
+        matches!(
+          devices.get(DEV).map(|slot| &slot.state),
+          Some(DeviceState::Playing { session, .. }) if session.stall_reload_owed
+        )
+      };
+      if !owed {
+        break;
+      }
+      assert!(Instant::now() < owed_deadline, "accepted resume re-LOAD clears the owed stall");
+      sleep(Duration::from_millis(10)).await;
+    }
+    assert!(bridge.has_session(DEV));
+    bridge.handle_session_end(DEV).await;
   }
 }

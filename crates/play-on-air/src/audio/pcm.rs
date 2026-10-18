@@ -107,6 +107,21 @@ impl PcmRing {
     take_frames
   }
 
+  /// Pop up to `frame_count` frames as interleaved f32 PCM, unconverted.
+  ///
+  /// Returns the number of **frames** written into `out` (cleared first). Moves audio between
+  /// rings without quantizing it; an empty ring is not counted as an egress underrun.
+  pub fn pop_f32(&self, frame_count: usize, out: &mut Vec<f32>) -> usize {
+    let ch = usize::from(self.channels);
+    out.clear();
+    let mut guard = self.buf.lock();
+    let take_frames = frame_count.min(guard.len() / ch);
+    let take_samples = take_frames.saturating_mul(ch);
+    out.extend(guard.drain(..take_samples));
+    drop(guard);
+    take_frames
+  }
+
   /// Number of complete frames currently buffered.
   pub fn available_frames(&self) -> usize {
     let guard = self.buf.lock();
@@ -168,6 +183,18 @@ mod tests {
       let expected = f32_to_i16(input[i]);
       assert_eq!(v, expected);
     }
+  }
+
+  #[test]
+  fn pop_f32_moves_samples_unchanged() {
+    let ring = PcmRing::new(2, 64);
+    ring.push_f32(&[0.1, -0.2, 0.3, -0.4, 0.5]);
+    let mut out = Vec::new();
+    assert_eq!(ring.pop_f32(8, &mut out), 2, "only complete frames");
+    assert_eq!(out, vec![0.1, -0.2, 0.3, -0.4]);
+    assert_eq!(ring.pop_f32(8, &mut out), 0);
+    assert_eq!(out, Vec::<f32>::new());
+    assert_eq!(ring.underrun_polls(), 0, "draining is not an egress underrun");
   }
 
   #[test]

@@ -500,6 +500,10 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
         return Some(resp_dict);
     }
 
+    let group = super::types::SessionGroup::from_setup(dict);
+    tracing::info!(group_uuid = ?group.group_uuid, multi_select = group.is_multi_select, "SETUP AirPlay group");
+    conn.shared.handler.on_session_group(&group);
+
     conn.timing.configure_from_setup(dict);
     if timing == "PTP" {
         let mut tpi = plist::Dictionary::new();
@@ -723,6 +727,7 @@ fn setup_stream_buffered(
         sample_rate: conn.shared.output_sample_rate,
         max_channels: conn.shared.output_max_channels,
         latency_samples: conn.shared.audio_latency_samples,
+        release_lead: conn.shared.release_lead,
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };

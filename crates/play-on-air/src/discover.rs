@@ -9,6 +9,7 @@
 //! Registration (shairplay / Bonjour or Avahi) still works for AirPlay ads;
 //! discovery alone uses the backend that matches the OS.
 
+use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader};
 #[cfg(target_os = "macos")]
@@ -363,8 +364,52 @@ fn unescape_dns_sd(s: &str) -> String {
   out
 }
 
-/// Build a [`Device`] from instance name + resolve info.
-pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
+/// Cast capability bit (TXT `ca`) set on transient dynamic groups.
+const CAST_CAPABILITY_DYNAMIC_GROUP: u64 = 64;
+
+/// Whether Cast capability bits (TXT `ca`) mark a transient dynamic group.
+///
+/// Google multizone announces a `Google-Cast-Group-<hex>` service on the leader while it
+/// expands a playing session to more speakers. The Google Home app tells it apart from a
+/// saved group only by capability bit 64 (dynamic group); the live announcement carries
+/// `ca=198756` (bits 32 and 64). Saved and user-made groups keep bit 32 (multizone group)
+/// without 64 and stay advertised; speakers carry neither.
+#[must_use]
+pub const fn is_dynamic_cast_group(capabilities: u64) -> bool {
+  capabilities & CAST_CAPABILITY_DYNAMIC_GROUP != 0
+}
+
+/// Parse a TXT `ca` value (decimal); `None` when absent or unparsable.
+#[must_use]
+pub fn parse_cast_capabilities(ca: Option<&str>) -> Option<u64> {
+  ca.and_then(|s| s.trim().parse().ok())
+}
+
+/// A resolved `_googlecast._tcp` service, classified for the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CastService {
+  /// A speaker or saved group that is bridged to AirPlay.
+  Device(Device),
+  /// A transient multizone dynamic group; never registered.
+  DynamicGroup {
+    /// The device PlayOnAir would build for it (id, name, instance for logs and cleanup).
+    device: Device,
+    /// Its TXT `ca` capability bits.
+    capabilities: u64,
+  },
+}
+
+/// Classify `device` by its TXT `ca` value: dynamic groups are kept out of the registry.
+#[must_use]
+pub fn classify_cast_service(device: Device, ca: Option<&str>) -> CastService {
+  match parse_cast_capabilities(ca) {
+    Some(capabilities) if is_dynamic_cast_group(capabilities) => CastService::DynamicGroup { device, capabilities },
+    _ => CastService::Device(device),
+  }
+}
+
+/// Classify a `dns-sd -L` resolve into a registry device or an ignored dynamic group.
+pub fn cast_service_from_resolve(instance: &str, info: &ResolveInfo) -> CastService {
   let txt = parse_txt_blob(&info.txt);
   let id = txt
     .get("id")
@@ -385,7 +430,31 @@ pub fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
     .filter(|a| !a.is_empty())
     .map_or_else(|| resolve_cast_host(&hostname), ToOwned::to_owned);
   let port = if info.port == 0 { 8009 } else { info.port };
-  Device::new(id, name, host, hostname, port, instance).with_model(model)
+  let device = Device::new(id, name, host, hostname, port, instance).with_model(model);
+  classify_cast_service(device, txt.get("ca").map(String::as_str))
+}
+
+/// Keep a transient dynamic group out of the registry.
+///
+/// Debug-logs once per instance (tracked in `ignored`); a group that is somehow already
+/// registered is removed as if it were never seen.
+fn ignore_dynamic_group(registry: &DeviceRegistry, device: &Device, capabilities: u64, ignored: &mut HashSet<String>) {
+  if ignored.insert(device.instance.clone()) {
+    tracing::debug!(
+      instance = %device.instance,
+      name = %device.name,
+      ca = capabilities,
+      "ignoring transient Cast dynamic group"
+    );
+  }
+  if registry.leave(&device.id).is_some() {
+    tracing::info!(
+      id = %device.id,
+      name = %device.name,
+      instance = %device.instance,
+      "Chromecast removed (transient Cast dynamic group)"
+    );
+  }
 }
 
 /// Mark a device pending leave when mDNS reports a remove (debounced ~20s).
@@ -476,6 +545,7 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
   let shared_child = Arc::new(std::sync::Mutex::new(child));
   let session_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
   let watcher = spawn_shutdown_watcher(Arc::clone(&shared_child), Arc::clone(&session_done), shutdown.clone());
+  let mut ignored_groups = HashSet::new();
 
   for raw_line in reader.lines() {
     if *shutdown.borrow() {
@@ -490,7 +560,10 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     };
     match event.kind {
       BrowseKind::Add => match resolve_instance_dns_sd(&event.instance, shutdown) {
-        Ok(device) => {
+        Ok(CastService::DynamicGroup { device, capabilities }) => {
+          ignore_dynamic_group(registry, &device, capabilities, &mut ignored_groups);
+        },
+        Ok(CastService::Device(device)) => {
           let was_pending = registry.is_pending_leave(&device.id);
           let is_new = registry.appear(device.clone());
           if was_pending {
@@ -550,13 +623,13 @@ fn spawn_dns_sd_browse() -> Result<Child> {
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_instance_dns_sd(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<Device> {
+fn resolve_instance_dns_sd(instance: &str, shutdown: &watch::Receiver<bool>) -> Result<CastService> {
   let output = run_lookup_dns_sd(instance, shutdown)?;
   // Prefer a resolve line that matches this host's primary LAN IPv4 when multi-homed.
   let preferred = vec![crate::net::advertise_host_ip()];
   let info = parse_lookup_output_with_preferred(&output, &preferred)
     .ok_or_else(|| Error::Discovery(format!("could not parse dns-sd -L for {instance}")))?;
-  Ok(device_from_resolve(instance, &info))
+  Ok(cast_service_from_resolve(instance, &info))
 }
 
 /// Max wall-clock for one `dns-sd -L` resolve before the child is killed.
@@ -655,12 +728,19 @@ fn run_browse_session(registry: &DeviceRegistry, shutdown: &watch::Receiver<bool
     .map_err(|err| Error::Discovery(format!("mdns-sd browse failed: {err}")))?;
 
   tracing::debug!(service = GOOGLECAST_MDNS_TYPE, "mdns-sd browse started");
+  let mut ignored_groups = HashSet::new();
 
   while !*shutdown.borrow() {
     // flume RecvTimeoutError: Timeout keeps the loop (shutdown poll); other = end.
     match receiver.recv_timeout(MDNS_RECV_POLL) {
       Ok(ServiceEvent::ServiceResolved(resolved)) => {
-        let device = device_from_mdns_resolved(resolved.as_ref());
+        let device = match cast_service_from_mdns_resolved(resolved.as_ref()) {
+          CastService::Device(device) => device,
+          CastService::DynamicGroup { device, capabilities } => {
+            ignore_dynamic_group(registry, &device, capabilities, &mut ignored_groups);
+            continue;
+          },
+        };
         let was_pending = registry.is_pending_leave(&device.id);
         let is_new = registry.appear(device.clone());
         if was_pending {
@@ -733,12 +813,12 @@ fn instance_from_mdns_fullname(fullname: &str) -> &str {
     .unwrap_or(fullname)
 }
 
-/// Map a resolved mDNS service into a Cast [`Device`].
+/// Classify a resolved mDNS service into a Cast [`Device`] or an ignored dynamic group.
 ///
 /// Host: IPv4 preferred (same /24 as this host first), else IPv6 with its scope id;
 /// see [`crate::net::select_cast_addr`].
 #[cfg(target_os = "linux")]
-fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
+fn cast_service_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> CastService {
   let props = resolved.get_properties();
   let id = props
     .get("id")
@@ -778,7 +858,8 @@ fn device_from_mdns_resolved(resolved: &mdns_sd::ResolvedService) -> Device {
     if p == 0 { 8009 } else { p }
   };
   let instance = instance_from_mdns_fullname(resolved.get_fullname()).to_owned();
-  Device::new(id, name, host, hostname, port, instance).with_model(model)
+  let device = Device::new(id, name, host, hostname, port, instance).with_model(model);
+  classify_cast_service(device, props.get("ca").map(mdns_sd::TxtProperty::val_str))
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +876,14 @@ fn run_browse_session(_registry: &DeviceRegistry, _shutdown: &watch::Receiver<bo
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Resolve that must classify as a bridged device.
+  fn device_from_resolve(instance: &str, info: &ResolveInfo) -> Device {
+    match cast_service_from_resolve(instance, info) {
+      CastService::Device(device) => device,
+      other @ CastService::DynamicGroup { .. } => panic!("expected a device, got {other:?}"),
+    }
+  }
 
   #[test]
   fn parse_browse_add_line() {
@@ -950,5 +1039,82 @@ Lookup Google-Cast-Group-abc._googlecast._tcp.local.
     assert_eq!(d.host, "10.0.0.9");
     assert_eq!(d.id, "xyz");
     assert_eq!(d.name, "Kitchen");
+  }
+
+  #[test]
+  fn dynamic_group_capability_bit() {
+    // Live dynamic group announcement: bits 32 + 64.
+    assert!(is_dynamic_cast_group(198_756));
+    // Speaker: neither bit.
+    assert!(!is_dynamic_cast_group(198_660));
+    // Saved group: bit 32 only.
+    assert!(!is_dynamic_cast_group(198_692));
+    assert!(!is_dynamic_cast_group(199_204));
+  }
+
+  #[test]
+  fn cast_capabilities_parse_failures_are_not_dynamic() {
+    assert_eq!(parse_cast_capabilities(Some("198756")), Some(198_756));
+    assert_eq!(parse_cast_capabilities(None), None);
+    assert_eq!(parse_cast_capabilities(Some("")), None);
+    assert_eq!(parse_cast_capabilities(Some("0x40")), None);
+    assert_eq!(parse_cast_capabilities(Some("-64")), None);
+    let device = Device::new("x", "X", "10.0.0.1", "x.local", 8009, "X");
+    assert_eq!(
+      classify_cast_service(device.clone(), Some("abc")),
+      CastService::Device(device.clone())
+    );
+    assert_eq!(classify_cast_service(device.clone(), None), CastService::Device(device));
+  }
+
+  #[test]
+  fn dynamic_group_resolve_is_not_a_device() {
+    let out = r"
+Lookup Google-Cast-Group-0123456789abcdef0123456789abcdef._googlecast._tcp.local.
+10:00:00.001  Google-Cast-Group-0123456789abcdef0123456789abcdef._googlecast._tcp.local. can be reached at leader.local.:32227 (interface 4) Flags: 1
+ id=7e5621b9-9750-22b2-4ef6-a17173a19135 cd=7e5621b9-9750-22b2-4ef6-a17173a19135 md=Google\ Cast\ Group fn=Pool\ Bathroom\ speaker\ +\ 1 ca=198756 st=0
+";
+    let info = parse_lookup_output(out).expect("lookup");
+    let service = cast_service_from_resolve("Google-Cast-Group-0123456789abcdef0123456789abcdef", &info);
+    let CastService::DynamicGroup { device, capabilities } = service else {
+      panic!("dynamic group must not become a device: {service:?}");
+    };
+    assert_eq!(capabilities, 198_756);
+    assert_eq!(device.name, "Pool Bathroom speaker + 1");
+  }
+
+  #[test]
+  fn saved_group_and_speaker_resolve_to_devices() {
+    let group = ResolveInfo {
+      hostname: "leader.local".to_owned(),
+      port: 32187,
+      txt: r"id=g md=Google\ Cast\ Group fn=Downstairs ca=199204".to_owned(),
+      address: Some("10.0.0.7".to_owned()),
+    };
+    assert!(matches!(
+      cast_service_from_resolve("Google-Cast-Group-g", &group),
+      CastService::Device(_)
+    ));
+    let speaker = ResolveInfo {
+      hostname: "nest.local".to_owned(),
+      port: 8009,
+      txt: "id=s fn=Gym ca=198660".to_owned(),
+      address: Some("10.0.0.8".to_owned()),
+    };
+    assert!(matches!(
+      cast_service_from_resolve("Nest-Audio-s", &speaker),
+      CastService::Device(_)
+    ));
+  }
+
+  #[test]
+  fn ignoring_dynamic_group_removes_a_registered_one() {
+    let registry = DeviceRegistry::default();
+    let device = Device::new("dyn", "Pool + 1", "10.0.0.7", "leader.local", 32227, "Google-Cast-Group-dyn");
+    assert!(registry.appear(device.clone()));
+    let mut ignored = HashSet::new();
+    ignore_dynamic_group(&registry, &device, 198_756, &mut ignored);
+    assert!(registry.leave("dyn").is_none());
+    assert!(ignored.contains("Google-Cast-Group-dyn"));
   }
 }

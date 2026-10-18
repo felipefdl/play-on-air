@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::cast::CastPool;
+use crate::cast::CastControl;
 use crate::media::MediaServerHandle;
 
 use super::load::INFLIGHT_LOAD_JOIN_TIMEOUT;
@@ -82,6 +82,11 @@ impl Bridge {
             tracing::debug!(%device_id, generation, "clearing orphaned Starting on shutdown");
             None
           },
+          DeviceState::Following { generation, follower } => {
+            tracing::debug!(%device_id, generation, "ending group follower on shutdown");
+            follower.pump.stop();
+            None
+          },
           DeviceState::Idle => None,
         })
         .collect();
@@ -111,11 +116,17 @@ impl Bridge {
       detached.abort_all();
       while detached.join_next().await.is_some() {}
     }
+    // Session hosts close after the teardowns sent their Cast STOP through them.
+    self.forget_all_groups();
   }
 }
 
 pub(super) async fn teardown_playing(session: PlayingSession, policy: TeardownCastPolicy) {
   let device_id = session.device_id.clone();
+  let media_key = session.route.media();
+  if let Some(pump) = session.source {
+    pump.stop();
+  }
   // Replace path: clear late_stop_allowed BEFORE session_alive so a concurrent late LOAD
   // never observes (dead, late_stop_allowed=true). Intermediate (alive, !late_stop) is safe
   // (late_load_should_stop is false). Full end leaves late_stop_allowed true.
@@ -125,7 +136,7 @@ pub(super) async fn teardown_playing(session: PlayingSession, policy: TeardownCa
     // Full end: stand ownership probes down immediately (before long joins / STOP I/O)
     // so a terminal-stall media absence cannot be declared as a false steal.
     // Do not clear on replace — a new LOAD may already own (or will own) active.
-    session.pool.session_ended(&device_id);
+    session.pool.session_ended(&media_key);
   }
   session.session_alive.store(false, Ordering::Release);
 
@@ -175,8 +186,7 @@ pub(super) async fn teardown_playing(session: PlayingSession, policy: TeardownCa
 
   let media = session.media;
   let pool = session.pool;
-  let end_device_id = session.device_id;
-  if tokio::task::spawn_blocking(move || end_media_and_maybe_cast_stop(media, &pool, &end_device_id, policy))
+  if tokio::task::spawn_blocking(move || end_media_and_maybe_cast_stop(media, pool.as_ref(), &media_key, policy))
     .await
     .is_err()
   {
@@ -187,7 +197,7 @@ pub(super) async fn teardown_playing(session: PlayingSession, policy: TeardownCa
 /// Run media shutdown then optional Cast STOP (blocking; call from `spawn_blocking`).
 fn end_media_and_maybe_cast_stop(
   media: MediaServerHandle,
-  pool: &CastPool,
+  pool: &dyn CastControl,
   device_id: &str,
   policy: TeardownCastPolicy,
 ) {
@@ -213,10 +223,29 @@ fn end_media_and_maybe_cast_stop(
 impl Bridge {
   /// End the bridge session for `device_id` if any (media down + Cast STOP best-effort).
   ///
-  /// Used by the Cast ownership-loss path so the app can tear media without waiting
-  /// for the AirPlay stack to emit `Ended`.
+  /// Used by tests and shutdown-style callers that end one device's session directly.
   pub async fn end_session(&self, device_id: &str) {
     self.handle_session_end(device_id).await;
+  }
+
+  /// Cast reported that another sender took the session on worker `cast_key` (a speaker, or a
+  /// multizone session host): end the bridge session that played there, with its whole group.
+  ///
+  /// Returns the AirPlay devices whose senders should be disconnected (the owner and every
+  /// group follower), so the app does not have to wait for the AirPlay stack to emit `Ended`.
+  pub async fn end_cast_session(&self, cast_key: &str) -> Vec<String> {
+    let owner = self.owner_for_cast_key(cast_key).unwrap_or_else(|| cast_key.to_owned());
+    let group = self.session_group(&owner);
+    self.handle_session_end(&owner).await;
+    let mut ended = vec![owner];
+    if let Some(uuid) = group {
+      let (followers, host) = self.end_group(&uuid);
+      ended.extend(followers);
+      if let Some(key) = host {
+        self.close_session_host(key);
+      }
+    }
+    ended
   }
 
   /// Tear down the current live generation for `device_id` (full STOP).
@@ -237,10 +266,11 @@ impl Bridge {
   ///
   /// For `Starting`: always clear that generation. Ring still current means the
   /// client ended while we were still starting — not a stale event.
-  pub(super) async fn handle_ended(&self, device_id: &str, rings: &dyn RingLookup) {
+  pub(super) async fn handle_ended(self: &Arc<Self>, device_id: &str, rings: &dyn RingLookup) {
     enum EndedDecision {
       Starting { generation: u64 },
       Playing { generation: u64, stale: bool },
+      Following { generation: u64, stale: bool },
     }
 
     let decision = {
@@ -252,8 +282,17 @@ impl Bridge {
         DeviceState::Playing { generation, session } => {
           let still_current = rings
             .ring_for(device_id)
-            .is_some_and(|current| Arc::ptr_eq(&current, &session.ring));
+            .is_some_and(|current| Arc::ptr_eq(&current, session.airplay_ring()));
           Some(EndedDecision::Playing {
+            generation: *generation,
+            stale: still_current,
+          })
+        },
+        DeviceState::Following { generation, follower } => {
+          let still_current = rings
+            .ring_for(device_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, follower.pump.source()));
+          Some(EndedDecision::Following {
             generation: *generation,
             stale: still_current,
           })
@@ -273,16 +312,27 @@ impl Bridge {
       Some(EndedDecision::Starting { generation }) => {
         self.clear_starting_if(device_id, generation);
         tracing::info!(%device_id, generation, "bridge Starting cancelled by Ended");
+        self.group_check_owner(device_id);
       },
-      Some(EndedDecision::Playing { generation, stale: true }) => {
+      Some(
+        EndedDecision::Playing { generation, stale: true } | EndedDecision::Following { generation, stale: true },
+      ) => {
         tracing::debug!(%device_id, generation, "dropping stale Ended (session ring still current)");
       },
+      Some(EndedDecision::Following { generation, stale: false }) => {
+        self.end_following(device_id, generation);
+      },
       Some(EndedDecision::Playing { generation, stale: false }) => {
+        // A group owner leaving while members still play hands its Cast session over.
+        if self.group_owner_left(device_id, generation) {
+          return;
+        }
         let removed = self.take_live_session_if_gen(device_id, generation);
         if let Some(session) = removed {
           teardown_playing(*session, TeardownCastPolicy::StopBestEffort).await;
           tracing::info!(%device_id, generation, "bridge session ended (media dropped; Cast STOP best-effort)");
         }
+        self.group_check_owner(device_id);
       },
     }
   }
@@ -297,6 +347,11 @@ impl Bridge {
         // Cancel Starting (leave Idle) so ownership kick / external end cannot leave
         // `has_session` true forever.
         tracing::debug!(%device_id, generation, "cleared Starting on session end");
+        None
+      },
+      DeviceState::Following { generation, follower } => {
+        tracing::debug!(%device_id, generation, "cleared group follower on session end");
+        follower.pump.stop();
         None
       },
     };
@@ -327,6 +382,8 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::cast::CastControl;
+  use crate::cast::CastPool;
   use std::sync::atomic::{AtomicBool, AtomicUsize};
   use std::time::Instant;
 
@@ -359,8 +416,8 @@ mod tests {
   #[tokio::test]
   async fn stale_ended_dropped_when_ring_still_current() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new(None));
-    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(registry, Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let ring = Arc::new(PcmRing::new(2, 64));
     insert_playing(
@@ -380,8 +437,8 @@ mod tests {
   #[tokio::test]
   async fn ended_tears_down_when_ring_no_longer_current() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new(None));
-    let bridge = Bridge::new(registry, Arc::clone(&pool));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(registry, Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let health_url = format!("{}/health", media.base_url);
     let ring = Arc::new(PcmRing::new(2, 64));
@@ -473,7 +530,7 @@ mod tests {
       pending_leave_deadline: None,
       pending_leave_since: None,
     });
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(Arc::clone(&registry), Arc::clone(&pool));
 
     let media = MediaServer::start("127.0.0.1").await.expect("media");
@@ -504,7 +561,7 @@ mod tests {
   #[tokio::test]
   async fn session_end_cancels_rollover_reload_loop() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
 
     let media = MediaServer::start("127.0.0.1").await.expect("media");
@@ -535,7 +592,7 @@ mod tests {
   #[tokio::test]
   async fn session_end_joins_inflight_load_and_marks_session_dead() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
 
@@ -575,7 +632,7 @@ mod tests {
   #[tokio::test]
   async fn session_end_joins_rollover_task_then_inflight_load() {
     let registry = Arc::new(DeviceRegistry::new());
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
 
@@ -644,7 +701,7 @@ mod tests {
 
   #[tokio::test]
   async fn ended_while_starting_with_current_ring_clears() {
-    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None))));
     let ring = Arc::new(PcmRing::new(2, 64));
     {
       let mut devices = bridge.devices.lock();
@@ -788,7 +845,7 @@ mod tests {
 
   #[tokio::test]
   async fn replace_teardown_clears_late_stop_allowed() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let session = test_playing_session(media, "dev-replace-stop", pool, Arc::new(PcmRing::new(2, 64)));
     let late_stop_allowed = Arc::clone(&session.late_stop_allowed);

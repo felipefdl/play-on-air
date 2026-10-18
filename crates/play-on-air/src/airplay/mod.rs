@@ -8,37 +8,38 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use shairplay::{AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, RaopServer, TrackMetadata};
+use shairplay::{AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, RaopServer, SessionGroup, TrackMetadata};
 use tokio::sync::mpsc;
 
 use crate::audio::PcmRing;
 use crate::error::{Error, Result};
-use crate::media::{Artwork, MAX_ARTWORK_BYTES};
+use crate::media::{Artwork, CAST_READ_AHEAD, MAX_ARTWORK_BYTES};
 
 /// Base TCP port for RAOP listeners; each device gets `BASE + (hash % PORT_SPAN)`.
 const RAOP_PORT_BASE: u16 = 5100;
 const RAOP_PORT_SPAN: u64 = 1000;
 /// Placeholder stereo capacity (~2 s at 48 kHz) until `audio_init` sets the real layout.
 const DEFAULT_RING_FRAMES: usize = 48_000 * 2;
-/// Session PCM ring depth in seconds of output audio.
+/// Headroom in the session PCM ring beyond [`CAST_READ_AHEAD`], in seconds of output audio.
 ///
 /// shairplay releases buffered audio on the sender's anchor timeline at presentation time
-/// minus `Audio-Latency` (~2 s) and back-pressures the sender over TCP, so the producer is
+/// minus [`CAST_READ_AHEAD`] and back-pressures the sender over TCP, so the producer is
 /// real-time paced. The ring only ever holds:
-/// - up to `Audio-Latency` released at once when an anchor arrives with less lead than that;
+/// - up to [`CAST_READ_AHEAD`] released at once when an anchor arrives (the burst a fresh
+///   Cast LOAD or re-LOAD pulls immediately);
 /// - real PCM produced while Cast is not pulling yet (initial LOAD, re-LOAD, FLAC to WAV
 ///   fallback), typically 1–4 s.
 ///
-/// 10 s covers both with headroom. Overflow means Cast stopped pulling for longer than that;
-/// dropping the oldest audio is then the correct live-stream behavior.
-const SESSION_RING_SECONDS: usize = 10;
+/// The read-ahead plus 8 s covers both with headroom. Overflow means Cast stopped pulling for
+/// longer than that; dropping the oldest audio is then the correct live-stream behavior.
+const SESSION_RING_HEADROOM_SECONDS: u64 = 8;
 /// Product max channels for Cast stereo path.
 const OUTPUT_MAX_CHANNELS: u8 = 2;
 /// RTSP `Audio-Latency` advertised on RECORD (samples at stream rate).
 ///
-/// This is the receiver output latency: shairplay releases each buffered sample this long
-/// before its anchor presentation time, so after the ~2 s Cast cushion (HTTP silence preroll
-/// plus `LIVE_LEAD`) it is audible close to when the sender scheduled it. Stream rate is not
+/// The output delay the sender is told about. Buffered audio is released earlier than this,
+/// [`CAST_READ_AHEAD`] before presentation, so a Cast (re)start can burst it; the speaker then
+/// plays up to that much ahead of the sender's timeline (no A/V sync promise). Stream rate is not
 /// known at receiver build (passthrough): 2 s at 48 kHz, ~2.18 s at 44.1 kHz.
 const AUDIO_LATENCY_SAMPLES: u32 = 48_000 * 2;
 /// Lifecycle events from an AirPlay receiver toward the bridge.
@@ -57,6 +58,12 @@ pub enum AirPlaySessionEvent {
     /// against the receiver's current one instead of wiring the new ring (and
     /// possibly a different sample rate) to the old event.
     ring: Arc<PcmRing>,
+    /// Sender's `groupUUID` when it selected several receivers together
+    /// (`isMultiSelectAirPlay`); `None` for a single-receiver stream.
+    ///
+    /// Every PlayOnAir receiver of one multi-select carries the same id, so the bridge can
+    /// play them as one Cast multizone group.
+    group: Option<String>,
   },
   /// Client disconnected; bridge should Cast-STOP and drop media.
   Ended {
@@ -273,6 +280,8 @@ impl Drop for RingSession {
 struct RingHandler {
   state: Arc<DeviceAudioState>,
   now_playing: Arc<Mutex<NowPlaying>>,
+  /// Multi-select group of the sender's latest initial SETUP (attached to the next `Started`).
+  group: Mutex<Option<String>>,
 }
 
 impl RingHandler {
@@ -280,6 +289,7 @@ impl RingHandler {
     Self {
       state,
       now_playing: Arc::new(Mutex::new(NowPlaying::default())),
+      group: Mutex::new(None),
     }
   }
 
@@ -298,9 +308,7 @@ impl AudioHandler for RingHandler {
     let sample_rate = format.sample_rate.max(1);
     // Cap at product stereo; shairplay also mixdowns via output_max_channels(2).
     let channels = u16::from(format.channels.clamp(1, OUTPUT_MAX_CHANNELS));
-    let capacity_frames = usize::try_from(sample_rate)
-      .unwrap_or(48_000)
-      .saturating_mul(SESSION_RING_SECONDS);
+    let capacity_frames = session_ring_frames(sample_rate);
     let ring = Arc::new(PcmRing::new(channels, capacity_frames));
     // shairplay aborts any prior audio session before this callback (exclusive
     // active audio). We always replace the ring; the stack drops the old session.
@@ -317,9 +325,21 @@ impl AudioHandler for RingHandler {
         device_id: self.state.device_id.clone(),
         sample_rate,
         ring: Arc::clone(&ring),
+        group: self.group.lock().clone(),
       }));
     }
     Box::new(RingSession::new(Arc::clone(&self.state), ring))
+  }
+
+  fn on_session_group(&self, group: &SessionGroup) {
+    let multi_select = group.group_uuid.clone().filter(|_| group.is_multi_select);
+    tracing::debug!(
+      device_id = %self.state.device_id,
+      group_uuid = ?group.group_uuid,
+      multi_select = group.is_multi_select,
+      "AirPlay session group"
+    );
+    *self.group.lock() = multi_select;
   }
 
   fn on_volume(&self, volume: f32) {
@@ -477,6 +497,7 @@ impl AirPlayReceiver {
       .port(port)
       .output_max_channels(OUTPUT_MAX_CHANNELS)
       .audio_latency_samples(AUDIO_LATENCY_SAMPLES)
+      .release_lead(CAST_READ_AHEAD)
       .advertise(options.advertise);
     if let Some((event, general)) = options.ptp_ports {
       builder = builder.ptp_ports(event, general);
@@ -893,6 +914,13 @@ pub fn stable_raop_port(device_id: &str) -> u16 {
   RAOP_PORT_BASE.saturating_add(offset)
 }
 
+/// Session PCM ring capacity at `sample_rate`: [`CAST_READ_AHEAD`] plus
+/// [`SESSION_RING_HEADROOM_SECONDS`].
+fn session_ring_frames(sample_rate: u32) -> usize {
+  let seconds = CAST_READ_AHEAD.as_secs().saturating_add(SESSION_RING_HEADROOM_SECONDS);
+  usize::try_from(u64::from(sample_rate.max(1)).saturating_mul(seconds)).unwrap_or(usize::MAX)
+}
+
 fn hash_device_id(device_id: &str) -> u64 {
   let mut hasher = std::collections::hash_map::DefaultHasher::new();
   device_id.hash(&mut hasher);
@@ -1065,6 +1093,45 @@ mod tests {
   }
 
   #[test]
+  fn multi_select_group_rides_on_started() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let state = Arc::new(DeviceAudioState {
+      ring_slot: Mutex::new(Arc::new(PcmRing::new(2, 64))),
+      event_tx: Some(tx),
+      device_id: "dev-group".to_owned(),
+    });
+    let handler = RingHandler::new(state);
+    let format = AudioFormat {
+      codec: shairplay::AudioCodec::Pcm,
+      bits: 32,
+      channels: 2,
+      sample_rate: 44_100,
+    };
+    let started_group = |events: &mut mpsc::UnboundedReceiver<AirPlaySessionEvent>| match events.try_recv() {
+      Ok(AirPlaySessionEvent::Started { group, .. }) => group,
+      other => panic!("expected Started, got {other:?}"),
+    };
+
+    handler.on_session_group(&SessionGroup {
+      group_uuid: Some("ABC-123".to_owned()),
+      is_multi_select: true,
+    });
+    let first = handler.audio_init(format);
+    assert_eq!(started_group(&mut rx).as_deref(), Some("ABC-123"));
+    drop(first);
+    drop(rx.try_recv());
+
+    // A group id without multi-select (one receiver) is not a Cast group.
+    handler.on_session_group(&SessionGroup {
+      group_uuid: Some("ABC-123".to_owned()),
+      is_multi_select: false,
+    });
+    let second = handler.audio_init(format);
+    assert_eq!(started_group(&mut rx), None);
+    drop(second);
+  }
+
+  #[test]
   fn format_change_second_init_suppresses_stale_ended() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let state = Arc::new(DeviceAudioState {
@@ -1082,7 +1149,7 @@ mod tests {
 
     let session1 = handler.audio_init(fmt(1));
     match rx.try_recv() {
-      Ok(AirPlaySessionEvent::Started { device_id, sample_rate, ring }) => {
+      Ok(AirPlaySessionEvent::Started { device_id, sample_rate, ring, .. }) => {
         assert_eq!(device_id, "dev-fmt");
         assert_eq!(sample_rate, 44_100);
         assert_eq!(ring.channels(), 1);

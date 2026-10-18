@@ -12,24 +12,27 @@
 //! Module map: `worker` (event routing + shutdown drain), `start` (prebuffer, initial LOAD),
 //! `playback` (pause / resume / flush / volume), `load` (re-LOAD coordination), `stall`
 //! (watchdog), `fallback` (FLAC → WAV), `teardown` (session end), `state` (slots + session),
-//! `remote` (now-playing metadata to Cast, Cast-side play / pause / volume to the sender).
+//! `remote` (now-playing metadata to Cast, Cast-side play / pause / volume to the sender),
+//! `group` (AirPlay multi-select played as one Google Cast multizone session).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::airplay::AirPlayManager;
+use crate::airplay::{AirPlayManager, AirPlaySessionEvent};
 use crate::audio::PcmRing;
-use crate::cast::CastPool;
+use crate::cast::CastControl;
 use crate::registry::DeviceRegistry;
 
+use self::group::CastGroup;
 use self::state::{DeviceSlot, DeviceState};
 
 mod fallback;
+mod group;
 mod load;
 mod playback;
 mod remote;
@@ -53,7 +56,7 @@ pub const SHUTDOWN_TIMEOUT: Duration = SHUTDOWN_WORKER_JOIN.saturating_add(SHUTD
 /// Orchestrates media HTTP + Cast load for AirPlay lifecycle events.
 pub struct Bridge {
   registry: Arc<DeviceRegistry>,
-  cast_pool: Arc<CastPool>,
+  cast_pool: Arc<dyn CastControl>,
   /// Optional AirPlay manager for seeding `GET_PARAMETER volume` from Cast after LOAD.
   airplay: Option<Arc<AirPlayManager>>,
   /// Per-device generation-stamped state machine.
@@ -68,6 +71,14 @@ pub struct Bridge {
   shutdown: watch::Sender<bool>,
   /// Teardowns that outlive their session slot (replace, terminal stall); joined on exit.
   detached: Mutex<JoinSet<()>>,
+  /// AirPlay multi-select groups played as one Cast multizone session, by `groupUUID`.
+  ///
+  /// Lock order: `devices` before `groups` when both are held.
+  groups: Mutex<HashMap<String, CastGroup>>,
+  /// Bridge-originated events (a group member promoted to start its own Cast session),
+  /// routed through [`Bridge::run`] to the member's device worker.
+  redispatch: mpsc::UnboundedSender<AirPlaySessionEvent>,
+  redispatch_rx: Mutex<Option<mpsc::UnboundedReceiver<AirPlaySessionEvent>>>,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -100,8 +111,9 @@ impl RingLookup for AirPlayManager {
 }
 
 impl Bridge {
-  /// Create a bridge over the shared device registry and warm Cast pool.
-  pub fn new(registry: Arc<DeviceRegistry>, cast_pool: Arc<CastPool>) -> Self {
+  /// Create a bridge over the shared device registry and Cast control (the warm pool).
+  pub fn new(registry: Arc<DeviceRegistry>, cast_pool: Arc<dyn CastControl>) -> Self {
+    let (redispatch, redispatch_rx) = mpsc::unbounded_channel();
     Self {
       registry,
       cast_pool,
@@ -111,6 +123,9 @@ impl Bridge {
       start_barrier: Mutex::new(None),
       shutdown: watch::Sender::new(false),
       detached: Mutex::new(JoinSet::new()),
+      groups: Mutex::new(HashMap::new()),
+      redispatch,
+      redispatch_rx: Mutex::new(Some(redispatch_rx)),
     }
   }
 

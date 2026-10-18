@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::media::MediaContent;
 
 use super::Bridge;
-use super::load::spawn_rollover_reload_loop;
+use super::load::{ReloadOutcome, spawn_rollover_reload_loop};
 use super::state::{DeviceState, EgressKind, PlayingSession};
 
 /// Early-session FLAC → WAV fallback window after a successful FLAC LOAD.
@@ -119,11 +119,12 @@ impl Bridge {
   /// Early FLAC window → immediate WAV fallback. Outside the window, each recovery is a FLAC
   /// strike; two strikes within [`FLAC_STRIKE_PAIR_WINDOW`] switch the LIVE session to WAV and
   /// remember process-lifetime fallback for the device.
-  pub async fn on_media_recovered(self: &Arc<Self>, device_id: &str) {
-    let Some(plan) = self.plan_media_recovered_flac(device_id) else {
+  pub async fn on_media_recovered(self: &Arc<Self>, cast_key: &str) {
+    let owner = self.owner_for_cast_key(cast_key).unwrap_or_else(|| cast_key.to_owned());
+    let Some(plan) = self.plan_media_recovered_flac(&owner) else {
       return;
     };
-    self.apply_media_recovered_plan(device_id, plan).await;
+    self.apply_media_recovered_plan(&owner, plan).await;
   }
 
   /// Decide whether a pool recovery should fall back FLAC→WAV (updates strike state under lock).
@@ -159,7 +160,10 @@ impl Bridge {
           }
         }
       },
-      DeviceState::Idle | DeviceState::Starting { .. } | DeviceState::Playing { .. } => {
+      DeviceState::Idle
+      | DeviceState::Starting { .. }
+      | DeviceState::Playing { .. }
+      | DeviceState::Following { .. } => {
         let live_generation = slot.live_gen();
         tracing::info!(
           %device_id,
@@ -229,7 +233,7 @@ impl Bridge {
       // Start rollover for WAV if not already running.
       if session.rollover_task.is_none() {
         let (cancel, task) = spawn_rollover_reload_loop(
-          session.device_id.clone(),
+          Arc::clone(&session.route),
           session.stream_url.clone(),
           Arc::clone(&session.track),
           Arc::clone(&session.pool),
@@ -253,6 +257,7 @@ impl Bridge {
     self
       .reload_playing_media(device_id, generation, "flac_to_wav_fallback", None)
       .await
+      == ReloadOutcome::Loaded
   }
 }
 
@@ -262,6 +267,7 @@ mod tests {
   use crate::audio::PcmRing;
   use crate::bridge::state::select_egress;
   use crate::bridge::test_support::{insert_playing, test_playing_session};
+  use crate::cast::CastControl;
   use crate::cast::CastPool;
   use crate::media::MediaServer;
   use crate::registry::DeviceRegistry;
@@ -285,7 +291,7 @@ mod tests {
 
   #[tokio::test]
   async fn on_media_recovered_early_flac_switches_to_wav() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let mut playing = test_playing_session(media, "dev-recov", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
@@ -312,7 +318,7 @@ mod tests {
 
   #[tokio::test]
   async fn on_media_recovered_one_late_strike_keeps_flac() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let mut playing = test_playing_session(media, "dev-late", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
@@ -343,7 +349,7 @@ mod tests {
 
   #[tokio::test]
   async fn on_media_recovered_two_late_strikes_switch_to_wav() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let mut playing = test_playing_session(media, "dev-late2", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
@@ -373,7 +379,7 @@ mod tests {
 
   #[tokio::test]
   async fn late_media_recovered_then_stall_strike_switches_to_wav() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let mut playing = test_playing_session(media, "dev-mixed", Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));

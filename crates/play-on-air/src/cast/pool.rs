@@ -26,7 +26,9 @@ use crate::net::CastRelayShutdown;
 use crate::registry::Device;
 
 use super::{
-  ActiveCastSession, CastTrack, MEDIA_NAMESPACE, MediaLoadRequest, media_session_from_status, volume_level_clamped,
+  ActiveCastSession, CastControl, CastTrack, MEDIA_NAMESPACE, MULTIZONE_NAMESPACE, MediaLoadRequest,
+  PlaybackSessionUpdate, SetPlaybackDevices, media_session_from_status, parse_set_playback_devices_reply,
+  volume_level_clamped,
 };
 
 /// Map Cast `Volume` from `get_status` to linear `0.0..=1.0` (muted → `0.0`).
@@ -456,6 +458,21 @@ enum CastWorkerCmd {
   SessionEnded,
   /// Replace the now-playing metadata of the live media (no reply; latest wins).
   UpdateMetadata { track: CastTrack },
+  /// Send multizone `SET_PLAYBACK_DEVICES` for the active session and return the answer.
+  SetPlaybackDevices {
+    request: SetPlaybackDevices,
+    reply: SyncSender<Result<PlaybackSessionUpdate>>,
+  },
+  /// Release the active session (and its LOAD request) without a Cast STOP.
+  TakeSession {
+    reply: SyncSender<Option<(ActiveCastSession, Option<MediaLoadRequest>)>>,
+  },
+  /// Take over a session that already plays on this worker's host.
+  Adopt {
+    session: ActiveCastSession,
+    load: Option<MediaLoadRequest>,
+    reply: SyncSender<Result<()>>,
+  },
   /// Exit the worker loop and drop the Cast device.
   Shutdown,
 }
@@ -484,6 +501,8 @@ struct CastWorkerHandle {
   terminal_failed: Arc<AtomicBool>,
   /// Bridge-initiated end: probes stand down even before the worker drains cmds.
   ownership_stand_down: Arc<AtomicBool>,
+  /// Multizone session host (not a registry speaker): excluded from [`CastPool::device_ids`].
+  session_host: bool,
 }
 
 /// Shared pool of warm Cast control-plane workers (`Send + Sync` via `Arc`).
@@ -555,22 +574,27 @@ impl CastPool {
   /// Does **not** spawn a second worker while one is still registered (including
   /// an exiting tombstone after join timeout).
   pub fn ensure(&self, device: &Device) {
+    self.ensure_worker(&device.id, &device.host, &device.hostname, device.port, false);
+  }
+
+  /// Start the worker for `id`, or retarget it when its endpoint changed.
+  fn ensure_worker(&self, id: &str, host: &str, hostname: &str, port: u16, session_host: bool) {
     let mut guard = self.workers.lock();
-    if let Some(handle) = guard.get_mut(&device.id) {
+    if let Some(handle) = guard.get_mut(id) {
       // Tombstone from remove: worker may still be unwinding; never double-spawn.
       if !ensure_may_spawn_for_slot(handle.exiting) {
         drop(guard);
         return;
       }
-      let host_changed = handle.host != device.host || handle.hostname != device.hostname || handle.port != device.port;
+      let host_changed = handle.host != host || handle.hostname != hostname || handle.port != port;
       if host_changed {
-        handle.host.clone_from(&device.host);
-        handle.hostname.clone_from(&device.hostname);
-        handle.port = device.port;
+        host.clone_into(&mut handle.host);
+        hostname.clone_into(&mut handle.hostname);
+        handle.port = port;
         drop(handle.cmd_tx.send(CastWorkerCmd::UpdateEndpoint {
-          host: device.host.clone(),
-          hostname: device.hostname.clone(),
-          port: device.port,
+          host: host.to_owned(),
+          hostname: hostname.to_owned(),
+          port,
         }));
       }
       drop(guard);
@@ -578,10 +602,9 @@ impl CastPool {
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let device_id = device.id.clone();
-    let host = device.host.clone();
-    let hostname = device.hostname.clone();
-    let port = device.port;
+    let device_id = id.to_owned();
+    let worker_host = host.to_owned();
+    let worker_hostname = hostname.to_owned();
     let notify = WorkerNotify {
       ownership_lost: self.ownership_lost.clone(),
       media_recovered: self.media_recovered.clone(),
@@ -601,8 +624,8 @@ impl CastPool {
       .spawn(move || {
         worker_main(
           device_id,
-          host,
-          hostname,
+          worker_host,
+          worker_hostname,
           port,
           cmd_rx,
           notify,
@@ -610,33 +633,35 @@ impl CastPool {
           reachable_worker,
           terminal_failed_worker,
           ownership_stand_down_worker,
+          session_host,
         );
       })
       .ok();
 
     if join.is_none() {
       drop(guard);
-      tracing::error!(id = %device.id, "failed to spawn warm Cast worker thread");
+      tracing::error!(%id, "failed to spawn warm Cast worker thread");
       return;
     }
 
     drop(guard.insert(
-      device.id.clone(),
+      id.to_owned(),
       CastWorkerHandle {
         cmd_tx,
         thread: join,
-        host: device.host.clone(),
-        hostname: device.hostname.clone(),
-        port: device.port,
+        host: host.to_owned(),
+        hostname: hostname.to_owned(),
+        port,
         relay_slot,
         exiting: false,
         reachable,
         terminal_failed,
         ownership_stand_down,
+        session_host,
       },
     ));
     drop(guard);
-    tracing::debug!(id = %device.id, host = %device.host, port = device.port, "warm Cast worker started");
+    tracing::debug!(%id, %host, port, session_host, "warm Cast worker started");
   }
 
   /// Whether the warm Cast worker for `device_id` currently reports a reachable control plane.
@@ -710,9 +735,48 @@ impl CastPool {
   #[must_use]
   pub fn device_ids(&self) -> Vec<String> {
     let guard = self.workers.lock();
-    guard.keys().cloned().collect()
+    guard
+      .iter()
+      .filter(|(_, handle)| !handle.session_host)
+      .map(|(id, _)| id.clone())
+      .collect()
   }
 
+  /// Stop the active media session on the warm connection (no-op if no session).
+  pub fn stop(&self, device_id: &str) -> Result<()> {
+    let tx = self.cmd_tx(device_id)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::Stop { reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast stop timed out for {device_id}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast stop reply dropped for {device_id}"))),
+    }
+  }
+
+  fn adopt(&self, key: &str, session: ActiveCastSession, load: Option<MediaLoadRequest>) -> Result<()> {
+    let tx = self.cmd_tx(key)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::Adopt { session, load, reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {key} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("session adopt timed out for {key}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("session adopt reply dropped for {key}"))),
+    }
+  }
+
+  fn cmd_tx(&self, device_id: &str) -> Result<mpsc::Sender<CastWorkerCmd>> {
+    let guard = self.workers.lock();
+    guard
+      .get(device_id)
+      .map(|h| h.cmd_tx.clone())
+      .ok_or_else(|| Error::Cast(format!("no warm Cast worker for {device_id}")))
+  }
+}
+
+impl CastControl for CastPool {
   /// LOAD media on the warm control plane for `device_id`.
   ///
   /// Blocks up to [`COMMAND_TIMEOUT`]. If the warm TCP is dead, the worker tries
@@ -720,7 +784,7 @@ impl CastPool {
   ///
   /// On timeout the caller marks the op abandoned: a late worker success must STOP
   /// the session and must not leave `active` installed (B1).
-  pub fn load(&self, device_id: &str, request: MediaLoadRequest) -> Result<ActiveCastSession> {
+  fn load(&self, device_id: &str, request: MediaLoadRequest) -> Result<ActiveCastSession> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     let abandoned = Arc::new(AtomicBool::new(false));
@@ -747,7 +811,7 @@ impl CastPool {
   }
 
   /// Set volume on the warm connection (0.0..=1.0).
-  pub fn set_volume(&self, device_id: &str, level: f32) -> Result<()> {
+  fn set_volume(&self, device_id: &str, level: f32) -> Result<()> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     tx.send(CastWorkerCmd::SetVolume { level, reply: reply_tx })
@@ -762,7 +826,7 @@ impl CastPool {
   }
 
   /// Read current receiver volume on the warm connection (`0.0..=1.0`; muted → `0.0`).
-  pub fn get_volume(&self, device_id: &str) -> Result<f32> {
+  fn get_volume(&self, device_id: &str) -> Result<f32> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     tx.send(CastWorkerCmd::GetVolume { reply: reply_tx })
@@ -776,21 +840,8 @@ impl CastPool {
     }
   }
 
-  /// Stop the active media session on the warm connection (no-op if no session).
-  pub fn stop(&self, device_id: &str) -> Result<()> {
-    let tx = self.cmd_tx(device_id)?;
-    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(CastWorkerCmd::Stop { reply: reply_tx })
-      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
-    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
-      Ok(result) => result,
-      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("warm Cast stop timed out for {device_id}"))),
-      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("warm Cast stop reply dropped for {device_id}"))),
-    }
-  }
-
   /// Pause active media. Errors with "no active session" when none is loaded.
-  pub fn pause(&self, device_id: &str) -> Result<()> {
+  fn pause(&self, device_id: &str) -> Result<()> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     tx.send(CastWorkerCmd::Pause { reply: reply_tx })
@@ -803,7 +854,7 @@ impl CastPool {
   }
 
   /// Resume a paused media session. Errors with "no active session" when none is loaded.
-  pub fn play(&self, device_id: &str) -> Result<()> {
+  fn play(&self, device_id: &str) -> Result<()> {
     let tx = self.cmd_tx(device_id)?;
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     tx.send(CastWorkerCmd::Play { reply: reply_tx })
@@ -820,7 +871,7 @@ impl CastPool {
   /// Returns `true` when the worker acknowledged STOP within `timeout`. Returns
   /// `false` on missing worker, send failure, timeout, or disconnect so callers
   /// (full teardown) can retry once.
-  pub fn stop_best_effort(&self, device_id: &str, timeout: Duration) -> bool {
+  fn stop_best_effort(&self, device_id: &str, timeout: Duration) -> bool {
     let Ok(tx) = self.cmd_tx(device_id) else {
       return false;
     };
@@ -855,7 +906,7 @@ impl CastPool {
   ///
   /// Do **not** call on replace-path teardowns: a new LOAD may already own (or is
   /// about to own) the active session.
-  pub fn session_ended(&self, device_id: &str) {
+  fn session_ended(&self, device_id: &str) {
     let guard = self.workers.lock();
     let Some(handle) = guard.get(device_id) else {
       return;
@@ -873,7 +924,7 @@ impl CastPool {
   ///
   /// Fire-and-forget. The worker sends a `QUEUE_UPDATE` for the playing queue item (no
   /// re-LOAD, so audio is not interrupted) and remembers the track for later re-LOADs.
-  pub fn update_metadata(&self, device_id: &str, track: CastTrack) {
+  fn update_metadata(&self, device_id: &str, track: CastTrack) {
     match self.cmd_tx(device_id) {
       Ok(tx) => {
         if tx.send(CastWorkerCmd::UpdateMetadata { track }).is_err() {
@@ -884,12 +935,60 @@ impl CastPool {
     }
   }
 
-  fn cmd_tx(&self, device_id: &str) -> Result<mpsc::Sender<CastWorkerCmd>> {
-    let guard = self.workers.lock();
-    guard
-      .get(device_id)
-      .map(|h| h.cmd_tx.clone())
-      .ok_or_else(|| Error::Cast(format!("no warm Cast worker for {device_id}")))
+  /// Send `SET_PLAYBACK_DEVICES` for the active session on worker `key` (the session host).
+  ///
+  /// Blocks up to [`COMMAND_TIMEOUT`] for `PLAYBACK_SESSION_UPDATED`; `INVALID_REQUEST`, no
+  /// active session, or no answer is an error.
+  fn set_playback_devices(&self, key: &str, request: SetPlaybackDevices) -> Result<PlaybackSessionUpdate> {
+    let tx = self.cmd_tx(key)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::SetPlaybackDevices { request, reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {key} disconnected")))?;
+    match reply_rx.recv_timeout(COMMAND_TIMEOUT.saturating_add(VOLUME_TIMEOUT)) {
+      Ok(result) => result,
+      Err(RecvTimeoutError::Timeout) => Err(Error::Cast(format!("multizone request timed out for {key}"))),
+      Err(RecvTimeoutError::Disconnected) => Err(Error::Cast(format!("multizone reply dropped for {key}"))),
+    }
+  }
+
+  /// Open (or retarget) a worker for a multizone session host at `host:port`.
+  ///
+  /// Session hosts are not registry speakers: [`Self::device_ids`] leaves them out, and LOAD
+  /// on them joins the running Default Media Receiver instead of launching it.
+  fn open_session_host(&self, key: &str, host: &str, port: u16) {
+    self.ensure_worker(key, host, "", port, true);
+  }
+
+  /// Hand the active media session from worker `from` to worker `to` (no Cast STOP).
+  ///
+  /// `to` re-reads the media session on its host. If it cannot, the session goes back to `from`.
+  fn move_session(&self, from: &str, to: &str) -> Result<()> {
+    let from_tx = self.cmd_tx(from)?;
+    let (take_tx, take_rx) = mpsc::sync_channel(1);
+    from_tx
+      .send(CastWorkerCmd::TakeSession { reply: take_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {from} disconnected")))?;
+    let (session, load) = take_rx
+      .recv_timeout(COMMAND_TIMEOUT)
+      .map_err(|_recv| Error::Cast(format!("session hand-off from {from} timed out")))?
+      .ok_or_else(|| Error::Cast(format!("no active session on {from} to move")))?;
+    match self.adopt(to, session.clone(), load.clone()) {
+      Ok(()) => Ok(()),
+      Err(err) => {
+        if let Err(back_err) = self.adopt(from, session, load) {
+          tracing::warn!(%from, error = %back_err, "Cast session hand-back after failed move failed");
+        }
+        Err(err)
+      },
+    }
+  }
+
+  /// Close a worker opened with [`Self::open_session_host`].
+  fn close_session_host(&self, key: &str) {
+    let is_host = self.workers.lock().get(key).is_some_and(|handle| handle.session_host);
+    if is_host {
+      self.remove(key);
+    }
   }
 }
 
@@ -953,6 +1052,8 @@ struct WorkerState {
   last_parse_warn: Option<String>,
   /// Source IP logged once per successful connect for this worker.
   logged_source_ip: bool,
+  /// Session host (multizone group endpoint): LOAD joins the running receiver instead of launching one.
+  join_running_app: bool,
 }
 
 #[expect(
@@ -978,6 +1079,7 @@ fn worker_main(
   reachable_flag: Arc<AtomicBool>,
   terminal_flag: Arc<AtomicBool>,
   ownership_stand_down: Arc<AtomicBool>,
+  join_running_app: bool,
 ) {
   let now = Instant::now();
   let mut state = WorkerState {
@@ -1010,6 +1112,7 @@ fn worker_main(
     next_reconnect_at: now,
     last_parse_warn: None,
     logged_source_ip: false,
+    join_running_app,
   };
 
   // Connect while idle (before any AirPlay session).
@@ -1048,6 +1151,17 @@ fn worker_main(
     };
 
     match cmd {
+      CastWorkerCmd::SetPlaybackDevices { request, reply } => {
+        let result = state.with_hard_deadline(|s| s.handle_set_playback_devices(&request));
+        drop(reply.send(result));
+      },
+      CastWorkerCmd::TakeSession { reply } => {
+        drop(reply.send(state.handle_take_session()));
+      },
+      CastWorkerCmd::Adopt { session, load, reply } => {
+        let result = state.with_hard_deadline(|s| s.handle_adopt(session, load));
+        drop(reply.send(result));
+      },
       CastWorkerCmd::Shutdown => {
         tracing::debug!(device_id = %state.device_id, "warm Cast worker shutting down");
         state.drop_device();
@@ -2086,10 +2200,18 @@ impl WorkerState {
       .ping()
       .map_err(|err| Error::Cast(format!("warm load heartbeat: {err}")))?;
 
-    let app = device
-      .receiver
-      .launch_app(&rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver)
-      .map_err(|err| Error::Cast(format!("warm launch app: {err}")))?;
+    let running = if self.join_running_app {
+      running_media_receiver(device)
+    } else {
+      None
+    };
+    let app = match running {
+      Some(app) => app,
+      None => device
+        .receiver
+        .launch_app(&rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver)
+        .map_err(|err| Error::Cast(format!("warm launch app: {err}")))?,
+    };
 
     device
       .connection
@@ -2101,7 +2223,114 @@ impl WorkerState {
       .load(app.transport_id.as_str(), app.session_id.as_str(), media)
       .map_err(|err| Error::Cast(format!("warm media load: {err}")))?;
 
-    media_session_from_status(app.transport_id, &status)
+    media_session_from_status(app.transport_id, app.session_id, &status)
+  }
+
+  /// Send `SET_PLAYBACK_DEVICES` for the active session to `receiver-0` and await the answer.
+  fn handle_set_playback_devices(&mut self, request: &SetPlaybackDevices) -> Result<PlaybackSessionUpdate> {
+    let session_id = self
+      .active
+      .as_ref()
+      .map(|session| session.session_id.clone())
+      .ok_or_else(|| Error::Cast("no active session".to_owned()))?;
+    if self.device.is_none() {
+      self.ensure_connected(true)?;
+    }
+    let device = self
+      .device
+      .as_ref()
+      .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
+    let request_id = device.message_manager.generate_request_id().get();
+    let body = request.payload(request_id, &session_id);
+    tracing::info!(device_id = %self.device_id, host = %self.host, port = self.port, %body, "Cast multizone SET_PLAYBACK_DEVICES");
+    device
+      .message_manager
+      .send(rust_cast::message_manager::CastMessage {
+        namespace: MULTIZONE_NAMESPACE.to_owned(),
+        source: "sender-0".to_owned(),
+        destination: "receiver-0".to_owned(),
+        payload: rust_cast::message_manager::CastMessagePayload::String(body.to_string()),
+      })
+      .map_err(|err| Error::Cast(format!("multizone send: {err}")))?;
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let answer = device.message_manager.receive_find_map(|message| {
+      if Instant::now() >= deadline {
+        return Err(rust_cast::errors::Error::Internal("multizone answer timed out".to_owned()));
+      }
+      if message.namespace != MULTIZONE_NAMESPACE {
+        return Ok(None);
+      }
+      let rust_cast::message_manager::CastMessagePayload::String(text) = &message.payload else {
+        return Ok(None);
+      };
+      Ok(parse_set_playback_devices_reply(text, request_id))
+    });
+    let update = answer.map_err(|err| Error::Cast(format!("multizone answer: {err}")))??;
+    tracing::info!(
+      device_id = %self.device_id,
+      name = ?update.name,
+      failed = ?update.failed_devices,
+      endpoint = ?update.endpoint,
+      "Cast multizone PLAYBACK_SESSION_UPDATED"
+    );
+    Ok(update)
+  }
+
+  /// Release the active session to another worker: no Cast STOP, probes stand down.
+  fn handle_take_session(&mut self) -> Option<(ActiveCastSession, Option<MediaLoadRequest>)> {
+    let session = self.active.clone()?;
+    let load = self.last_load.clone();
+    self.clear_active_session();
+    self.ownership_stand_down.store(true, Ordering::Release);
+    tracing::info!(
+      device_id = %self.device_id,
+      transport_id = %session.transport_id,
+      "Cast media session handed to another worker"
+    );
+    Some((session, load))
+  }
+
+  /// Take over a media session that already plays on this worker's host (moved by multizone).
+  ///
+  /// The media session id is re-read from the host, since a move may renumber it.
+  fn handle_adopt(&mut self, session: ActiveCastSession, load: Option<MediaLoadRequest>) -> Result<()> {
+    if self.device.is_none() {
+      self.ensure_connected(true)?;
+    }
+    let device = self
+      .device
+      .as_ref()
+      .ok_or_else(|| Error::Cast("warm Cast device not connected".to_owned()))?;
+    device
+      .connection
+      .connect(session.transport_id.as_str())
+      .map_err(|err| Error::Cast(format!("adopt app connection: {err}")))?;
+    let status = device
+      .media
+      .get_status(session.transport_id.as_str(), None)
+      .map_err(|err| Error::Cast(format!("adopt media status: {err}")))?;
+    let entry = status
+      .entries
+      .first()
+      .ok_or_else(|| Error::Cast("adopt: host reports no media session".to_owned()))?;
+    let adopted = ActiveCastSession {
+      transport_id: session.transport_id,
+      session_id: session.session_id,
+      media_session_id: entry.media_session_id,
+      queue_item_id: entry.current_item_id.map(i32::from).or(session.queue_item_id),
+    };
+    tracing::info!(
+      device_id = %self.device_id,
+      host = %self.host,
+      port = self.port,
+      transport_id = %adopted.transport_id,
+      media_session_id = adopted.media_session_id,
+      "Cast media session adopted on session host"
+    );
+    self.last_load = load;
+    self.last_load_at = Some(Instant::now());
+    self.set_active_session(adopted);
+    Ok(())
   }
 
   fn handle_set_volume(&mut self, level: f32) -> Result<()> {
@@ -2320,6 +2549,21 @@ impl WorkerState {
     );
     Ok(())
   }
+}
+
+/// Default Media Receiver app id.
+const DEFAULT_MEDIA_RECEIVER_APP_ID: &str = "CC1AD845";
+
+/// The Default Media Receiver instance already running on `device`, if any.
+///
+/// A multizone group endpoint runs the receiver for the moved session; LOAD there joins it
+/// instead of sending a LAUNCH.
+fn running_media_receiver(device: &WarmCastDevice) -> Option<rust_cast::channels::receiver::Application> {
+  let status = device.receiver.get_status().ok()?;
+  status
+    .applications
+    .into_iter()
+    .find(|app| app.app_id == DEFAULT_MEDIA_RECEIVER_APP_ID)
 }
 
 struct MediaProbe {
@@ -2768,6 +3012,7 @@ mod tests {
           reachable: Arc::new(AtomicBool::new(true)),
           terminal_failed: Arc::new(AtomicBool::new(false)),
           ownership_stand_down: Arc::new(AtomicBool::new(false)),
+          session_host: false,
         },
       ));
     }
@@ -2908,6 +3153,7 @@ mod tests {
           reachable: Arc::new(AtomicBool::new(false)),
           terminal_failed: Arc::new(AtomicBool::new(false)),
           ownership_stand_down: Arc::new(AtomicBool::new(false)),
+          session_host: false,
         },
       ));
     }

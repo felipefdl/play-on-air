@@ -124,21 +124,33 @@ async fn device_worker_loop(
         device_id: event_device,
         sample_rate,
         ring,
+        group,
       } => {
         // Prebuffer + LOAD can take seconds; shutdown abandons the start (StartingGuard
         // clears `Starting`, the unpublished media server drops) instead of waiting on it.
         tokio::select! {
           biased;
           () = shutdown_requested(&mut stop) => break,
-          result = bridge.handle_session_start(&event_device, sample_rate, ring, Arc::clone(&rings)) => {
+          result = bridge.handle_session_start(&event_device, sample_rate, ring, group, Arc::clone(&rings)) => {
             if let Err(err) = result {
               tracing::error!(device_id = %event_device, error = %err, "failed to start Cast bridge session");
             }
           },
         }
+        // A group owner whose start failed hands the group to a member.
+        bridge.group_check_owner(&event_device);
       },
       AirPlaySessionEvent::Ended { device_id: event_device } => {
         bridge.handle_ended(&event_device, rings.as_ref()).await;
+      },
+      // Transport and metadata of a group follower belong to the group owner's session: every
+      // member gets the same sender command, and only the owner turns it into a Cast command.
+      AirPlaySessionEvent::Paused { device_id: event_device }
+      | AirPlaySessionEvent::Resumed { device_id: event_device }
+      | AirPlaySessionEvent::Flushed { device_id: event_device }
+        if bridge.is_following(&event_device) =>
+      {
+        tracing::debug!(device_id = %event_device, "group follower transport event; the group owner acts on Cast");
       },
       AirPlaySessionEvent::Paused { device_id: event_device } => {
         bridge.handle_pause(&event_device);
@@ -178,11 +190,17 @@ impl Bridge {
   ) {
     let mut workers = DeviceWorkerSet::new();
     let mut stop = self.shutdown.subscribe();
+    let taken = self.redispatch_rx.lock().take();
+    let Some(mut redispatch) = taken else {
+      tracing::error!("bridge run called twice; refusing second run");
+      return;
+    };
 
     loop {
       let event = tokio::select! {
         biased;
         () = shutdown_requested(&mut stop) => break,
+        Some(event) = redispatch.recv() => event,
         next = events.recv() => match next {
           Some(event) => event,
           None => break,
@@ -291,12 +309,14 @@ mod tests {
       device_id: "dev-a".to_owned(),
       sample_rate: 48_000,
       ring: ring_a,
+      group: None,
     })
     .expect("send a");
     tx.send(AirPlaySessionEvent::Started {
       device_id: "dev-b".to_owned(),
       sample_rate: 48_000,
       ring: ring_b,
+      group: None,
     })
     .expect("send b");
 
@@ -381,6 +401,7 @@ mod tests {
       device_id: "dev-starting".to_owned(),
       sample_rate: 48_000,
       ring: starting_ring,
+      group: None,
     })
     .expect("send start");
     let wait_start = Instant::now();

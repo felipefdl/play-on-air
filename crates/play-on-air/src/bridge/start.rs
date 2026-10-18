@@ -15,19 +15,20 @@ use crate::media::{MediaContent, MediaServer, MediaServerHandle};
 use crate::net::advertise_host_for_peer;
 
 use super::fallback::is_transport_shaped_cast_error;
+use super::group::GroupEntry;
 use super::load::{LoadVolumePolicy, cast_load_media, spawn_rollover_reload_loop};
 use super::stall::spawn_stall_watchdog;
 use super::state::SessionTasks;
-use super::state::{DeviceState, EgressKind, PlayingSession, select_egress};
+use super::state::{CastRoute, DeviceSlot, DeviceState, EgressKind, PlayingSession, select_egress};
 use super::teardown::TeardownCastPolicy;
 use super::{Bridge, RingLookup};
 
 /// Frames of real PCM required before Cast LOAD: one FLAC block (~43 ms at 48 kHz).
 ///
-/// shairplay hands PCM over on the sender's anchor timeline (real-time paced, never in bursts),
-/// so the prebuffer only confirms that audio is flowing; any extra depth would become permanent
-/// latency. PCM produced while Cast LOADs feeds the first real chunks; the media server's
-/// silence preroll builds the Cast-side cushion and `LIVE_LEAD` maintains it.
+/// shairplay hands PCM over on the sender's anchor timeline, up to `CAST_READ_AHEAD` before
+/// presentation (a burst when an anchor arrives with audio queued, then real time), so the
+/// prebuffer only confirms that audio is flowing. Whatever the ring holds when Cast GETs the
+/// stream is burst to it, and the media server's pacing keeps Cast that far ahead.
 pub(super) const PREBUFFER_FRAMES: usize = FLAC_BLOCK_SIZE;
 
 /// Max prebuffer poll iterations (160 × 50 ms = 8 s). Real-time PCM reaches one block within
@@ -74,6 +75,32 @@ impl Drop for StartingGuard<'_> {
   }
 }
 
+/// Bump `slot`'s generation and install `Starting`; return the prior `Playing` session, if any.
+pub(super) fn accept_start_in(slot: &mut DeviceSlot, device_id: &str) -> (u64, Option<Box<PlayingSession>>) {
+  slot.generation = slot.generation.saturating_add(1);
+  let generation = slot.generation;
+  let previous = std::mem::replace(&mut slot.state, DeviceState::Starting { generation });
+  let prior = match previous {
+    DeviceState::Playing { generation: old_gen, session } => {
+      // Prior session tears down on a detached task; slot is already Starting{new}.
+      // Skip Cast STOP on that path so the new LOAD is not HOL-blocked.
+      tracing::debug!(%device_id, old_gen, new_gen = generation, "prior Playing moved to detached drain");
+      Some(session)
+    },
+    DeviceState::Starting { generation: old_gen } => {
+      tracing::debug!(%device_id, old_gen, new_gen = generation, "superseding in-flight Starting");
+      None
+    },
+    DeviceState::Following { generation: old_gen, follower } => {
+      tracing::debug!(%device_id, old_gen, new_gen = generation, "group follower starts its own session");
+      follower.pump.stop();
+      None
+    },
+    DeviceState::Idle => None,
+  };
+  (generation, prior)
+}
+
 /// Poll until [`PREBUFFER_FRAMES`] are available, or the ring is superseded.
 ///
 /// Returns `Ok(true)` when the prebuffer is ready, `Ok(false)` if the session restarted (stale
@@ -105,6 +132,7 @@ impl Bridge {
     device_id: &str,
     sample_rate: u32,
     ring: Arc<PcmRing>,
+    airplay_group: Option<String>,
     rings: Arc<dyn RingLookup>,
   ) -> Result<()> {
     let is_current = |expected: &Arc<PcmRing>| -> bool {
@@ -129,7 +157,29 @@ impl Bridge {
     // Do NOT await prior Cast STOP — new LOAD replaces the app session (SkipStopForReplace).
     // Every non-install exit after this point must clear Starting for this generation.
     // StartingGuard also clears on panic between accept and Playing install.
-    let (generation, prior) = self.accept_start(device_id);
+    // AirPlay multi-select: the first member to start owns the Cast session; the others
+    // join it through Cast multizone instead of loading their own stream.
+    let (generation, prior, group, media_key) = if let Some(uuid) = airplay_group {
+      match self.enter_group(device_id, &uuid, sample_rate, &ring) {
+        GroupEntry::Following { prior } => {
+          if let Some(old) = prior {
+            // The member's own Cast session ends; multizone adds the speaker to the group.
+            self.detach_teardown(*old, TeardownCastPolicy::StopBestEffort);
+          }
+          self.schedule_group_reconcile(&uuid);
+          return Ok(());
+        },
+        GroupEntry::Owner { generation, prior, media_key } => (generation, prior, Some(uuid), media_key),
+        GroupEntry::Standalone => {
+          let (generation, prior) = self.accept_start(device_id);
+          (generation, prior, None, None)
+        },
+      }
+    } else {
+      let (generation, prior) = self.accept_start(device_id);
+      (generation, prior, None, None)
+    };
+    let route = Arc::new(CastRoute::new(media_key.as_deref().unwrap_or(device_id), device_id));
     let mut starting_guard = StartingGuard::arm(self, device_id, generation);
 
     if let Some(old) = prior {
@@ -169,7 +219,9 @@ impl Bridge {
       return Ok(());
     }
 
-    let result = self.start_cast_session(device_id, generation, &device, ring, fmt).await;
+    let result = self
+      .start_cast_session(device_id, generation, &device, ring, fmt, route, group)
+      .await;
     // Disarm only when this generation is live Playing (install kept the session).
     // clear_starting_if is a no-op on Playing; keep explicit error clears + guard for panics.
     if result.is_ok()
@@ -188,24 +240,9 @@ impl Bridge {
   pub(super) fn accept_start(&self, device_id: &str) -> (u64, Option<Box<PlayingSession>>) {
     let mut devices = self.devices.lock();
     let slot = devices.entry(device_id.to_owned()).or_default();
-    slot.generation = slot.generation.saturating_add(1);
-    let generation = slot.generation;
-    let previous = std::mem::replace(&mut slot.state, DeviceState::Starting { generation });
-    let prior = match previous {
-      DeviceState::Playing { generation: old_gen, session } => {
-        // Prior session tears down on a detached task; slot is already Starting{new}.
-        // Skip Cast STOP on that path so the new LOAD is not HOL-blocked.
-        tracing::debug!(%device_id, old_gen, new_gen = generation, "prior Playing moved to detached drain");
-        Some(session)
-      },
-      DeviceState::Starting { generation: old_gen } => {
-        tracing::debug!(%device_id, old_gen, new_gen = generation, "superseding in-flight Starting");
-        None
-      },
-      DeviceState::Idle => None,
-    };
+    let accepted = accept_start_in(slot, device_id);
     drop(devices);
-    (generation, prior)
+    accepted
   }
 
   pub(super) fn clear_starting_if(&self, device_id: &str, generation: u64) {
@@ -226,6 +263,10 @@ impl Bridge {
       .is_some_and(|slot| matches!(slot.state, DeviceState::Starting { generation: g } if g == generation))
   }
 
+  #[expect(
+    clippy::too_many_arguments,
+    reason = "session start carries device identity, ring, format, Cast route, and group"
+  )]
   async fn start_cast_session(
     self: &Arc<Self>,
     device_id: &str,
@@ -233,6 +274,8 @@ impl Bridge {
     device: &crate::registry::Device,
     ring: Arc<PcmRing>,
     fmt: StreamFormat,
+    route: Arc<CastRoute>,
+    group: Option<String>,
   ) -> Result<()> {
     let host = advertise_host_for_peer(&device.host);
     let media = match MediaServer::start(&host).await {
@@ -251,6 +294,8 @@ impl Bridge {
       %device_id,
       generation,
       cast = %device.host,
+      cast_target = %route.media(),
+      group = ?group,
       %stream_url,
       ?egress,
       frames = ring.available_frames(),
@@ -259,7 +304,17 @@ impl Bridge {
 
     let session_ring = Arc::clone(&ring);
     let load_result = self
-      .initial_cast_load(device_id, generation, device, &media, &ring, fmt, &stream_url, &mut egress)
+      .initial_cast_load(
+        device_id,
+        generation,
+        device,
+        &route,
+        &media,
+        &ring,
+        fmt,
+        &stream_url,
+        &mut egress,
+      )
       .await;
 
     match load_result {
@@ -273,7 +328,7 @@ impl Bridge {
           );
           media.shutdown();
           let pool = Arc::clone(&self.cast_pool);
-          let id = device_id.to_owned();
+          let id = route.media();
           let _stop = tokio::task::spawn_blocking(move || {
             let _ok = pool.stop_best_effort(&id, Duration::from_secs(2));
           })
@@ -292,7 +347,18 @@ impl Bridge {
           "bridge session Cast load ok"
         );
         self
-          .install_playing_after_load(device_id, generation, device, media, session_ring, stream_url, fmt, egress)
+          .install_playing_after_load(
+            device_id,
+            generation,
+            device,
+            media,
+            session_ring,
+            stream_url,
+            fmt,
+            egress,
+            route,
+            group,
+          )
           .await;
         Ok(())
       },
@@ -315,6 +381,7 @@ impl Bridge {
     device_id: &str,
     generation: u64,
     device: &crate::registry::Device,
+    route: &Arc<CastRoute>,
     media: &MediaServerHandle,
     ring: &Arc<PcmRing>,
     fmt: StreamFormat,
@@ -331,7 +398,7 @@ impl Bridge {
         });
         let flac_result = self
           .blocking_load(
-            device_id,
+            route,
             MediaLoadRequest::flac(stream_url.to_owned(), CastStreamKind::Live).with_track(track.clone()),
           )
           .await?;
@@ -359,7 +426,7 @@ impl Bridge {
             });
             self
               .blocking_load(
-                device_id,
+                route,
                 MediaLoadRequest::wav(stream_url.to_owned(), CastStreamKind::Buffered).with_track(track),
               )
               .await?
@@ -374,7 +441,7 @@ impl Bridge {
         });
         self
           .blocking_load(
-            device_id,
+            route,
             MediaLoadRequest::wav(stream_url.to_owned(), CastStreamKind::Buffered).with_track(track),
           )
           .await?
@@ -384,13 +451,13 @@ impl Bridge {
 
   async fn blocking_load(
     &self,
-    device_id: &str,
+    route: &Arc<CastRoute>,
     request: MediaLoadRequest,
   ) -> Result<std::result::Result<crate::cast::MediaSessionRef, Error>> {
     let pool = Arc::clone(&self.cast_pool);
-    let load_device_id = device_id.to_owned();
+    let load_route = Arc::clone(route);
     tokio::task::spawn_blocking(move || {
-      cast_load_media(&pool, &load_device_id, request, LoadVolumePolicy::PreserveDevice)
+      cast_load_media(pool.as_ref(), &load_route, request, LoadVolumePolicy::PreserveDevice)
     })
     .await
     .map_err(|join_err| Error::Bridge(format!("Cast load task join: {join_err}")))
@@ -410,6 +477,8 @@ impl Bridge {
     stream_url: String,
     fmt: StreamFormat,
     egress: EgressKind,
+    route: Arc<CastRoute>,
+    group: Option<String>,
   ) {
     let cast_linear = self.sync_reported_volume_after_load(device_id).await;
     let session_alive = Arc::new(AtomicBool::new(true));
@@ -421,7 +490,7 @@ impl Bridge {
 
     let (rollover_cancel, rollover_task) = if egress == EgressKind::WavBuffered {
       let (cancel, task) = spawn_rollover_reload_loop(
-        device_id.to_owned(),
+        Arc::clone(&route),
         stream_url.clone(),
         Arc::clone(&track),
         Arc::clone(&self.cast_pool),
@@ -443,7 +512,10 @@ impl Bridge {
       media,
       device_id: device_id.to_owned(),
       pool: Arc::clone(&self.cast_pool),
+      route,
+      group: group.clone(),
       ring: session_ring,
+      source: None,
       stream_url,
       cast_name: device.name.clone(),
       channels: fmt.channels,
@@ -455,6 +527,7 @@ impl Bridge {
       flush_reload_requested: 0,
       flush_reload_done: 0,
       last_stall_reload_at: None,
+      stall_reload_owed: false,
       started_at: Instant::now(),
       flac_strike: None,
       pause_debounce_arm: 0,
@@ -490,6 +563,8 @@ impl Bridge {
     if let Some(orphaned) = orphan {
       tracing::info!(%device_id, generation, "start superseded before Playing install; tearing down");
       self.detach_teardown(orphaned, TeardownCastPolicy::StopBestEffort);
+    } else if let Some(uuid) = group {
+      self.group_owner_playing(&uuid, device_id);
     }
   }
 
@@ -528,6 +603,7 @@ mod tests {
   use crate::bridge::state::DeviceSlot;
   use crate::bridge::teardown::teardown_playing;
   use crate::bridge::test_support::{FixedRingLookup, insert_playing, test_playing_session};
+  use crate::cast::CastControl;
   use crate::cast::CastPool;
   use crate::registry::{Device, DeviceRegistry};
 
@@ -536,7 +612,7 @@ mod tests {
     let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
     let media = runtime.block_on(async { MediaServer::start("127.0.0.1").await.expect("media") });
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let ring1 = Arc::new(PcmRing::new(2, 64));
     insert_playing(&bridge, "dev", 1, test_playing_session(media, "dev", pool, Arc::clone(&ring1)));
 
@@ -563,7 +639,7 @@ mod tests {
 
     let start = Instant::now();
     bridge
-      .handle_session_start("dev-1", 48_000, event_ring, rings)
+      .handle_session_start("dev-1", 48_000, event_ring, None, rings)
       .await
       .expect("stale start skips cleanly");
     assert!(
@@ -580,7 +656,7 @@ mod tests {
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: None });
 
     bridge
-      .handle_session_start("dev-1", 48_000, event_ring, rings)
+      .handle_session_start("dev-1", 48_000, event_ring, None, rings)
       .await
       .expect("withdrawn receiver skips cleanly");
     assert!(!bridge.has_session("dev-1"));
@@ -592,7 +668,7 @@ mod tests {
     let ring = Arc::new(PcmRing::new(2, 64));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
     let err = bridge
-      .handle_session_start("missing-dev", 48_000, ring, rings)
+      .handle_session_start("missing-dev", 48_000, ring, None, rings)
       .await
       .expect_err("unknown device must fail");
     assert!(err.to_string().contains("unknown device"), "unexpected error: {err}");
@@ -619,7 +695,7 @@ mod tests {
     let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 2));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
     let err = bridge
-      .handle_session_start("dev-prebuf", 48_000, ring, rings)
+      .handle_session_start("dev-prebuf", 48_000, ring, None, rings)
       .await
       .expect_err("empty ring must prebuffer-timeout");
     let msg = err.to_string();

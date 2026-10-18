@@ -20,6 +20,35 @@ pub struct AudioFormat {
     pub sample_rate: u32,
 }
 
+/// AirPlay group identity the sender announced in its initial SETUP.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionGroup {
+    /// `groupUUID`: shared by every receiver the sender selected together (string as sent).
+    pub group_uuid: Option<String>,
+    /// `isMultiSelectAirPlay`: the sender plays to several receivers at once.
+    pub is_multi_select: bool,
+}
+
+impl SessionGroup {
+    /// Reads `groupUUID` (non-empty string) and `isMultiSelectAirPlay` (boolean) from an initial
+    /// SETUP plist. Missing keys, an empty UUID, or values of another type read as absent.
+    pub(crate) fn from_setup(dict: &plist::Dictionary) -> Self {
+        let group_uuid = dict
+            .get("groupUUID")
+            .and_then(plist::Value::as_string)
+            .filter(|uuid| !uuid.is_empty())
+            .map(str::to_owned);
+        let is_multi_select = dict
+            .get("isMultiSelectAirPlay")
+            .and_then(plist::Value::as_boolean)
+            .unwrap_or(false);
+        Self {
+            group_uuid,
+            is_multi_select,
+        }
+    }
+}
+
 /// Trait for receiving AirPlay events and creating audio sessions.
 ///
 /// `AudioHandler` is `Send + Sync` — all callbacks can be called from any thread
@@ -47,6 +76,11 @@ pub trait AudioHandler: Send + Sync + 'static {
     fn on_progress(&self, _start: u32, _current: u32, _end: u32) {}
 
     // --- Connection lifecycle ---
+
+    /// Called on each initial (not `isRemoteControlOnly`) SETUP with the sender's group identity,
+    /// before the stream SETUP and [`audio_init`](AudioHandler::audio_init) of that session. A
+    /// SETUP without the group keys reports [`SessionGroup::default`] (no group).
+    fn on_session_group(&self, _group: &SessionGroup) {}
 
     /// Called when a client connects.
     fn on_client_connected(&self, _addr: &str) {}
@@ -148,9 +182,66 @@ pub trait AudioSession: Send + Sync {
     ///
     /// Default is a no-op. Hosts that bridge to a sink should map this to pause/resume.
     fn on_rate(&mut self, _rate: u32) {}
-    /// AP2 buffered `FLUSHBUFFERED` / playout flush. Default is a no-op.
+    /// AP2 buffered `FLUSHBUFFERED` flush-all: playout stopped and every queued packet was
+    /// discarded, so audio already handed to the host predates the sender's next anchor.
+    /// A range flush keeps playing and only trims the queue, so it does not call this.
+    /// Default is a no-op.
     ///
     /// Distinct from [`audio_flush`](Self::audio_flush) so the buffered delivery
     /// thread can notify without sharing the legacy RTP session object.
     fn on_flush(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionGroup;
+
+    fn dict(entries: Vec<(&str, plist::Value)>) -> plist::Dictionary {
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect()
+    }
+
+    #[test]
+    fn session_group_reads_both_keys() {
+        let setup = dict(vec![
+            (
+                "groupUUID",
+                plist::Value::String("5A0C9F1E-1111-2222-3333-444455556666".into()),
+            ),
+            ("isMultiSelectAirPlay", plist::Value::Boolean(true)),
+        ]);
+        assert_eq!(
+            SessionGroup::from_setup(&setup),
+            SessionGroup {
+                group_uuid: Some("5A0C9F1E-1111-2222-3333-444455556666".into()),
+                is_multi_select: true,
+            }
+        );
+    }
+
+    #[test]
+    fn session_group_defaults_when_keys_absent() {
+        let setup = dict(vec![("timingProtocol", plist::Value::String("PTP".into()))]);
+        assert_eq!(SessionGroup::from_setup(&setup), SessionGroup::default());
+    }
+
+    #[test]
+    fn session_group_ignores_empty_uuid() {
+        let setup = dict(vec![
+            ("groupUUID", plist::Value::String(String::new())),
+            ("isMultiSelectAirPlay", plist::Value::Boolean(false)),
+        ]);
+        assert_eq!(SessionGroup::from_setup(&setup), SessionGroup::default());
+    }
+
+    #[test]
+    fn session_group_ignores_wrong_types() {
+        let setup = dict(vec![
+            ("groupUUID", plist::Value::Integer(42.into())),
+            ("isMultiSelectAirPlay", plist::Value::String("true".into())),
+        ]);
+        assert_eq!(SessionGroup::from_setup(&setup), SessionGroup::default());
+    }
 }

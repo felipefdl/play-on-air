@@ -81,7 +81,7 @@ iOS/macOS ──AirPlay 2──► PlayOnAir ──FLAC LIVE HTTP + Cast──�
 
 - **Ingress:** AirPlay 2 receiver (pairing, FairPlay, encrypted RTSP, buffered and realtime audio).
 - **Core:** generation-stamped session state, prebuffer, flush/skip re-LOAD, volume mapping.
-- **Egress:** local HTTP media URL (FLAC chunked LIVE by default; WAV/LPCM BUFFERED fallback) + Cast v2 control (play, pause, stop, volume). ~2 s cushion via silence preroll and maintained lead.
+- **Egress:** local HTTP media URL (FLAC chunked LIVE by default; WAV/LPCM BUFFERED fallback) + Cast v2 control (play, pause, stop, volume). 8 s Cast read-ahead: queued audio bursts on every (re)LOAD so Cast starts at once, and pacing holds that lead.
 - **Config (optional):** rename / hide only.
 
 ## Operator promise

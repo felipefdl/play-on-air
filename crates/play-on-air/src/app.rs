@@ -10,7 +10,7 @@ use tokio::time::sleep;
 
 use crate::airplay::{AirPlayManager, AirPlaySessionEvent, cast_linear_to_airplay_db};
 use crate::bridge::{Bridge, SHUTDOWN_TIMEOUT as BRIDGE_SHUTDOWN_TIMEOUT};
-use crate::cast::{CastPool, CastRemoteEvent};
+use crate::cast::{CastControl, CastPool, CastRemoteEvent};
 use crate::config::Config;
 use crate::discover::Discovery;
 use crate::error::Result;
@@ -82,8 +82,8 @@ impl App {
         .with_media_recovered(media_recovered_tx)
         .with_remote_events(cast_remote_tx),
     );
-    let bridge =
-      Arc::new(Bridge::new(Arc::clone(&registry), Arc::clone(&cast_pool)).with_airplay(Arc::clone(&airplay)));
+    let cast_control: Arc<dyn CastControl> = Arc::<CastPool>::clone(&cast_pool);
+    let bridge = Arc::new(Bridge::new(Arc::clone(&registry), cast_control).with_airplay(Arc::clone(&airplay)));
 
     let discovery = Discovery::new(Arc::clone(&registry));
     let discovery_handle = discovery.spawn(shutdown.clone());
@@ -100,15 +100,17 @@ impl App {
     let ownership_bridge = Arc::clone(&bridge);
     let ownership_airplay = Arc::clone(&airplay);
     let ownership_watch = tokio::spawn(async move {
-      while let Some(device_id) = ownership_rx.recv().await {
-        tracing::info!(%device_id, "Cast ownership lost; ending bridge and kicking AirPlay clients");
-        ownership_bridge.end_session(&device_id).await;
-        if let Err(err) = ownership_airplay.kick_clients(&device_id).await {
-          tracing::warn!(
-            %device_id,
-            error = %err,
-            "failed to re-advertise AirPlay after ownership-loss kick"
-          );
+      while let Some(cast_key) = ownership_rx.recv().await {
+        tracing::info!(%cast_key, "Cast ownership lost; ending bridge and kicking AirPlay clients");
+        // A multizone group session ends for every member speaker at once.
+        for device_id in ownership_bridge.end_cast_session(&cast_key).await {
+          if let Err(err) = ownership_airplay.kick_clients(&device_id).await {
+            tracing::warn!(
+              %device_id,
+              error = %err,
+              "failed to re-advertise AirPlay after ownership-loss kick"
+            );
+          }
         }
       }
     });

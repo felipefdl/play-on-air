@@ -21,7 +21,9 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
    `audio_init` outside the playout mutex (avoids Drop clearing the new ring). The session is
    created at the first released packet (decode runs on the delivery thread).
 7. `AudioSession::on_rate` / `on_flush` for AP2 buffered SETRATEANCHORTIME / FLUSHBUFFERED, queued
-   in order and delivered by the delivery thread, also while stopped.
+   in order and delivered by the delivery thread, also while stopped. `on_flush` fires for a
+   flush-all only (everything the host holds predates the next anchor); a range flush keeps
+   playing and does not notify the host.
 8. Buffered playout: `PlayoutHandle::stop` is a synchronous stop that wakes the delivery thread and
    the suspended reader, and the reader task's Drop guard calls it, so hard-stop before task abort
    never wedges delivery. RTSP handlers drive playout through the same handle synchronously (no
@@ -32,7 +34,9 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 11. **Buffered playout timing follows `docs/ap2-receiver-spec.md` section 1.** RTP timestamps are
     extended to 64 bits (queue keys, so order is wrap-safe). Sample `r` is presented at
     `H(anchor) + (r - anchorRtp) / rate`; a packet is released to the host at presentation minus
-    the advertised `Audio-Latency` (PlayOnAir's Cast cushion), never on arrival. Packets whose end is
+    the release lead (`RaopServerBuilder::release_lead`, default and minimum the advertised
+    `Audio-Latency`), never on arrival. PlayOnAir sets the lead to its Cast read-ahead (8 s) so
+    queued audio is in the host ring to burst when Cast (re)LOADs. Packets whose end is
     behind the playhead are pruned (anchor in the past joins mid-stream). Rate must be 0 or 1
     (else plist `status` -6705); rate 0 stops, keeps the buffer and clears the anchor; each anchor
     start fades in over 30 ms. Packets are queued compressed and decoded at release.
@@ -43,7 +47,8 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 14. Realtime type 96: RTP seq reorder window (drop dups, silence for aged gaps; ALAC in order only).
     Decode failure fills the same silence length as a Lost packet (keeps PCM clock length).
 15. RTSP `process_connection` read timeout (45s) so half-open iOS sockets release the connection semaphore; accept loop prunes finished `conn_aborts`.
-16. Configurable `Audio-Latency` RECORD header (`RaopServerBuilder::audio_latency_samples`, default 96000 = 2s@48k).
+16. Configurable `Audio-Latency` RECORD header (`RaopServerBuilder::audio_latency_samples`, default 96000 = 2s@48k)
+    and a separate buffered release lead (`RaopServerBuilder::release_lead`, item 11).
 17. Event channel: 1 MB ciphertext cap, disconnect on decrypt error, exit when command sender closes.
 18. **PTP follower** (`net::ptp`, spec section 3) replaces the drain-only sink: passive, per
     grandmaster clock identity, offset from two-step Sync/Follow_Up (or one-step Sync) through a
@@ -103,6 +108,12 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
     the disc number; `asdk` the stream flag). `POST /command` `updateMRNowPlayingInfo` is merged
     per connection (`mergePolicy`) and surfaced through `on_metadata` / `on_coverart`.
     `AudioHandler::on_progress` timestamps are at the stream sample rate.
+25. **AirPlay group identity.** The initial SETUP (not `isRemoteControlOnly`) reads `groupUUID`
+    (non-empty string) and `isMultiSelectAirPlay` (boolean, absent = false) into the public
+    `SessionGroup` and calls `AudioHandler::on_session_group` (default no-op) before the stream
+    SETUP and `audio_init` of that session. A SETUP without the keys reports
+    `SessionGroup::default()` (no group). PlayOnAir uses it to map AirPlay multi-room sessions onto
+    Google multizone groups.
 
 ### AirPlay 2 dependencies kept
 

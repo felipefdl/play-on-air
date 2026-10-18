@@ -31,6 +31,8 @@ pub(crate) struct RaopShared {
     pub(crate) output_max_channels: Option<u8>,
     /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
     pub(crate) audio_latency_samples: u32,
+    /// Buffered-audio release lead (`None` = `audio_latency_samples`).
+    pub(crate) release_lead: Option<std::time::Duration>,
     pub(crate) pin: Option<String>,
     #[cfg(feature = "video")]
     pub(crate) video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
@@ -334,6 +336,7 @@ pub(crate) fn test_shared(handler: Arc<dyn AudioHandler>) -> Arc<RaopShared> {
         output_sample_rate: None,
         output_max_channels: None,
         audio_latency_samples: crate::raop::server::DEFAULT_AUDIO_LATENCY_SAMPLES,
+        release_lead: None,
         pin: None,
         #[cfg(feature = "video")]
         video_handler: None,

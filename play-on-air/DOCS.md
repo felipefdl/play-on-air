@@ -90,6 +90,7 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Speaker still shows AirPlay after "Hey Google" | When Google Assistant or another Cast app takes the speaker, the Log shows `Cast ownership lost` and PlayOnAir disconnects the AirPlay client. iOS can take a moment to clear Now Playing. If that line never appears, restart the app. |
 | Silent after AirPlaying again (after another Cast app took the speaker) | Each new AirPlay stream starts a fresh Cast session. The Log shows `bridge session Cast load ok` when the speaker accepted it; if it is missing, check the Log for Cast errors around that time. |
 | iPhone volume shows 100% but Nest is quieter | PlayOnAir reports the Cast speaker's volume to AirPlay once it can reach the speaker. Disconnect and reconnect AirPlay on the phone to pick up the current value. |
+| Speakers selected together drift or one stays silent | The Log shows `updating Cast multizone group` and `Cast multizone PLAYBACK_SESSION_UPDATED` when a speaker joins. `Cast could not add the speaker to the group; it plays standalone` means Google refused that speaker; it then plays its own stream, not in sync. |
 | Nest silent while iPhone still Streaming | Cast pause follows real AirPlay pause/flush events; a stalled stream re-loads automatically. |
 | Nest Mini / Nest speakers cut out or sound wrong | Keep the host and speakers on a stable LAN (wired host or strong Wi-Fi). Use `info` log level for normal listening; `debug` and `trace` add load. |
 | Nothing after install | Confirm `host_network: true` is still set in the published app config; do not run PlayOnAir on a bridge-only network without multicast. |
@@ -107,6 +108,9 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Quality path | Decode AirPlay once; Cast hop is lossless (FLAC or WAV/LPCM). Never defaults to MP3/AAC for Cast egress |
 | Cast steal | If Google Assistant, YouTube, or another Cast app takes the speaker while PlayOnAir was bridging, the bridge ends and AirPlay clients are disconnected so the phone leaves Now Playing |
 | AirPlay supersede | If another phone AirPlays to the same speaker, the new stream wins; prior audio is aborted (iOS may take a moment to clear Now Playing) |
+| Several PlayOnAir speakers | Selected together in the AirPlay picker, they play in sync through Google Cast multizone: the first starts the stream and the others join it. Pause, skip, and seek act on the group; volume stays per speaker; deselecting any speaker (including the first) leaves the rest playing |
+| Mixed speakers | PlayOnAir speakers selected together with HomePods or other AirPlay speakers are not in sync with them: Cast cannot take Apple multi-room timing |
+| Speaker groups | Temporary Google speaker groups (created when a stream expands to more speakers) are not shown in AirPlay; speaker groups made in the Google Home app are |
 
 ## Store assets
 

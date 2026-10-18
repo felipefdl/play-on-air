@@ -2,4 +2,6 @@
 
 pub mod http;
 
-pub use http::{Artwork, MAX_ARTWORK_BYTES, MediaContent, MediaServer, MediaServerHandle, RolloverSignal};
+pub use http::{
+  Artwork, CAST_READ_AHEAD, MAX_ARTWORK_BYTES, MediaContent, MediaServer, MediaServerHandle, RolloverSignal,
+};

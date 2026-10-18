@@ -65,6 +65,8 @@ pub struct RaopServerBuilder {
     output_max_channels: Option<u8>,
     /// Samples advertised in the RTSP `Audio-Latency` header on RECORD.
     audio_latency_samples: u32,
+    /// Buffered-audio release lead (`None` = the advertised `Audio-Latency`).
+    release_lead: Option<std::time::Duration>,
     pin: Option<String>,
     /// Register `_raop` / `_airplay` mDNS services on start.
     advertise: bool,
@@ -95,6 +97,7 @@ impl RaopServerBuilder {
             output_sample_rate: None,
             output_max_channels: None,
             audio_latency_samples: DEFAULT_AUDIO_LATENCY_SAMPLES,
+            release_lead: None,
             pin: None,
             advertise: true,
             ptp_ports: (
@@ -167,6 +170,17 @@ impl RaopServerBuilder {
     /// `2 * sample_rate` when the host knows the stream rate at build time.
     pub fn audio_latency_samples(mut self, samples: u32) -> Self {
         self.audio_latency_samples = samples;
+        self
+    }
+
+    /// How long before its presentation time each buffered (type 103) sample is handed to the
+    /// host.
+    ///
+    /// Default: the advertised `Audio-Latency`. A host whose output buffers ahead of real time
+    /// (PlayOnAir's Cast speakers) sets a longer lead so audio queued by the sender reaches it
+    /// early enough to be burst on a fresh start. The sender still sees `Audio-Latency`.
+    pub fn release_lead(mut self, lead: std::time::Duration) -> Self {
+        self.release_lead = Some(lead);
         self
     }
 
@@ -258,6 +272,7 @@ impl RaopServerBuilder {
             output_sample_rate: self.output_sample_rate,
             output_max_channels: self.output_max_channels,
             audio_latency_samples: self.audio_latency_samples,
+            release_lead: self.release_lead,
             pin: self.pin,
             #[cfg(feature = "video")]
             video_handler: self.video_handler,

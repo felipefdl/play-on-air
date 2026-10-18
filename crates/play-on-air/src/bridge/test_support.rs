@@ -8,23 +8,26 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use crate::audio::PcmRing;
-use crate::bridge::state::{DeviceState, EgressKind, PlayingSession, SessionTasks};
+use crate::bridge::state::{CastRoute, DeviceState, EgressKind, PlayingSession, SessionTasks};
 use crate::bridge::{Bridge, RingLookup};
-use crate::cast::CastPool;
+use crate::cast::CastControl;
 use crate::media::MediaServerHandle;
 
 /// Minimal playing session for teardown / pause tests (no live Cast worker).
 pub(super) fn test_playing_session(
   media: MediaServerHandle,
   device_id: &str,
-  pool: Arc<CastPool>,
+  pool: Arc<dyn CastControl>,
   ring: Arc<PcmRing>,
 ) -> PlayingSession {
   PlayingSession {
     media,
     device_id: device_id.to_owned(),
     pool,
+    route: Arc::new(CastRoute::new(device_id, device_id)),
+    group: None,
     ring,
+    source: None,
     stream_url: "http://127.0.0.1:9/stream".to_owned(),
     cast_name: "test".to_owned(),
     channels: 2,
@@ -36,6 +39,7 @@ pub(super) fn test_playing_session(
     flush_reload_requested: 0,
     flush_reload_done: 0,
     last_stall_reload_at: None,
+    stall_reload_owed: false,
     started_at: Instant::now(),
     flac_strike: None,
     pause_debounce_arm: 0,
@@ -108,5 +112,184 @@ pub(super) struct MapRingLookup {
 impl RingLookup for MapRingLookup {
   fn ring_for(&self, device_id: &str) -> Option<Arc<PcmRing>> {
     self.rings.get(device_id).map(Arc::clone)
+  }
+}
+
+/// A Cast command the bridge issued to [`FakeCast`].
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum CastCall {
+  Load(String),
+  SetVolume(String),
+  GetVolume(String),
+  Pause(String),
+  Play(String),
+  Stop(String),
+  SessionEnded(String),
+  Metadata(String),
+  SetPlaybackDevices { key: String, members: Vec<String> },
+  OpenHost { key: String, host: String, port: u16 },
+  Move { from: String, to: String },
+  CloseHost(String),
+}
+
+/// One-shot callback run inside the next [`FakeCast`] LOAD (simulates an event racing it).
+pub(super) struct LoadHook(Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for LoadHook {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("LoadHook")
+  }
+}
+
+/// Recording [`CastControl`] with scripted multizone answers (no network).
+#[derive(Debug, Default)]
+pub(super) struct FakeCast {
+  calls: Mutex<Vec<CastCall>>,
+  /// Answers to `SET_PLAYBACK_DEVICES`, in order; an empty queue answers success, no move.
+  answers: Mutex<std::collections::VecDeque<crate::error::Result<crate::cast::PlaybackSessionUpdate>>>,
+  /// Run (once) while the next LOAD is on the wire.
+  load_hook: Mutex<Option<LoadHook>>,
+}
+
+impl FakeCast {
+  pub(super) fn answer(&self, answer: crate::error::Result<crate::cast::PlaybackSessionUpdate>) {
+    self.answers.lock().push_back(answer);
+  }
+
+  /// Run `hook` during the next LOAD, before it returns.
+  pub(super) fn on_next_load(&self, hook: impl FnOnce() + Send + 'static) {
+    *self.load_hook.lock() = Some(LoadHook(Box::new(hook)));
+  }
+
+  pub(super) fn calls(&self) -> Vec<CastCall> {
+    self.calls.lock().clone()
+  }
+
+  fn record(&self, call: CastCall) {
+    self.calls.lock().push(call);
+  }
+}
+
+impl CastControl for FakeCast {
+  fn load(
+    &self,
+    key: &str,
+    _request: crate::cast::MediaLoadRequest,
+  ) -> crate::error::Result<crate::cast::MediaSessionRef> {
+    self.record(CastCall::Load(key.to_owned()));
+    let pending = self.load_hook.lock().take();
+    if let Some(LoadHook(hook)) = pending {
+      hook();
+    }
+    Ok(crate::cast::MediaSessionRef {
+      transport_id: format!("transport-{key}"),
+      session_id: format!("session-{key}"),
+      media_session_id: 1,
+      queue_item_id: Some(1),
+    })
+  }
+
+  fn set_volume(&self, key: &str, _level: f32) -> crate::error::Result<()> {
+    self.record(CastCall::SetVolume(key.to_owned()));
+    Ok(())
+  }
+
+  fn get_volume(&self, key: &str) -> crate::error::Result<f32> {
+    self.record(CastCall::GetVolume(key.to_owned()));
+    Ok(0.5)
+  }
+
+  fn pause(&self, key: &str) -> crate::error::Result<()> {
+    self.record(CastCall::Pause(key.to_owned()));
+    Ok(())
+  }
+
+  fn play(&self, key: &str) -> crate::error::Result<()> {
+    self.record(CastCall::Play(key.to_owned()));
+    Ok(())
+  }
+
+  fn stop_best_effort(&self, key: &str, _timeout: std::time::Duration) -> bool {
+    self.record(CastCall::Stop(key.to_owned()));
+    true
+  }
+
+  fn session_ended(&self, key: &str) {
+    self.record(CastCall::SessionEnded(key.to_owned()));
+  }
+
+  fn update_metadata(&self, key: &str, _track: crate::cast::CastTrack) {
+    self.record(CastCall::Metadata(key.to_owned()));
+  }
+
+  fn set_playback_devices(
+    &self,
+    key: &str,
+    request: crate::cast::SetPlaybackDevices,
+  ) -> crate::error::Result<crate::cast::PlaybackSessionUpdate> {
+    self.record(CastCall::SetPlaybackDevices {
+      key: key.to_owned(),
+      members: request.devices.into_iter().map(|device| device.device_id).collect(),
+    });
+    self
+      .answers
+      .lock()
+      .pop_front()
+      .unwrap_or_else(|| Ok(crate::cast::PlaybackSessionUpdate::default()))
+  }
+
+  fn open_session_host(&self, key: &str, host: &str, port: u16) {
+    self.record(CastCall::OpenHost {
+      key: key.to_owned(),
+      host: host.to_owned(),
+      port,
+    });
+  }
+
+  fn move_session(&self, from: &str, to: &str) -> crate::error::Result<()> {
+    self.record(CastCall::Move { from: from.to_owned(), to: to.to_owned() });
+    Ok(())
+  }
+
+  fn close_session_host(&self, key: &str) {
+    self.record(CastCall::CloseHost(key.to_owned()));
+  }
+}
+
+/// Ring lookup whose entries tests replace (a receiver's new stream, or its end).
+#[derive(Default)]
+pub(super) struct SwapRingLookup {
+  pub(super) rings: Mutex<HashMap<String, Arc<PcmRing>>>,
+}
+
+impl SwapRingLookup {
+  pub(super) fn set(&self, device_id: &str, current: Option<Arc<PcmRing>>) {
+    let mut rings = self.rings.lock();
+    match current {
+      Some(ring) => drop(rings.insert(device_id.to_owned(), ring)),
+      None => drop(rings.remove(device_id)),
+    }
+  }
+}
+
+impl RingLookup for SwapRingLookup {
+  fn ring_for(&self, device_id: &str) -> Option<Arc<PcmRing>> {
+    self.rings.lock().get(device_id).map(Arc::clone)
+  }
+}
+
+/// Registry speaker on loopback.
+pub(super) fn test_device(id: &str, name: &str) -> crate::registry::Device {
+  crate::registry::Device {
+    id: id.to_owned(),
+    name: name.to_owned(),
+    model: String::new(),
+    host: "127.0.0.1".to_owned(),
+    hostname: format!("{id}.local"),
+    port: 8009,
+    last_seen: Instant::now(),
+    instance: id.to_owned(),
+    pending_leave_deadline: None,
+    pending_leave_since: None,
   }
 }

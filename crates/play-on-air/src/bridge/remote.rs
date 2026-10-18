@@ -49,7 +49,7 @@ impl Bridge {
   ///
   /// Not playing yet: the next LOAD reads the receiver's now-playing state instead.
   pub(super) fn handle_now_playing(&self, device_id: &str, now_playing: &NowPlaying) {
-    let track = {
+    let (track, media_key) = {
       let devices = self.devices.lock();
       let Some(DeviceState::Playing { session, .. }) = devices.get(device_id).map(|slot| &slot.state) else {
         return;
@@ -57,15 +57,27 @@ impl Bridge {
       session.media.set_artwork(now_playing.artwork.clone());
       let track = cast_track(now_playing, &session.media, &session.cast_name);
       session.track.lock().clone_from(&track);
+      let media_key = session.route.media();
       drop(devices);
-      track
+      (track, media_key)
     };
-    self.cast_pool.update_metadata(device_id, track);
+    self.cast_pool.update_metadata(&media_key, track);
   }
 
   /// A Cast-side change we did not command: forward it to the AirPlay sender.
   pub fn on_cast_remote(&self, event: &CastRemoteEvent) {
-    let device_id = event.device_id.as_str();
+    // A multizone session host reports the group: its play / pause belong to the group owner,
+    // and its volume is the group master level, not one speaker's (each member's own
+    // worker reports that speaker's volume).
+    let (owner, from_session_host) = match self.owner_for_cast_key(&event.device_id) {
+      Some(owner) if owner != event.device_id => (owner, true),
+      Some(_) | None => (event.device_id.clone(), false),
+    };
+    let device_id = owner.as_str();
+    if from_session_host && matches!(event.kind, CastRemoteKind::Volume { .. }) {
+      tracing::debug!(key = %event.device_id, "ignoring Cast group master volume change");
+      return;
+    }
     match event.kind {
       CastRemoteKind::Paused => {
         if self.pause_locally_for_cast(device_id) {
@@ -140,6 +152,7 @@ impl Bridge {
 
 #[cfg(test)]
 mod tests {
+  use crate::cast::CastControl;
   use std::sync::Arc;
 
   use bytes::Bytes;
@@ -158,7 +171,7 @@ mod tests {
   /// Device pause: local pause first, and the sender's rate-0 echo then arms no Cast PAUSE.
   #[tokio::test]
   async fn cast_pause_pauses_locally_and_absorbs_sender_echo() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     insert_playing(
@@ -193,7 +206,7 @@ mod tests {
 
   #[tokio::test]
   async fn cast_volume_updates_rollover_volume_unless_muted() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let session = test_playing_session(media, "dev-vol-rc", pool, Arc::new(PcmRing::new(2, 64)));
@@ -210,7 +223,7 @@ mod tests {
   /// Now-playing updates the session track (used by re-LOADs) and serves the artwork.
   #[tokio::test]
   async fn now_playing_updates_session_track_and_artwork() {
-    let pool = Arc::new(CastPool::new(None));
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
     let base_url = media.base_url.clone();

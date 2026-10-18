@@ -87,5 +87,5 @@ pub use raop::hls::{HlsHandler, HlsSession};
 pub use raop::video::{PacketKind, VideoHandler, VideoPacket, VideoSession};
 pub use raop::{
     AudioCodec, AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, MemoryPairingStore, PairingStore,
-    RaopServer, RaopServerBuilder, TrackMetadata,
+    RaopServer, RaopServerBuilder, SessionGroup, TrackMetadata,
 };

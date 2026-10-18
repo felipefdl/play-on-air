@@ -4,9 +4,14 @@
 //! `rust_cast` channels via [`CastPool`] (warm per-device worker threads) over a TLS
 //! client that accepts self-signed and X.509 v1 device certificates (`tls`).
 
+mod multizone;
 mod pool;
 mod tls;
 
+pub use multizone::{
+  MULTIZONE_NAMESPACE, PlaybackDevice, PlaybackSessionUpdate, SessionEndpoint, SetPlaybackDevices, normalize_device_id,
+  parse_set_playback_devices_reply,
+};
 pub use pool::{CastPool, CastRemoteEvent, CastRemoteKind};
 
 use rust_cast::channels::media::{Image, Media, Metadata, MusicTrackMediaMetadata, Status, StreamType};
@@ -193,36 +198,63 @@ impl MediaLoadRequest {
 pub struct MediaSessionRef {
   /// Cast app transport id.
   pub transport_id: String,
+  /// Receiver app session id (the `sessionId` multizone requests name).
+  pub session_id: String,
   /// Media session id returned by LOAD/STATUS.
   pub media_session_id: i32,
   /// Queue item id of the loaded media (target of metadata `QUEUE_UPDATE`), if reported.
   pub queue_item_id: Option<i32>,
 }
 
-impl MediaSessionRef {
-  /// Construct a session reference used by pure transport helpers.
-  pub fn new(transport_id: impl Into<String>, media_session_id: i32) -> Self {
-    Self {
-      transport_id: transport_id.into(),
-      media_session_id,
-      queue_item_id: None,
-    }
-  }
-}
-
 /// Active Cast media session after a successful LOAD.
 pub type ActiveCastSession = MediaSessionRef;
 
 /// Extract the media session (and its current queue item) from a LOAD/STATUS response.
-pub fn media_session_from_status(transport_id: impl Into<String>, status: &Status) -> Result<MediaSessionRef> {
+pub fn media_session_from_status(
+  transport_id: impl Into<String>,
+  session_id: impl Into<String>,
+  status: &Status,
+) -> Result<MediaSessionRef> {
   if let Some(entry) = status.entries.first() {
     return Ok(MediaSessionRef {
       transport_id: transport_id.into(),
+      session_id: session_id.into(),
       media_session_id: entry.media_session_id,
       queue_item_id: entry.current_item_id.map(i32::from),
     });
   }
   Err(Error::Cast("LOAD status had no media session entries".to_owned()))
+}
+
+/// Cast control the bridge drives, keyed by pool worker: a speaker's registry id, or a
+/// session host key opened with [`CastControl::open_session_host`].
+///
+/// Implemented by [`CastPool`]; every call blocks (bounded) and must run off the async runtime.
+pub trait CastControl: Send + Sync + std::fmt::Debug {
+  /// LOAD media (launching or joining the Default Media Receiver).
+  fn load(&self, key: &str, request: MediaLoadRequest) -> Result<ActiveCastSession>;
+  /// Set receiver volume (`0.0..=1.0`).
+  fn set_volume(&self, key: &str, level: f32) -> Result<()>;
+  /// Read receiver volume (`0.0..=1.0`; muted is `0.0`).
+  fn get_volume(&self, key: &str) -> Result<f32>;
+  /// Pause the active media session.
+  fn pause(&self, key: &str) -> Result<()>;
+  /// Resume the active media session.
+  fn play(&self, key: &str) -> Result<()>;
+  /// Media STOP with a wall-clock bound; `true` when acknowledged.
+  fn stop_best_effort(&self, key: &str, timeout: std::time::Duration) -> bool;
+  /// Bridge-initiated end: stand ownership probes down without a Cast STOP.
+  fn session_ended(&self, key: &str);
+  /// Replace the live media's now-playing metadata (fire-and-forget).
+  fn update_metadata(&self, key: &str, track: CastTrack);
+  /// Send `SET_PLAYBACK_DEVICES` for the active session hosted on `key` and await the answer.
+  fn set_playback_devices(&self, key: &str, request: SetPlaybackDevices) -> Result<PlaybackSessionUpdate>;
+  /// Open (or retarget) a control connection to a session host that is not a registry speaker.
+  fn open_session_host(&self, key: &str, host: &str, port: u16);
+  /// Hand the active media session from worker `from` to worker `to` without a Cast STOP.
+  fn move_session(&self, from: &str, to: &str) -> Result<()>;
+  /// Close a connection opened with [`CastControl::open_session_host`].
+  fn close_session_host(&self, key: &str);
 }
 
 #[cfg(test)]
@@ -325,7 +357,8 @@ mod tests {
         supported_media_commands: 0,
       }],
     };
-    let session = media_session_from_status("t-1", &status).unwrap();
+    let session = media_session_from_status("t-1", "s-1", &status).unwrap();
+    assert_eq!(session.session_id, "s-1");
     assert_eq!(session.transport_id, "t-1");
     assert_eq!(session.media_session_id, 42);
     assert_eq!(session.queue_item_id, Some(3));
@@ -334,6 +367,6 @@ mod tests {
   #[test]
   fn media_session_from_empty_status_errors() {
     let status = Status { request_id: 1, entries: vec![] };
-    drop(media_session_from_status("t", &status).unwrap_err());
+    drop(media_session_from_status("t", "s", &status).unwrap_err());
   }
 }
