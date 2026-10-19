@@ -110,6 +110,10 @@ pub(super) struct PlayingSession {
   /// entry points (flush spawn, resume spawn, stall, rollover) so a second caller cannot
   /// overwrite a `JoinHandle` without aborting it (detached LOAD).
   pub(super) reload_flight: Arc<tokio::sync::Mutex<()>>,
+  /// Present when this session times Cast playback to the AirPlay timeline.
+  ///
+  /// Absent for an uncalibrated model, a Google Cast group, and the WAV fallback.
+  pub(super) sync: Option<Arc<super::sync::SyncSession>>,
 }
 
 /// Per-device generation-stamped session state.

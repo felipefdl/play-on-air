@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use tokio::time::sleep;
 
 use crate::airplay::cast_linear_to_airplay_db;
+use crate::audio::sync::{SyncTimeline, resolve_sync};
 use crate::audio::{FLAC_BLOCK_SIZE, PcmRing};
 use crate::cast::{CastStreamKind, MediaLoadRequest};
 use crate::error::{Error, Result};
@@ -20,6 +21,7 @@ use super::load::{LoadVolumePolicy, cast_load_media, spawn_rollover_reload_loop}
 use super::stall::spawn_stall_watchdog;
 use super::state::SessionTasks;
 use super::state::{CastRoute, DeviceSlot, DeviceState, EgressKind, PlayingSession, select_egress};
+use super::sync::{SyncAttach, SyncSession, run_sync};
 use super::teardown::TeardownCastPolicy;
 use super::{Bridge, RingLookup};
 
@@ -303,6 +305,7 @@ impl Bridge {
     );
 
     let session_ring = Arc::clone(&ring);
+    let mut sync_attach = None;
     let load_result = self
       .initial_cast_load(
         device_id,
@@ -314,6 +317,7 @@ impl Bridge {
         fmt,
         &stream_url,
         &mut egress,
+        &mut sync_attach,
       )
       .await;
 
@@ -358,6 +362,7 @@ impl Bridge {
             egress,
             route,
             group,
+            sync_attach,
           )
           .await;
         Ok(())
@@ -387,6 +392,7 @@ impl Bridge {
     fmt: StreamFormat,
     stream_url: &str,
     egress: &mut EgressKind,
+    sync_out: &mut Option<SyncAttach>,
   ) -> Result<crate::cast::MediaSessionRef> {
     let track = self.load_track(device_id, media, &device.name);
     match *egress {
@@ -396,15 +402,29 @@ impl Bridge {
           channels: fmt.channels,
           sample_rate: fmt.sample_rate,
         });
-        let flac_result = self
-          .blocking_load(
-            route,
-            MediaLoadRequest::flac(stream_url.to_owned(), CastStreamKind::Live).with_track(track.clone()),
-          )
-          .await?;
+        // Cast speaker groups (multizone) keep the normal path; an AirPlay multi-select with one
+        // Cast speaker in it is exactly the mixed-vendor case sync targets.
+        let syncing = resolve_sync(&device.model);
+        let attached = syncing.as_ref().map(|params| {
+          let created = Arc::new(SyncTimeline::new(fmt.sample_rate, device_id, &params.model));
+          ring.attach_timeline(Arc::clone(&created));
+          created.prepare_for_load();
+          created
+        });
+        let mut request = MediaLoadRequest::flac(stream_url.to_owned(), CastStreamKind::Live).with_track(track.clone());
+        if attached.is_some() {
+          request = request.with_autoplay(false);
+        }
+        let flac_result = self.blocking_load(route, request).await?;
         match flac_result {
-          Ok(session) => Ok(session),
+          Ok(session) => {
+            if let (Some(created), Some(params)) = (attached, syncing) {
+              *sync_out = Some(SyncAttach { timeline: created, params });
+            }
+            Ok(session)
+          },
           Err(flac_err) => {
+            ring.detach_timeline();
             // Always WAV for this session. Process-lifetime memory only on decisive rejection
             // (not timeout / disconnect / no worker) so transport blips do not poison FLAC forever.
             let remember = !is_transport_shaped_cast_error(&flac_err);
@@ -479,6 +499,7 @@ impl Bridge {
     egress: EgressKind,
     route: Arc<CastRoute>,
     group: Option<String>,
+    sync_attach: Option<SyncAttach>,
   ) {
     let cast_linear = self.sync_reported_volume_after_load(device_id).await;
     let session_alive = Arc::new(AtomicBool::new(true));
@@ -487,6 +508,20 @@ impl Bridge {
     let track = Arc::new(Mutex::new(self.load_track(device_id, &media, &device.name)));
     let inflight_load = Arc::new(Mutex::new(None));
     let reload_flight = Arc::new(tokio::sync::Mutex::new(()));
+    let playback_paused = Arc::new(AtomicBool::new(false));
+    let transport_flight = Arc::new(tokio::sync::Mutex::new(()));
+    let sync_session = sync_attach.map(|attach| {
+      Arc::new(SyncSession::from_attach(
+        attach,
+        device_id,
+        fmt.sample_rate,
+        Arc::clone(&self.cast_pool),
+        Arc::clone(&route),
+        Arc::clone(&session_alive),
+        Arc::clone(&playback_paused),
+        Arc::clone(&transport_flight),
+      ))
+    });
 
     let (rollover_cancel, rollover_task) = if egress == EgressKind::WavBuffered {
       let (cancel, task) = spawn_rollover_reload_loop(
@@ -508,7 +543,7 @@ impl Bridge {
 
     let (watchdog_cancel, watchdog_task) = spawn_stall_watchdog(Arc::clone(self), device_id.to_owned(), generation);
 
-    let playing = PlayingSession {
+    let mut playing = PlayingSession {
       media,
       device_id: device_id.to_owned(),
       pool: Arc::clone(&self.cast_pool),
@@ -522,7 +557,7 @@ impl Bridge {
       sample_rate: fmt.sample_rate,
       egress,
       paused: false,
-      playback_paused: Arc::new(AtomicBool::new(false)),
+      playback_paused,
       paused_at: None,
       flush_reload_requested: 0,
       flush_reload_done: 0,
@@ -530,7 +565,7 @@ impl Bridge {
       stall_reload_owed: false,
       started_at: Instant::now(),
       flac_strike: None,
-      transport_flight: Arc::new(tokio::sync::Mutex::new(())),
+      transport_flight,
       tasks: SessionTasks::default(),
       rollover_cancel,
       rollover_task,
@@ -542,7 +577,12 @@ impl Bridge {
       track,
       inflight_load,
       reload_flight,
+      sync: sync_session,
     };
+
+    if let Some(session) = playing.sync.as_ref().map(Arc::clone) {
+      let _task = playing.tasks.spawn(device_id, run_sync(session));
+    }
 
     let orphan = {
       let mut devices = self.devices.lock();

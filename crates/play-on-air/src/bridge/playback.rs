@@ -107,6 +107,16 @@ enum OwedReload {
   Stall,
 }
 
+/// A synced session that has not sent its timed PLAY yet owns that PLAY. A resume in the
+/// start lead must not start Cast early.
+const fn hold_play_for_timed_start(decision: ResumeDecision, timed_play_pending: bool) -> ResumeDecision {
+  if timed_play_pending && matches!(decision, ResumeDecision::Play) {
+    ResumeDecision::None
+  } else {
+    decision
+  }
+}
+
 const fn resume_decision(paused: bool, long_pause: bool, owed: OwedReload) -> ResumeDecision {
   // An owed re-LOAD outranks PLAY. Flush: the ring was cleared, so only a fresh LOAD drops the
   // old track Cast still buffers (PLAY would resume that tail). Stall: Cast's media stopped
@@ -355,7 +365,10 @@ impl Bridge {
     } else {
       OwedReload::None
     };
-    let decision = resume_decision(session.paused, long_pause, owed);
+    let timed_play_pending = session.sync.as_ref().is_some_and(|sync| !sync.play_sent());
+    let raw = resume_decision(session.paused, long_pause, owed);
+    let decision = hold_play_for_timed_start(raw, timed_play_pending);
+    let awaiting_timed_play = timed_play_pending && matches!(raw, ResumeDecision::Play);
     session.paused = false;
     session.playback_paused.store(false, Ordering::Release);
     session.paused_at = None;
@@ -383,6 +396,9 @@ impl Bridge {
       ResumeDecision::None => ResumeAction::None,
     };
     drop(devices);
+    if awaiting_timed_play {
+      tracing::info!(%device_id, generation, "AirPlay resumed; Cast PLAY waits for the timed start");
+    }
     Some(action)
   }
 
@@ -642,6 +658,17 @@ mod tests {
     // An owed stall re-LOAD outranks PLAY too.
     assert_eq!(resume_decision(true, false, OwedReload::Stall), ResumeDecision::ReloadStall);
     assert_eq!(resume_decision(false, false, OwedReload::Stall), ResumeDecision::ReloadStall);
+    assert_eq!(
+      hold_play_for_timed_start(ResumeDecision::Play, true),
+      ResumeDecision::None,
+      "a resume during the start lead must not PLAY early"
+    );
+    assert_eq!(hold_play_for_timed_start(ResumeDecision::Play, false), ResumeDecision::Play);
+    assert_eq!(
+      hold_play_for_timed_start(ResumeDecision::ReloadFlush, true),
+      ResumeDecision::ReloadFlush,
+      "a flush still re-LOADs while the timed start is pending"
+    );
   }
 
   /// A resume clears every piece of local pause state, so the stall watchdog and re-LOAD gates

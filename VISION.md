@@ -2,7 +2,7 @@
 
 ## What it is
 
-PlayOnAir is a small local network bridge: Chromecast devices on the LAN appear as **AirPlay 2** speakers. You run one binary on a machine that can reach those devices. iPhone, iPad, and Mac send AirPlay 2 audio to PlayOnAir; PlayOnAir re-streams that audio to the matching Chromecast at the highest fidelity the wire allows.
+PlayOnAir is a small local network bridge: Chromecast devices on the LAN appear as **AirPlay 2** speakers. You run one binary on a machine that can reach those devices. iPhone, iPad, and Mac send AirPlay 2 audio to PlayOnAir; PlayOnAir re-streams that audio to the matching Chromecast at the highest fidelity the wire allows. Nest Audio and Google Nest Mini play in step with HomePods and other AirPlay 2 speakers selected in the same group. Other Cast models in that group play without that alignment.
 
 It is personal open source (MIT), maintained by Felipe Lima. It is not a TagoIO product and has no cloud account, dashboard, or telemetry.
 
@@ -32,7 +32,7 @@ Apple devices speak AirPlay. Many homes already have Google Cast speakers and TV
 | Video / screen mirroring / A/V lip sync | Hard protocol mismatch (timed RTP push vs Cast HTTP pull); audio product |
 | Cloud, accounts, remote control from the internet | LAN process only |
 | Required configuration, wizards, or XML | Defaults must just work |
-| Multi-room clock sync across mixed vendors | Cast sink cannot take Apple PTP timing; no fake multi-room promises |
+| Apple-timeline alignment for uncalibrated Cast models and Google multizone groups | Each model needs its PLAY delay and `currentTime` offset measured against an Apple receiver; Google's group timing is not exposed. Do not promise alignment that was not measured. |
 | Hi-res (24/96+) end-to-end | AirPlay speaker casting caps the source; do not advertise what the wire cannot deliver |
 | Enterprise MDM / multi-tenant / compliance packaging | Single-user / household LAN tool |
 

@@ -194,6 +194,8 @@ struct RingSession {
   state: Arc<DeviceAudioState>,
   ring: Arc<PcmRing>,
   cast_paused: Arc<AtomicBool>,
+  /// Presentation instant for the next [`AudioSession::audio_process`] chunk.
+  pending_due: Option<Instant>,
 }
 
 impl RingSession {
@@ -202,6 +204,7 @@ impl RingSession {
       state,
       ring,
       cast_paused: Arc::new(AtomicBool::new(false)),
+      pending_due: None,
     }
   }
 
@@ -231,9 +234,19 @@ impl RingSession {
 }
 
 impl AudioSession for RingSession {
+  fn audio_due(&mut self, due: Instant) {
+    if self.ring.tracks_due() {
+      self.pending_due = Some(due);
+    }
+  }
+
   fn audio_process(&mut self, samples: &[f32]) {
     self.note_pcm();
-    self.ring.push_f32(samples);
+    if let Some(due) = self.pending_due.take() {
+      self.ring.push_f32_at(samples, due);
+    } else {
+      self.ring.push_f32(samples);
+    }
   }
 
   fn audio_flush(&mut self) {
@@ -318,6 +331,9 @@ impl AudioHandler for RingHandler {
     let channels = u16::from(format.channels.clamp(1, OUTPUT_MAX_CHANNELS));
     let capacity_frames = session_ring_frames(sample_rate);
     let ring = Arc::new(PcmRing::new(channels, capacity_frames));
+    // Presentation times start with the first sample. Sync reads them only for a calibrated
+    // model; other sessions never attach a timeline.
+    ring.enable_due_tracking(sample_rate);
     // shairplay aborts any prior audio session before this callback (exclusive
     // active audio). We always replace the ring; the stack drops the old session.
     self.state.replace_ring(Arc::clone(&ring));

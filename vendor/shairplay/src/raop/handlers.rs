@@ -41,7 +41,7 @@ pub(crate) struct RaopConnection {
     pub(crate) is_ap2: bool,
     /// Control handle of this connection's buffered (type 103) stream.
     pub(crate) playout: Option<crate::raop::buffered_audio::PlayoutHandle>,
-    /// PTP timing protocol and peer set from SETUP / SETPEERS / SETPEERSX.
+    /// PTP timing protocol from SETUP.
     pub(crate) timing: crate::net::ptp::SessionTiming,
     /// Sender client version from `User-Agent` (gates `dvlc` volume reports).
     pub(crate) sender_version: Option<crate::raop::remote::SenderVersion>,
