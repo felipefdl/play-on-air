@@ -20,11 +20,11 @@
 //! in master election (spec section 3) and does not answer `Delay_Req`.
 //!
 //! Lock: a timeline is locked once [`LOCK_MIN_SAMPLES`] samples are in the filter and the newest
-//! is younger than [`LOCK_STALE_NS`]. Timelines are identified by the clock identity the sender
-//! names in each anchor, not by the address PTP arrives from: a Mac grandmaster sends from a
-//! temporary IPv6 address an iPhone sender does not list in `timingPeerList`. A fresh timeline
-//! with fewer samples is *locking* (it locks within about half a second at 8 Hz Sync): an anchor
-//! on it is deferred until lock rather than falling back at once.
+//! is younger than [`LOCK_STALE_NS`]. Only timelines whose last sender address is in the
+//! session's peer set (SETUP `timingPeerInfo`, SETPEERS / SETPEERSX) are used for that session.
+//! A fresh peer timeline with fewer samples is *locking* (it locks within about half a second
+//! at 8 Hz Sync): an anchor on it is deferred until lock rather than falling back at once
+//! ([`AnchorMapping::Locking`]).
 //!
 //! Sockets are bound once per process for a given fixed port pair and shared by every
 //! [`crate::RaopServer`] that asks for it, so several advertised receivers in one process do not
@@ -201,14 +201,14 @@ pub(crate) struct PtpClock {
     state: Arc<Mutex<ClockState>>,
 }
 
-/// What the follower can do with a network time on one timeline, now.
+/// What the follower can do with a network time on one timeline, for one session, now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimelineMapping {
     /// Locked: the network time maps to this local monotonic instant (ns).
     Locked(u64),
-    /// A timeline with fresh samples, not yet enough of them to lock.
+    /// A session-peer timeline with fresh samples, not yet enough of them to lock.
     Locking,
-    /// Unknown or stale timeline: no lock is coming soon.
+    /// Unknown timeline, not a session peer, or stale: no lock is coming soon.
     Unavailable,
 }
 
@@ -270,14 +270,15 @@ impl PtpClock {
 
     /// Map a network time on `timeline_id` to a local monotonic instant (ns).
     ///
-    /// Locked when the timeline has [`LOCK_MIN_SAMPLES`] samples and its newest sample is fresh
-    /// at `now_ns`; locking when only the sample count is missing.
-    pub(crate) fn map(&self, timeline_id: u64, network_ns: u64, now_ns: u64) -> TimelineMapping {
+    /// Locked when the timeline has [`LOCK_MIN_SAMPLES`] samples, its newest sample is fresh at
+    /// `now_ns`, and its sender address is one of `peers`; locking when only the sample count
+    /// is missing.
+    pub(crate) fn map(&self, timeline_id: u64, network_ns: u64, peers: &[IpAddr], now_ns: u64) -> TimelineMapping {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(timeline) = state.timelines.iter().find(|t| t.clock_id == timeline_id) else {
             return TimelineMapping::Unavailable;
         };
-        if now_ns.saturating_sub(timeline.last_sample_ns) > LOCK_STALE_NS {
+        if !peers.contains(&timeline.source) || now_ns.saturating_sub(timeline.last_sample_ns) > LOCK_STALE_NS {
             return TimelineMapping::Unavailable;
         }
         if timeline.filter.samples < LOCK_MIN_SAMPLES {
@@ -292,8 +293,8 @@ impl PtpClock {
 
     /// [`Self::map`] reduced to the locked instant.
     #[cfg(test)]
-    pub(crate) fn to_local_ns(&self, timeline_id: u64, network_ns: u64, now_ns: u64) -> Option<u64> {
-        match self.map(timeline_id, network_ns, now_ns) {
+    pub(crate) fn to_local_ns(&self, timeline_id: u64, network_ns: u64, peers: &[IpAddr], now_ns: u64) -> Option<u64> {
+        match self.map(timeline_id, network_ns, peers, now_ns) {
             TimelineMapping::Locked(local) => Some(local),
             TimelineMapping::Locking | TimelineMapping::Unavailable => None,
         }
@@ -309,12 +310,33 @@ impl PtpClock {
     }
 }
 
+/// A session's view of the PTP follower (clock plus the peer set at anchor time), carried by a
+/// deferred anchor so the delivery thread can map it once the timeline locks.
+#[derive(Clone, Debug)]
+pub(crate) struct PtpMapper {
+    clock: PtpClock,
+    peers: Vec<IpAddr>,
+}
+
+impl PtpMapper {
+    pub(crate) const fn new(clock: PtpClock, peers: Vec<IpAddr>) -> Self {
+        Self { clock, peers }
+    }
+
+    /// [`PtpClock::map`] for this session's peers.
+    pub(crate) fn map(&self, timeline_id: u64, network_ns: u64, now_ns: u64) -> TimelineMapping {
+        self.clock.map(timeline_id, network_ns, &self.peers, now_ns)
+    }
+}
+
 /// How a `SETRATEANCHORTIME` network time maps for a session.
 #[derive(Debug)]
 pub(crate) enum AnchorMapping {
-    /// The timeline is locked or locking on this follower: map (and keep following) through it.
-    Ptp(PtpClock),
-    /// No PTP mapping (not PTP timing, no follower, unknown or stale timeline).
+    /// Mapped to this local monotonic instant (ns).
+    Locked(u64),
+    /// The timeline is locking: map later through this mapper.
+    Locking(PtpMapper),
+    /// No PTP mapping (not PTP timing, no follower, unknown, foreign or stale timeline).
     Unavailable,
 }
 
@@ -554,25 +576,77 @@ pub(crate) fn acquire(event_port: u16, general_port: u16) -> Arc<PtpService> {
     service
 }
 
-/// Per-session PTP configuration from SETUP.
+/// Parse a peer address string from `timingPeerInfo` / SETPEERS (drops an IPv6 zone suffix).
+fn parse_peer_address(text: &str) -> Option<IpAddr> {
+    let host = text.split('%').next().unwrap_or(text).trim();
+    host.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+}
+
+/// Addresses from one peer dictionary (`Addresses` array of strings).
+fn peer_dict_addresses(dict: &plist::Dictionary, out: &mut Vec<IpAddr>) {
+    if let Some(addresses) = dict.get("Addresses").and_then(plist::Value::as_array) {
+        out.extend(
+            addresses
+                .iter()
+                .filter_map(|a| a.as_string())
+                .filter_map(parse_peer_address),
+        );
+    }
+}
+
+/// Per-session PTP configuration from SETUP and SETPEERS / SETPEERSX.
 #[derive(Debug, Default)]
 pub(crate) struct SessionTiming {
     /// SETUP negotiated `timingProtocol` = `PTP`.
     ptp: bool,
+    /// Sender clock addresses this session accepts timelines from.
+    peers: Vec<IpAddr>,
 }
 
 impl SessionTiming {
-    /// Record the SETUP `timingProtocol`; peer addresses are only logged (see the module docs).
+    /// Record the SETUP `timingProtocol` and its peer info.
+    ///
+    /// `timingPeerInfo` (one peer dictionary) is added; `timingPeerList` (array of peer
+    /// dictionaries) replaces the whole set.
     pub(crate) fn configure_from_setup(&mut self, setup: &plist::Dictionary) {
         self.ptp = setup.get("timingProtocol").and_then(plist::Value::as_string) == Some("PTP");
         if !self.ptp {
             return;
         }
-        tracing::debug!(
-            peers = ?setup.get("timingPeerList"),
-            info = ?setup.get("timingPeerInfo"),
-            "PTP session peers from SETUP"
-        );
+        if let Some(list) = setup.get("timingPeerList").and_then(plist::Value::as_array) {
+            self.replace_peers(list);
+        }
+        if let Some(info) = setup.get("timingPeerInfo").and_then(plist::Value::as_dictionary) {
+            let mut added = Vec::new();
+            peer_dict_addresses(info, &mut added);
+            for ip in added {
+                if !self.peers.contains(&ip) {
+                    self.peers.push(ip);
+                }
+            }
+        }
+        tracing::debug!(peers = ?self.peers, "PTP session peers from SETUP");
+    }
+
+    /// Apply a SETPEERS (array of address strings) or SETPEERSX (array of peer dictionaries)
+    /// body: the list is the complete peer set. Ignored unless the session negotiated PTP.
+    pub(crate) fn replace_peers(&mut self, list: &[plist::Value]) {
+        if !self.ptp {
+            tracing::debug!("SETPEERS ignored: session timing is not PTP");
+            return;
+        }
+        let mut peers = Vec::with_capacity(list.len());
+        for entry in list {
+            if let Some(text) = entry.as_string() {
+                peers.extend(parse_peer_address(text));
+            } else if let Some(dict) = entry.as_dictionary() {
+                peer_dict_addresses(dict, &mut peers);
+            }
+        }
+        peers.sort_unstable();
+        peers.dedup();
+        tracing::debug!(?peers, "PTP session peers replaced");
+        self.peers = peers;
     }
 
     /// Map an anchor network time through `clock` for this session.
@@ -586,8 +660,9 @@ impl SessionTiming {
         let Some(clock) = clock.filter(|_| self.ptp) else {
             return AnchorMapping::Unavailable;
         };
-        match clock.map(timeline_id, network_ns, now_ns) {
-            TimelineMapping::Locked(_) | TimelineMapping::Locking => AnchorMapping::Ptp(clock),
+        match clock.map(timeline_id, network_ns, &self.peers, now_ns) {
+            TimelineMapping::Locked(local) => AnchorMapping::Locked(local),
+            TimelineMapping::Locking => AnchorMapping::Locking(PtpMapper::new(clock, self.peers.clone())),
             TimelineMapping::Unavailable => AnchorMapping::Unavailable,
         }
     }
@@ -637,42 +712,62 @@ mod tests {
     }
 
     /// Offset mapping: master runs 1000 s ahead of local; a network time maps back exactly once
-    /// locked, only on the named timeline, and not once the timeline goes stale.
+    /// locked, and only for listed peers.
     #[test]
     fn locked_timeline_maps_network_time_to_local() {
         let clock = PtpClock::new();
         let offset = 1_000_000_000_000u64;
+        let peers = [sender()];
         for i in 0..LOCK_MIN_SAMPLES as u16 {
             let rx = 5_000_000_000 + u64::from(i) * 125_000_000;
             assert_eq!(
-                clock.to_local_ns(GM, rx + offset, rx),
+                clock.to_local_ns(GM, rx + offset, &peers, rx),
                 None,
                 "locks only after enough samples"
             );
             feed_pair(&clock, i, rx + offset, rx);
         }
         let now = 5_400_000_000;
-        assert_eq!(clock.to_local_ns(GM, offset + 7_000_000_000, now), Some(7_000_000_000));
-        assert_eq!(clock.to_local_ns(GM + 1, offset, now), None, "other timeline");
         assert_eq!(
-            clock.to_local_ns(GM, offset, now + LOCK_STALE_NS + 1),
+            clock.to_local_ns(GM, offset + 7_000_000_000, &peers, now),
+            Some(7_000_000_000)
+        );
+        assert_eq!(clock.to_local_ns(GM + 1, offset, &peers, now), None, "other timeline");
+        let stranger = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))];
+        assert_eq!(
+            clock.to_local_ns(GM, offset, &stranger, now),
+            None,
+            "not a session peer"
+        );
+        assert_eq!(
+            clock.to_local_ns(GM, offset, &peers, now + LOCK_STALE_NS + 1),
             None,
             "stale lock"
         );
     }
 
-    /// A fresh timeline is locking until it has enough samples; unknown or stale timelines are
-    /// unavailable (no wait is worth it); a PTP session maps a locking timeline through the
-    /// follower, a non-PTP session never maps.
+    /// A fresh session-peer timeline is locking until it has enough samples; unknown, foreign
+    /// or stale timelines are unavailable (no wait is worth it); a non-PTP session never maps.
     #[test]
     fn timeline_reports_locking_before_lock() {
         let clock = PtpClock::new();
         let offset = 1_000_000_000_000u64;
-        assert_eq!(clock.map(GM, offset, 0), TimelineMapping::Unavailable, "unknown");
-        feed_pair(&clock, 0, 5_000_000_000 + offset, 5_000_000_000);
-        assert_eq!(clock.map(GM, offset, 5_100_000_000), TimelineMapping::Locking);
+        let peers = [sender()];
         assert_eq!(
-            clock.map(GM, offset, 5_000_000_000 + LOCK_STALE_NS + 1),
+            clock.map(GM, offset, &peers, 0),
+            TimelineMapping::Unavailable,
+            "unknown"
+        );
+        feed_pair(&clock, 0, 5_000_000_000 + offset, 5_000_000_000);
+        assert_eq!(clock.map(GM, offset, &peers, 5_100_000_000), TimelineMapping::Locking);
+        let stranger = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))];
+        assert_eq!(
+            clock.map(GM, offset, &stranger, 5_100_000_000),
+            TimelineMapping::Unavailable,
+            "not a session peer"
+        );
+        assert_eq!(
+            clock.map(GM, offset, &peers, 5_000_000_000 + LOCK_STALE_NS + 1),
             TimelineMapping::Unavailable,
             "stale"
         );
@@ -681,17 +776,18 @@ mod tests {
         setup.insert("timingProtocol".into(), "PTP".into());
         let mut timing = SessionTiming::default();
         timing.configure_from_setup(&setup);
-        let AnchorMapping::Ptp(follower) = timing.map_anchor(Some(clock.clone()), GM, offset, 5_100_000_000) else {
-            panic!("session maps the locking timeline through the follower");
+        timing.replace_peers(&["192.168.1.20".into()]);
+        let AnchorMapping::Locking(mapper) = timing.map_anchor(Some(clock.clone()), GM, offset, 5_100_000_000) else {
+            panic!("session sees the timeline locking");
         };
         for seq in 1..LOCK_MIN_SAMPLES as u16 {
             let rx = 5_000_000_000 + u64::from(seq) * 125_000_000;
             feed_pair(&clock, seq, rx + offset, rx);
         }
         assert_eq!(
-            follower.map(GM, offset + 7_000_000_000, 5_500_000_000),
+            mapper.map(GM, offset + 7_000_000_000, 5_500_000_000),
             TimelineMapping::Locked(7_000_000_000),
-            "the session's follower sees the lock"
+            "the deferred mapper sees the lock"
         );
         assert!(matches!(
             SessionTiming::default().map_anchor(Some(clock), GM, offset, 5_500_000_000),
@@ -705,13 +801,14 @@ mod tests {
     fn filter_keeps_min_delay_sample_and_rejects_single_outlier() {
         let clock = PtpClock::new();
         let offset = 50_000_000_000u64;
+        let peers = [sender()];
         let delays = [300_000u64, 40_000, 2_000_000, 900_000, 120_000_000];
         for (i, delay) in delays.iter().enumerate() {
             let send = 1_000_000_000 + i as u64 * 125_000_000;
             feed_pair(&clock, i as u16, send + offset, send + delay);
         }
         // Estimate = offset - 40 µs (least delayed); the 120 ms outlier never entered the window.
-        let local = clock.to_local_ns(GM, offset + 10_000_000_000, 2_000_000_000);
+        let local = clock.to_local_ns(GM, offset + 10_000_000_000, &peers, 2_000_000_000);
         assert_eq!(local, Some(10_000_040_000));
     }
 
@@ -719,6 +816,7 @@ mod tests {
     #[test]
     fn filter_accepts_confirmed_step() {
         let clock = PtpClock::new();
+        let peers = [sender()];
         let mut seq = 0u16;
         for i in 0..6u64 {
             let rx = 1_000_000_000 + i * 125_000_000;
@@ -732,7 +830,7 @@ mod tests {
             seq += 1;
         }
         assert_eq!(
-            clock.to_local_ns(GM, 13_000_000_000, 3_000_000_000),
+            clock.to_local_ns(GM, 13_000_000_000, &peers, 3_000_000_000),
             Some(10_000_000_000)
         );
     }
@@ -740,11 +838,50 @@ mod tests {
     #[test]
     fn one_step_sync_is_a_sample() {
         let clock = PtpClock::new();
+        let peers = [sender()];
         for i in 0..LOCK_MIN_SAMPLES as u16 {
             let rx = 1_000_000_000 + u64::from(i) * 125_000_000;
             clock.handle_packet(&timestamp_msg(MSG_SYNC, false, GM, i, rx + 500), sender(), rx);
         }
-        assert_eq!(clock.to_local_ns(GM, 2_000_000_500, 1_500_000_000), Some(2_000_000_000));
+        assert_eq!(
+            clock.to_local_ns(GM, 2_000_000_500, &peers, 1_500_000_000),
+            Some(2_000_000_000)
+        );
+    }
+
+    /// SETUP peer info adds, SETPEERS strings and SETPEERSX dictionaries replace, non-PTP ignores.
+    #[test]
+    fn session_peers_follow_setup_and_setpeers() {
+        let mut setup = plist::Dictionary::new();
+        setup.insert("timingProtocol".into(), "PTP".into());
+        let mut info = plist::Dictionary::new();
+        info.insert(
+            "Addresses".into(),
+            plist::Value::Array(vec!["fe80::1%en0".into(), "192.168.1.20".into()]),
+        );
+        setup.insert("timingPeerInfo".into(), plist::Value::Dictionary(info));
+        let mut timing = SessionTiming::default();
+        timing.configure_from_setup(&setup);
+        assert_eq!(timing.peers.len(), 2);
+
+        timing.replace_peers(&["192.168.1.30".into()]);
+        assert_eq!(timing.peers, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30))]);
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert("ID".into(), "peer".into());
+        dict.insert(
+            "Addresses".into(),
+            plist::Value::Array(vec!["::ffff:192.168.1.40".into()]),
+        );
+        timing.replace_peers(&[plist::Value::Dictionary(dict)]);
+        assert_eq!(timing.peers, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40))]);
+
+        let mut ntp = SessionTiming::default();
+        let mut ntp_setup = plist::Dictionary::new();
+        ntp_setup.insert("timingProtocol".into(), "NTP".into());
+        ntp.configure_from_setup(&ntp_setup);
+        ntp.replace_peers(&["192.168.1.30".into()]);
+        assert!(ntp.peers.is_empty());
     }
 
     /// End to end over real sockets on ephemeral ports: Sync + Follow_Up datagrams lock the
@@ -754,6 +891,7 @@ mod tests {
         let service = acquire(0, 0);
         let (event, general) = service.ports().expect("ephemeral bind");
         let tx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("tx bind");
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let offset = 3_000_000_000_000u64;
         for seq in 0..6u16 {
             let master = mono_now_ns() + offset;
@@ -769,7 +907,7 @@ mod tests {
         let mut locked = None;
         for _ in 0..100 {
             let now = mono_now_ns();
-            locked = service.clock().to_local_ns(GM, now + offset, now);
+            locked = service.clock().to_local_ns(GM, now + offset, &[loopback], now);
             if locked.is_some() {
                 break;
             }

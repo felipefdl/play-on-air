@@ -53,24 +53,21 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
 18. **PTP follower** (`net::ptp`, spec section 3) replaces the drain-only sink: passive, per
     grandmaster clock identity, offset from two-step Sync/Follow_Up (or one-step Sync) through a
     16-sample minimum-delay filter with 3-sample step confirmation; locked after 4 samples, stale
-    after 3 s. Anchors map by the clock identity they name, whatever address the grandmaster sends
-    from (a Mac grandmaster uses a temporary IPv6 address an iPhone sender does not list in
-    `timingPeerList`); SETUP peer info and SETPEERS / SETPEERSX are only logged. A started anchor
-    keeps following its timeline: every packet's presentation is re-mapped through PTP while the
-    timeline maps, so playout tracks the grandmaster's rate rather than the local clock's. Ports
-    come from `RaopServerBuilder::ptp_ports` (default 319/320, `0` = ephemeral, readback
-    `RaopServer::ptp_ports`); fixed ports are bound once per process and shared by every server.
-    Bind failure logs one warning and playback uses the unlocked fallback (item 20).
+    after 3 s. SETUP `timingPeerInfo` adds and `timingPeerList` / SETPEERS (strings) / SETPEERSX
+    (peer dictionaries) replace the session peer set; only timelines from session peers map
+    anchors. Ports come from `RaopServerBuilder::ptp_ports` (default 319/320, `0` = ephemeral,
+    readback `RaopServer::ptp_ports`); fixed ports are bound once per process and shared by every
+    server. Bind failure logs one warning and playback uses the unlocked fallback (item 20).
 19. **FLUSHBUFFERED follows spec section 2.** 24-bit modulo sequence compare. No `flushFromSeq`
     (or no `flushFromTS`): flush-all stops playback, discards the queue, resets anchor and RTP
     epoch, and drops incoming seq before `flushUntilSeq` (exclusive). Range flush keeps playing,
     trims the queue from `flushFromTS` to the end, and drops seq in `[flushFromSeq, flushUntilSeq)`.
     Rules retire at `flushUntilSeq + 20`. Missing `flushUntilSeq` answers `status` -6705.
 20. **Unlocked anchor fallback** (deviation, below). An anchor on a timeline the follower is
-    *locking* (fresh timeline with fewer than 4 samples, e.g. a grandmaster that
+    *locking* (fresh session-peer timeline with fewer than 4 samples, e.g. a grandmaster that
     appeared just before the anchor) is deferred: the RTSP reply is immediate, the delivery thread
     holds release and re-maps every 20 ms, and plays through PTP as soon as the timeline locks, at
-    most 1 s after receipt. Otherwise (unknown or stale timeline, no follower, or no lock
+    most 1 s after receipt. Otherwise (unknown, foreign or stale timeline, no follower, or no lock
     within 1 s) the first anchor on a timeline is mapped to "release on receipt" (`H = receipt +
     Audio-Latency`, receipt being the SETRATEANCHORTIME arrival) and that offset is pinned for
     later anchors on the same timeline; it re-pins when an anchor lands more than 1 s from

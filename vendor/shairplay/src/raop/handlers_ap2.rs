@@ -871,8 +871,8 @@ fn plist_uint(dict: &plist::Dictionary, key: &str) -> Option<u64> {
         .or_else(|| value.as_signed_integer().map(|v| v as u64))
 }
 
-/// `rtpTime` plus anchor time of a rate-1 SETRATEANCHORTIME: on a PTP timeline this session's
-/// follower tracks (locked or locking), or as a bare network time for the unlocked fallback.
+/// `rtpTime` plus anchor time of a rate-1 SETRATEANCHORTIME, mapped through the PTP follower
+/// when this session's timeline is locked, or deferred to the delivery thread while it locks.
 fn parse_anchor(conn: &RaopConnection, dict: &plist::Dictionary) -> Option<(u32, AnchorTime)> {
     let rtp = plist_uint(dict, "rtpTime")? as u32;
     let secs = plist_uint(dict, "networkTimeSecs")?;
@@ -885,10 +885,11 @@ fn parse_anchor(conn: &RaopConnection, dict: &plist::Dictionary) -> Option<(u32,
         network_ns,
         crate::util::mono_now_ns(),
     ) {
-        AnchorMapping::Ptp(clock) => AnchorTime::Ptp {
+        AnchorMapping::Locked(local) => AnchorTime::Local(local),
+        AnchorMapping::Locking(mapper) => AnchorTime::Locking {
             timeline_id,
             ns: network_ns,
-            clock,
+            mapper,
         },
         AnchorMapping::Unavailable => AnchorTime::Network {
             timeline_id,
@@ -937,16 +938,16 @@ pub(crate) fn handle_set_rate_anchor_time(
     }
 }
 
-/// AP2 SETPEERS / SETPEERSX: the session's PTP peer set. Timelines are matched by the clock
-/// identity each anchor names (see [`crate::net::ptp`]), so the list is only logged.
+/// AP2 SETPEERS / SETPEERSX: the body (address strings, or peer dictionaries) replaces the
+/// session's PTP peer set.
 pub(crate) fn handle_set_peers(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     request: &HttpRequest,
     _response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     let data = request.data()?;
-    let peers: plist::Value = plist::from_bytes(data).ok()?;
-    tracing::debug!(?peers, "PTP session peers replaced");
+    let plist_val: plist::Value = plist::from_bytes(data).ok()?;
+    conn.timing.replace_peers(plist_val.as_array()?);
     None
 }
 

@@ -131,8 +131,6 @@ pub struct MediaLoadRequest {
   pub stream_kind: CastStreamKind,
   /// Now-playing metadata shown on the sink UI.
   pub track: CastTrack,
-  /// When false, the receiver stays paused after LOAD until PLAY.
-  pub autoplay: bool,
 }
 
 impl MediaLoadRequest {
@@ -143,7 +141,6 @@ impl MediaLoadRequest {
       content_type: CONTENT_TYPE_FLAC.to_owned(),
       stream_kind: kind,
       track: CastTrack::default(),
-      autoplay: true,
     }
   }
 
@@ -154,7 +151,6 @@ impl MediaLoadRequest {
       content_type: CONTENT_TYPE_WAV.to_owned(),
       stream_kind: kind,
       track: CastTrack::default(),
-      autoplay: true,
     }
   }
 
@@ -162,15 +158,6 @@ impl MediaLoadRequest {
   #[must_use]
   pub fn with_track(mut self, track: CastTrack) -> Self {
     self.track = track;
-    self
-  }
-
-  /// Start playback on LOAD when `autoplay` is true.
-  ///
-  /// A synced session loads with autoplay off and sends PLAY at a measured instant.
-  #[must_use]
-  pub const fn with_autoplay(mut self, autoplay: bool) -> Self {
-    self.autoplay = autoplay;
     self
   }
 
