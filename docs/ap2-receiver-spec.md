@@ -895,8 +895,12 @@ over 25 ms, so picking a single peak jumps between them.
   correction paused, so they gained nothing.
 - The sync helps only groups that mix Cast and Apple speakers; Cast-only and Apple-only groups
   were already in step.
-- Found while testing and unverified on 0.3.0: a Cast re-LOAD after a flush and resume with about
-  1 s queued stayed in BUFFERING, and a track of pure digital silence stalled the Cast buffer.
+- Found while testing: digital silence stalled the Cast buffer. FLAC coded it in a few bytes per
+  second, and a Cast receiver does not play until it has read about 32 KB (and after an underrun
+  it waits for far more). 0.4.2 encodes without constant subframes, so silence streams at about
+  100 kbit/s. The re-LOAD that stayed in BUFFERING after a flush and resume was the same silent
+  track. Separately, with only about 1 s queued even music stalls for about 10 s after a LOAD;
+  the iPhone queues the full 8 s.
 
 ## Open questions
 

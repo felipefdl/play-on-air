@@ -29,9 +29,18 @@ pub const FLAC_BLOCK_SIZE: usize = 2048;
 /// still shared, so a replacement arena is the same size as the first one.
 pub(crate) const LIVE_ARENA_BYTES: usize = 64 * 1024;
 
-/// Default verified encoder config for the live encoder.
+/// Verified encoder config for the live encoder: flacenc defaults without constant subframes.
+///
+/// A constant subframe codes a block of digital silence in a few bytes, so silence streams at
+/// about 7 kbit/s. A Cast receiver does not play until it has read about 32 KB, and after an
+/// underrun it waits for far more, so a silent intro never starts and 30 s of silence mid-track
+/// stalls it for about 20 s, after which it plays that far behind. Without constant subframes a
+/// silent block costs at least 1 bit per sample (about 96 kbit/s for 48 kHz stereo), which keeps
+/// the 8 s read-ahead well above that threshold. Decoded audio is unchanged.
 fn verified_encoder_config() -> Result<Verified<config::Encoder>> {
-  config::Encoder::default()
+  let mut encoder = config::Encoder::default();
+  encoder.subframe_coding.use_constant = false;
+  encoder
     .into_verified()
     .map_err(|(_cfg, err)| Error::Audio(format!("invalid FLAC encoder config: {err:?}")))
 }
@@ -242,6 +251,30 @@ mod tests {
     for (i, (&orig, &dec)) in pcm.iter().zip(decoded.iter()).enumerate() {
       assert_eq!(i32::from(orig), dec, "mismatch at sample {i}");
     }
+  }
+
+  /// Digital silence keeps a byte rate a Cast receiver can buffer: every silent frame carries at
+  /// least 1 bit per sample (a constant subframe would be a few bytes and stall the speaker), and
+  /// it still decodes to exact zeros.
+  #[test]
+  fn digital_silence_frames_keep_one_bit_per_sample_and_decode_to_zero() {
+    let mut encoder = LiveFlacEncoder::new(48_000, 2).expect("encoder");
+    let silence = vec![0_i16; FLAC_BLOCK_SIZE * 2];
+    let mut bitstream = encoder.header_bytes().expect("header").to_vec();
+    for _ in 0..4 {
+      let frame = encoder.encode_block(&silence).expect("frame");
+      assert!(
+        frame.len() >= FLAC_BLOCK_SIZE * 2 / 8,
+        "silent frame is {} bytes, under 1 bit per sample",
+        frame.len()
+      );
+      bitstream.extend_from_slice(&frame);
+    }
+
+    let mut reader = claxon::FlacReader::new(std::io::Cursor::new(&bitstream)).expect("claxon");
+    let decoded: Vec<i32> = reader.samples().map(|s| s.expect("sample")).collect();
+    assert_eq!(decoded.len(), FLAC_BLOCK_SIZE * 2 * 4);
+    assert!(decoded.iter().all(|&s| s == 0), "silence decodes to zeros");
   }
 
   /// Steady state: when each chunk is dropped before the next encode (HTTP wrote it), every
