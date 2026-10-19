@@ -229,6 +229,16 @@ impl MediaServerHandle {
     tracing::debug!(generation, "media live bodies invalidated");
   }
 
+  /// End in-flight LiveWav/LiveFlac bodies but keep serving: the next GET starts a new body.
+  ///
+  /// After a flush the ring holds the sender's new audio while Cast still has the old media
+  /// paused. Its body would keep taking that audio at real time and send it to the stale
+  /// media, so the re-LOAD's GET would find little queued.
+  pub fn end_live_bodies(&self) {
+    let generation = self.live_generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    tracing::debug!(generation, "media live bodies ended; next GET starts a new body");
+  }
+
   /// Shared rollover signal for bridge re-LOAD loops.
   pub fn rollover_signal(&self) -> Arc<RolloverSignal> {
     Arc::clone(&self.rollover)
@@ -1875,6 +1885,57 @@ mod tests {
     let text = String::from_utf8_lossy(&buf);
     assert!(text.starts_with("HTTP/1.1 404"), "post-invalidate GET must 404; got: {text}");
 
+    handle.shutdown();
+  }
+
+  /// After a skip's flush the old body must stop taking audio: what the sender queues next is
+  /// left for the re-LOAD's GET, which still gets a new body.
+  #[tokio::test]
+  async fn end_live_bodies_leaves_new_audio_for_the_next_get() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let ring = Arc::new(PcmRing::new(2, 96_000));
+    ring.push_f32(&vec![0.1; 24_000 * 2]);
+    let handle = MediaServer::start("127.0.0.1").await.expect("start");
+    handle.set_content(MediaContent::LiveFlac {
+      ring: Arc::clone(&ring),
+      channels: 2,
+      sample_rate: 48_000,
+    });
+    let host_port = format!("127.0.0.1:{}", handle.addr.port());
+    let req = format!("GET /stream HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+
+    let mut old = TcpStream::connect(&host_port).await.expect("connect old");
+    old.write_all(req.as_bytes()).await.expect("write old");
+    let mut prefix = [0_u8; 1024];
+    assert!(old.read(&mut prefix).await.expect("read old") > 0, "old body streams first");
+
+    handle.end_live_bodies();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+      let mut sink = [0_u8; 8192];
+      while let Ok(n) = old.read(&mut sink).await
+        && n > 0
+      {}
+    })
+    .await;
+    assert!(ended.is_ok(), "ended body must close within a few seconds");
+
+    // The sender's new audio after the flush stays queued (the old connection is still open).
+    ring.clear();
+    ring.push_f32(&vec![0.2; 48_000 * 2]);
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(ring.available_frames(), 48_000, "no body takes audio before the next GET");
+
+    let mut next = TcpStream::connect(&host_port).await.expect("connect next");
+    next.write_all(req.as_bytes()).await.expect("write next");
+    let mut head = [0_u8; 64];
+    let n = next.read(&mut head).await.expect("read next");
+    assert!(
+      String::from_utf8_lossy(&head[..n]).starts_with("HTTP/1.1 200"),
+      "the re-LOAD's GET still gets a body"
+    );
+    drop(old);
     handle.shutdown();
   }
 

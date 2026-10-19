@@ -23,13 +23,42 @@ use super::state::{CastRoute, DeviceSlot, DeviceState, EgressKind, PlayingSessio
 use super::teardown::TeardownCastPolicy;
 use super::{Bridge, RingLookup};
 
-/// Frames of real PCM required before Cast LOAD: one FLAC block (~43 ms at 48 kHz).
+/// Frames of real PCM required before the start lead wait: one FLAC block (~43 ms at 48 kHz).
 ///
 /// shairplay hands PCM over on the sender's anchor timeline, up to `CAST_READ_AHEAD` before
 /// presentation (a burst when an anchor arrives with audio queued, then real time), so the
-/// prebuffer only confirms that audio is flowing. Whatever the ring holds when Cast GETs the
-/// stream is burst to it, and the media server's pacing keeps Cast that far ahead.
+/// prebuffer only confirms that audio is flowing; [`wait_for_start_lead`] then lets the queue
+/// reach [`CAST_START_LEAD`]. Whatever the ring holds when Cast GETs the stream is burst to it,
+/// and the media server's pacing keeps Cast that far ahead.
 pub(super) const PREBUFFER_FRAMES: usize = FLAC_BLOCK_SIZE;
+
+/// Audio a Cast LOAD should find queued: below about 5 s a Nest Audio plays half a second, runs
+/// dry, and buffers 8-10 s before it plays again; from 5 s it plays straight through.
+///
+/// After a skip the sender's new track arrives a fraction of a second at a time at first, so a
+/// re-LOAD on the first packet hit that stall on almost every skip. shairplay releases audio up
+/// to `CAST_READ_AHEAD` (8 s) before presentation and a fresh anchor presents about 2 s out, so
+/// about 6 s is what a fast sender can have queued right away.
+pub(super) const CAST_START_LEAD: Duration = Duration::from_secs(6);
+
+/// Longest a LOAD waits for [`CAST_START_LEAD`]: a sender that delivers only in real time
+/// reaches it in about this long, and then LOADs on whatever is queued.
+const CAST_START_LEAD_WAIT: Duration = Duration::from_secs(6);
+
+const START_LEAD_POLL: Duration = Duration::from_millis(20);
+
+/// Wait until `ring` holds [`CAST_START_LEAD`] of audio, [`CAST_START_LEAD_WAIT`] passes, or
+/// `keep_waiting` turns false (session replaced, paused or ended); the caller's own checks
+/// decide what to do next. Returns at once when the lead is already queued.
+pub(super) async fn wait_for_start_lead(ring: &PcmRing, sample_rate: u32, keep_waiting: impl Fn() -> bool) {
+  let lead_frames = usize::try_from(CAST_START_LEAD.as_secs())
+    .unwrap_or(usize::MAX)
+    .saturating_mul(usize::try_from(sample_rate.max(1)).unwrap_or(usize::MAX));
+  let deadline = Instant::now() + CAST_START_LEAD_WAIT;
+  while ring.available_frames() < lead_frames && Instant::now() < deadline && keep_waiting() {
+    sleep(START_LEAD_POLL).await;
+  }
+}
 
 /// Max prebuffer poll iterations (160 × 50 ms = 8 s). Real-time PCM reaches one block within
 /// tens of milliseconds, so running out means the sender paused or stopped before audio flowed.
@@ -212,6 +241,11 @@ impl Bridge {
         return Err(err);
       },
     }
+
+    wait_for_start_lead(&ring, fmt.sample_rate, || {
+      is_current(&ring) && self.starting_still(device_id, generation)
+    })
+    .await;
 
     if !is_current(&ring) || !self.starting_still(device_id, generation) {
       tracing::info!(%device_id, generation, "session restarted before Cast load; skipping stale start");

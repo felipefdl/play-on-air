@@ -7,12 +7,29 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
+use crate::audio::PcmRing;
 use crate::cast::{CastControl, CastStreamKind, CastTrack, MediaLoadRequest};
 use crate::error::Result;
 use crate::media::RolloverSignal;
 
 use super::Bridge;
+use super::start::wait_for_start_lead;
 use super::state::{CastRoute, DeviceState, EgressKind};
+
+/// What a re-LOAD needs from the Playing session, read under the slot lock.
+struct ReloadPlan {
+  pool: Arc<dyn CastControl>,
+  route: Arc<CastRoute>,
+  request: MediaLoadRequest,
+  volume: LoadVolumePolicy,
+  alive: Arc<AtomicBool>,
+  late_stop_allowed: Arc<AtomicBool>,
+  inflight_load: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+  reload_flight: Arc<tokio::sync::Mutex<()>>,
+  playback_paused: Arc<AtomicBool>,
+  ring: Arc<PcmRing>,
+  sample_rate: u32,
+}
 
 /// How long teardown waits for an in-flight blocking Cast LOAD.
 ///
@@ -351,22 +368,35 @@ impl Bridge {
       }
       .with_track(session.track.lock().clone());
       let last_volume = *session.last_volume_linear.lock();
-      let plan = (
-        Arc::clone(&session.pool),
-        Arc::clone(&session.route),
+      let plan = ReloadPlan {
+        pool: Arc::clone(&session.pool),
+        route: Arc::clone(&session.route),
         request,
-        LoadVolumePolicy::Rollover { last_volume },
-        Arc::clone(&session.session_alive),
-        Arc::clone(&session.late_stop_allowed),
-        Arc::clone(&session.inflight_load),
-        Arc::clone(&session.reload_flight),
-        Arc::clone(&session.playback_paused),
-      );
+        volume: LoadVolumePolicy::Rollover { last_volume },
+        alive: Arc::clone(&session.session_alive),
+        late_stop_allowed: Arc::clone(&session.late_stop_allowed),
+        inflight_load: Arc::clone(&session.inflight_load),
+        reload_flight: Arc::clone(&session.reload_flight),
+        playback_paused: Arc::clone(&session.playback_paused),
+        ring: Arc::clone(&session.ring),
+        sample_rate: session.sample_rate,
+      };
       drop(devices);
       Some(plan)
     };
-    let Some((pool, route, request, volume, alive, late_stop_allowed, inflight_load, reload_flight, playback_paused)) =
-      load_plan
+    let Some(ReloadPlan {
+      pool,
+      route,
+      request,
+      volume,
+      alive,
+      late_stop_allowed,
+      inflight_load,
+      reload_flight,
+      playback_paused,
+      ring,
+      sample_rate,
+    }) = load_plan
     else {
       return ReloadOutcome::Failed;
     };
@@ -396,6 +426,13 @@ impl Bridge {
 
     // Single-flight: finish any prior LOAD before publishing a new one (no detached race).
     join_prior_inflight_load(&inflight_load, device_id).await;
+
+    // A skip's re-LOAD fires on the new track's first packet; LOAD once the speaker can start
+    // on a full lead instead of running dry and rebuffering.
+    wait_for_start_lead(&ring, sample_rate, || {
+      alive.load(Ordering::Acquire) && !playback_paused.load(Ordering::Acquire)
+    })
+    .await;
 
     // State can change while joining the prior load (B2: pause during wait). The flush count
     // read here is what this LOAD covers once accepted (it starts after those flushes).

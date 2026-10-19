@@ -68,6 +68,9 @@ const fn stall_action(
 
 struct StallSnapshot {
   paused: bool,
+  /// A re-LOAD holds the session's flight lock (waiting for the start lead or on the wire):
+  /// no body writes while it runs is expected, not a stall.
+  reloading: bool,
   last_write: Option<Instant>,
   ring_frames: usize,
   started_at: Instant,
@@ -100,6 +103,9 @@ impl Bridge {
     let Some(snapshot) = self.stall_snapshot(device_id, generation) else {
       return;
     };
+    if snapshot.reloading {
+      return;
+    }
 
     // Body age: last HTTP write, or time since session start if Cast never pulled.
     // Never-pulled while the ring has data after STALL_BODY_STALE is a stall.
@@ -163,6 +169,7 @@ impl Bridge {
     let (_bytes, last_write) = session.media.progress();
     let snap = StallSnapshot {
       paused: session.paused,
+      reloading: session.reload_flight.try_lock().is_err(),
       last_write,
       ring_frames: session.ring.available_frames(),
       started_at: session.started_at,
@@ -362,8 +369,7 @@ mod tests {
   /// owe the re-LOAD to resume, like a flush that fires while paused.
   #[tokio::test]
   async fn pause_during_stall_reload_owes_reload_to_resume() {
-    use crate::audio::PcmRing;
-    use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, test_playing_session};
+    use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, started_ring, test_playing_session};
     use crate::cast::CastControl;
     use crate::media::MediaServer;
     use crate::registry::DeviceRegistry;
@@ -373,8 +379,7 @@ mod tests {
     let pool: Arc<dyn CastControl> = Arc::<FakeCast>::clone(&fake);
     let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
     let media = MediaServer::start("127.0.0.1").await.expect("media");
-    let ring = Arc::new(PcmRing::new(2, 64));
-    insert_playing(&bridge, DEV, 1, test_playing_session(media, DEV, pool, ring));
+    insert_playing(&bridge, DEV, 1, test_playing_session(media, DEV, pool, started_ring()));
     let loads = |cast: &FakeCast| cast.calls().iter().filter(|call| matches!(call, CastCall::Load(_))).count();
 
     let pausing = Arc::clone(&bridge);
