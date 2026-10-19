@@ -54,6 +54,7 @@ pub(super) fn test_playing_session(
     track: Arc::new(Mutex::new(crate::cast::CastTrack::default())),
     inflight_load: Arc::new(Mutex::new(None)),
     reload_flight: Arc::new(tokio::sync::Mutex::new(())),
+    sync: None,
   }
 }
 

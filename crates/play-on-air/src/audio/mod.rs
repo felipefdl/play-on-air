@@ -2,6 +2,7 @@
 
 pub mod flac;
 pub mod pcm;
+pub(crate) mod sync;
 pub mod wav;
 
 pub(crate) use flac::LIVE_ARENA_BYTES;

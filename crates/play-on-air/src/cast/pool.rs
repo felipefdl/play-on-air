@@ -2168,8 +2168,13 @@ impl WorkerState {
     self.last_load = Some(request.clone());
     self.last_load_at = Some(Instant::now());
     let media = request.to_media();
-    match self.load_once(&media) {
-      Ok(session) => self.commit_load_session(session, &media.content_id, abandoned),
+    let autoplay = request.autoplay;
+    match self.load_once(&media, autoplay) {
+      Ok(session) => {
+        let committed = self.commit_load_session(session, &media.content_id, abandoned);
+        self.expect_load_state(autoplay);
+        committed
+      },
       Err(err) => {
         if abandoned.load(Ordering::Acquire) {
           return Err(Error::Cast(format!(
@@ -2203,7 +2208,7 @@ impl WorkerState {
             self.device_id
           )));
         }
-        let session = self.load_once(&media).map_err(|retry_err| {
+        let session = self.load_once(&media, autoplay).map_err(|retry_err| {
           tracing::warn!(
             device_id = %self.device_id,
             error = %retry_err,
@@ -2211,8 +2216,18 @@ impl WorkerState {
           );
           retry_err
         })?;
-        self.commit_load_session(session, &media.content_id, abandoned)
+        let committed = self.commit_load_session(session, &media.content_id, abandoned);
+        self.expect_load_state(autoplay);
+        committed
       },
+    }
+  }
+
+  /// An `autoplay: false` LOAD leaves the receiver PAUSED by our own request: do not report
+  /// that PAUSED as a user pause.
+  fn expect_load_state(&mut self, autoplay: bool) {
+    if !autoplay {
+      self.remote.expect_player(PlayerIntent::Paused, Instant::now());
     }
   }
 
@@ -2279,7 +2294,7 @@ impl WorkerState {
     }
   }
 
-  fn load_once(&self, media: &rust_cast::channels::media::Media) -> Result<ActiveCastSession> {
+  fn load_once(&self, media: &rust_cast::channels::media::Media, autoplay: bool) -> Result<ActiveCastSession> {
     let device = self
       .device
       .as_ref()
@@ -2308,10 +2323,22 @@ impl WorkerState {
       .connect(app.transport_id.as_str())
       .map_err(|err| Error::Cast(format!("warm app connection: {err}")))?;
 
-    let status = device
-      .media
-      .load(app.transport_id.as_str(), app.session_id.as_str(), media)
-      .map_err(|err| Error::Cast(format!("warm media load: {err}")))?;
+    let status = if autoplay {
+      device
+        .media
+        .load(app.transport_id.as_str(), app.session_id.as_str(), media)
+        .map_err(|err| Error::Cast(format!("warm media load: {err}")))?
+    } else {
+      device
+        .media
+        .load_with_opts(
+          app.transport_id.as_str(),
+          app.session_id.as_str(),
+          media,
+          rust_cast::channels::media::LoadOptions { current_time: 0.0, autoplay: false },
+        )
+        .map_err(|err| Error::Cast(format!("warm media load: {err}")))?
+    };
 
     media_session_from_status(app.transport_id, app.session_id, &status)
   }
