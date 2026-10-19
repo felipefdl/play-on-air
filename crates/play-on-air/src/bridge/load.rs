@@ -345,20 +345,11 @@ impl Bridge {
         ReloadValidity::Paused => return ReloadOutcome::Paused,
         ReloadValidity::Stale => return ReloadOutcome::Failed,
       }
-      // Timed start again, including an AirPlay multi-select. A Cast group never has `sync`.
-      let sync_timeline = session
-        .sync
-        .as_ref()
-        .filter(|_| session.egress == EgressKind::FlacLive)
-        .map(|sync| Arc::clone(&sync.timeline));
-      let mut request = match session.egress {
+      let request = match session.egress {
         EgressKind::FlacLive => MediaLoadRequest::flac(session.stream_url.clone(), CastStreamKind::Live),
         EgressKind::WavBuffered => MediaLoadRequest::wav(session.stream_url.clone(), CastStreamKind::Buffered),
       }
       .with_track(session.track.lock().clone());
-      if sync_timeline.is_some() {
-        request = request.with_autoplay(false);
-      }
       let last_volume = *session.last_volume_linear.lock();
       let plan = (
         Arc::clone(&session.pool),
@@ -370,23 +361,12 @@ impl Bridge {
         Arc::clone(&session.inflight_load),
         Arc::clone(&session.reload_flight),
         Arc::clone(&session.playback_paused),
-        sync_timeline,
       );
       drop(devices);
       Some(plan)
     };
-    let Some((
-      pool,
-      route,
-      request,
-      volume,
-      alive,
-      late_stop_allowed,
-      inflight_load,
-      reload_flight,
-      playback_paused,
-      sync_timeline,
-    )) = load_plan
+    let Some((pool, route, request, volume, alive, late_stop_allowed, inflight_load, reload_flight, playback_paused)) =
+      load_plan
     else {
       return ReloadOutcome::Failed;
     };
@@ -459,9 +439,6 @@ impl Bridge {
           let _sent = result_tx.send(LoadAttempt::Paused);
           return;
         }
-        if let Some(timeline) = sync_timeline {
-          timeline.prepare_for_load();
-        }
         let result = cast_load_media(pool.as_ref(), &route, request, volume);
         // If pause landed during LOAD, treat success as late and STOP (B1/B2).
         if paused_flag.load(Ordering::Acquire) {
@@ -505,7 +482,6 @@ impl Bridge {
             "Cast re-LOAD ok"
           );
           self.confirm_group_session(device_id);
-          self.note_sync_reload(device_id);
           return ReloadOutcome::Loaded;
         }
         // Wire success was not accepted — STOP unless replace forbids it (B1 orphan otherwise).

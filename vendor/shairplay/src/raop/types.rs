@@ -190,14 +190,6 @@ pub trait AudioSession: Send + Sync {
     /// Distinct from [`audio_flush`](Self::audio_flush) so the buffered delivery
     /// thread can notify without sharing the legacy RTP session object.
     fn on_flush(&mut self) {}
-    /// Local monotonic instant when the first sample of the next
-    /// [`audio_process`](Self::audio_process) chunk is due on the sender's anchor timeline.
-    ///
-    /// Buffered playout calls this immediately before that chunk. The instant is the
-    /// packet's presentation time (`MONO_EPOCH` + presentation nanoseconds). The AAC
-    /// decoder and the resampler add a small fixed delay that is not subtracted.
-    /// Default is a no-op.
-    fn audio_due(&mut self, _due: std::time::Instant) {}
 }
 
 #[cfg(test)]

@@ -5,12 +5,8 @@
 //! receiver (`docs/ap2-receiver-spec.md` sections 1 and 2):
 //!
 //! - **Timeline.** RTP timestamps are extended to 64 bits (rollover counted on the assumption
-//!   that RTP time increases). An anchor pins RTP `anchor_rtp` to sender network time `N(anchor)`;
-//!   every sample `r` is presented at network time `N(anchor) + (r - anchor_rtp) / sample_rate`.
-//!   While the anchor's PTP timeline is locked, that network time is mapped to the local clock
-//!   again for every packet, so playout follows the grandmaster's rate rather than the local
-//!   clock's (Apple's receivers slave their timebase to PTP the same way); otherwise the anchor's
-//!   local instant `H(anchor)` plus elapsed samples is used.
+//!   that RTP time increases). An anchor pins RTP `anchor_rtp` to local instant `H(anchor)`;
+//!   every sample `r` is presented at `H(anchor) + (r - anchor_rtp) / sample_rate`.
 //! - **Release.** PlayOnAir's output is not a DAC but a host ring feeding a Cast speaker that
 //!   holds its own buffer. The receiver advertises an output delay as the RTSP `Audio-Latency`
 //!   (`L`, in source samples) and releases each packet to the host at `presentation - lead`.
@@ -31,20 +27,21 @@
 //!   end, and drops incoming packets in `[flushFromSeq, flushUntilSeq)`. Each drop rule retires
 //!   once a packet at `flushUntilSeq + 20` or later arrives.
 //!
-//! Anchors normally arrive on a timeline the PTP follower ([`crate::net::ptp`]) has locked and
-//! map at once. An anchor on a timeline the follower is still **locking** (fresh samples, not
-//! enough yet, typically right after a new grandmaster appears) is deferred: the RTSP handler
-//! answers at once, and the delivery thread holds release and re-maps the anchor every
-//! [`LOCK_POLL_NS`] until the timeline locks, for at most [`LOCK_WAIT_NS`] after receipt. When
-//! the follower cannot provide the mapping (ports owned by another PTP stack, no lock within the
-//! wait, or an unknown timeline) the reference receiver refuses the anchor; PlayOnAir plays anyway
-//! with the **unlocked fallback**: the first anchor on a timeline is mapped so its sample is
-//! released on receipt (`H = receipt + L`), and that sender-clock to local-clock offset is kept
-//! for later anchors on the same timeline so their relative timing (pause/resume, seeks) stays
-//! correct. If a later anchor lands more than [`FALLBACK_MAX_SKEW_NS`] away from "release on
-//! receipt", the offset is re-pinned, which bounds the error to that skew. The pinned offset is
-//! dropped as soon as an anchor maps through a locked timeline, so it never outlives the lock.
-//! Pacing stays real time either way.
+//! Anchors normally arrive already mapped to a local instant through the PTP follower
+//! ([`crate::net::ptp`]). An anchor on a timeline the follower is still **locking** (a fresh
+//! session-peer timeline without enough samples yet, typically right after a new grandmaster
+//! appears) is deferred: the RTSP handler answers at once, and the delivery thread holds release
+//! and re-maps the anchor every [`LOCK_POLL_NS`] until the timeline locks, for at most
+//! [`LOCK_WAIT_NS`] after receipt. When the follower cannot provide the mapping (ports owned by
+//! another PTP stack, no lock within the wait, or a timeline that is not a session peer) the
+//! reference receiver refuses the anchor; PlayOnAir plays anyway with the **unlocked
+//! fallback**: the first anchor on a timeline is mapped so its sample is released on receipt
+//! (`H = receipt + L`), and that sender-clock to local-clock offset is kept for later anchors on
+//! the same timeline so their relative timing (pause/resume, seeks) stays correct. If a later
+//! anchor lands more than [`FALLBACK_MAX_SKEW_NS`] away from "release on receipt", the offset is
+//! re-pinned, which bounds the error to that skew. The pinned offset is dropped as soon as an
+//! anchor maps through a locked timeline, so it never outlives the lock. Pacing stays real time
+//! either way.
 //!
 //! Packets are stored compressed (decrypted AAC) and decoded on the delivery thread at release,
 //! so 120 s of buffer costs a few MiB instead of tens of MiB of PCM.
@@ -60,7 +57,7 @@ use tracing::{debug, info, warn};
 
 use crate::codec::aac::{AacDecoder, AudioSsrc};
 use crate::error::{CodecError, NetworkError, ShairplayError};
-use crate::net::ptp::{PtpClock, TimelineMapping};
+use crate::net::ptp::{PtpMapper, TimelineMapping};
 use crate::raop::audio_pipeline::{NONCE_TRAIL_LEN, RTP_HEADER_LEN, decrypt_rtp_chacha};
 use crate::raop::{AudioCodec, AudioFormat, AudioHandler, AudioSession};
 use crate::util::mono_now_ns;
@@ -152,8 +149,7 @@ impl RtpExtender {
 /// When the sender wants the anchor sample presented.
 #[derive(Debug, Clone)]
 pub(crate) enum AnchorTime {
-    /// A local monotonic instant (no PTP timeline to follow).
-    #[cfg(test)]
+    /// Already mapped to a local monotonic instant through a locked PTP timeline.
     Local(u64),
     /// Network time the PTP follower could not map (unlocked fallback applies).
     Network {
@@ -162,16 +158,15 @@ pub(crate) enum AnchorTime {
         /// Network time in nanoseconds.
         ns: u64,
     },
-    /// Network time on a timeline the session's PTP follower tracks: mapped at once when locked,
-    /// on the delivery thread once it locks, or by the unlocked fallback after
-    /// [`LOCK_WAIT_NS`]. Playout keeps following the timeline after the anchor starts.
-    Ptp {
+    /// Network time on a timeline the follower is locking: mapped on the delivery thread once
+    /// it locks, or by the unlocked fallback after [`LOCK_WAIT_NS`].
+    Locking {
         /// `networkTimeTimelineID`.
         timeline_id: u64,
         /// Network time in nanoseconds.
         ns: u64,
-        /// The PTP follower.
-        clock: PtpClock,
+        /// The session's view of the follower.
+        mapper: PtpMapper,
     },
 }
 
@@ -239,22 +234,10 @@ struct Packet {
     payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct Anchor {
     rtp: u64,
-    /// Local instant of the anchor sample when it started; presentation falls back to it (plus
-    /// elapsed samples) while the followed timeline does not map.
     local_ns: i128,
-    /// PTP timeline the anchor was mapped through, re-mapped for every packet.
-    follow: Option<Follow>,
-}
-
-/// The anchor sample's network time on a PTP timeline, and the follower that maps it.
-#[derive(Debug, Clone)]
-struct Follow {
-    timeline_id: u64,
-    ns: u64,
-    clock: PtpClock,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -272,7 +255,7 @@ struct PendingAnchor {
     ns: u64,
     /// Local instant the anchor was received (fallback base and wait start).
     receipt_ns: u64,
-    clock: PtpClock,
+    mapper: PtpMapper,
 }
 
 /// A packet due for the host.
@@ -280,8 +263,6 @@ struct PendingAnchor {
 pub(crate) struct Released {
     /// RTP timestamp (32-bit wire value).
     pub(crate) rtp: u32,
-    /// Presentation time of the packet's first sample, nanoseconds on the [`crate::util::mono_now_ns`] clock.
-    pub(crate) presentation_ns: i128,
     ssrc: AudioSsrc,
     payload: Vec<u8>,
     /// First packet after an anchor start: fade in.
@@ -336,7 +317,7 @@ impl Playout {
     }
 
     fn samples_to_ns(&self, samples: i128) -> i128 {
-        samples_to_ns(samples, self.source_rate)
+        samples * NS_PER_SEC / i128::from(self.source_rate.max(1))
     }
 
     /// Advertised `Audio-Latency` in ns at the source rate.
@@ -349,6 +330,10 @@ impl Playout {
     fn release_lead_ns(&self) -> i128 {
         let latency = self.latency_ns();
         self.release_lead_ns.map_or(latency, |lead| lead.max(latency))
+    }
+
+    fn presentation_ns(&self, anchor: Anchor, rtp: u64) -> i128 {
+        anchor.local_ns + self.samples_to_ns(i128::from(rtp) - i128::from(anchor.rtp))
     }
 
     /// Queued audio duration (first packet start to last packet end).
@@ -411,35 +396,32 @@ impl Playout {
                 self.pending = None;
                 self.fade_next = true;
                 match time {
-                    #[cfg(test)]
                     AnchorTime::Local(local) => {
                         self.drop_fallback_pin();
-                        self.start(rtp, i128::from(local), None, now_ns);
+                        self.start(rtp, i128::from(local), now_ns);
                     }
                     AnchorTime::Network { timeline_id, ns } => {
                         let local_ns = self.fallback(timeline_id, ns, now_ns);
-                        self.start(rtp, local_ns, None, now_ns);
+                        self.start(rtp, local_ns, now_ns);
                     }
-                    AnchorTime::Ptp { timeline_id, ns, clock } => {
-                        let pending = PendingAnchor {
+                    AnchorTime::Locking {
+                        timeline_id,
+                        ns,
+                        mapper,
+                    } => {
+                        info!(
+                            anchor_rtp = rtp as u32,
+                            timeline_id = format_args!("{timeline_id:#018x}"),
+                            max_wait_ms = LOCK_WAIT_NS / 1_000_000,
+                            "PTP locking on the anchor timeline; playout deferred until lock"
+                        );
+                        self.pending = Some(PendingAnchor {
                             rtp,
                             timeline_id,
                             ns,
                             receipt_ns: now_ns,
-                            clock,
-                        };
-                        if matches!(pending.clock.map(timeline_id, ns, now_ns), TimelineMapping::Locking) {
-                            info!(
-                                anchor_rtp = rtp as u32,
-                                timeline_id = format_args!("{timeline_id:#018x}"),
-                                max_wait_ms = LOCK_WAIT_NS / 1_000_000,
-                                "PTP locking on the anchor timeline; playout deferred until lock"
-                            );
-                            self.pending = Some(pending);
-                        } else {
-                            // Locked now (or gone stale since the handler looked): resolve at once.
-                            let _ = self.resolve_pending(pending, now_ns);
-                        }
+                            mapper,
+                        });
                     }
                 }
             }
@@ -448,8 +430,8 @@ impl Playout {
         Ok(self.first_available())
     }
 
-    fn start(&mut self, rtp: u64, local_ns: i128, follow: Option<Follow>, now_ns: u64) {
-        self.anchor = Some(Anchor { rtp, local_ns, follow });
+    fn start(&mut self, rtp: u64, local_ns: i128, now_ns: u64) {
+        self.anchor = Some(Anchor { rtp, local_ns });
         info!(
             anchor_rtp = rtp as u32,
             lead_ms = (local_ns - i128::from(now_ns)) / 1_000_000,
@@ -474,16 +456,11 @@ impl Playout {
     fn resolve_pending(&mut self, pending: PendingAnchor, now_ns: u64) -> Option<u64> {
         let deadline = pending.receipt_ns.saturating_add(LOCK_WAIT_NS);
         let waited_ms = now_ns.saturating_sub(pending.receipt_ns) / 1_000_000;
-        let (local_ns, follow) = match pending.clock.map(pending.timeline_id, pending.ns, now_ns) {
+        let local_ns = match pending.mapper.map(pending.timeline_id, pending.ns, now_ns) {
             TimelineMapping::Locked(local) => {
-                debug!(waited_ms, "Anchor mapped through PTP");
+                debug!(waited_ms, "Deferred anchor mapped through PTP");
                 self.drop_fallback_pin();
-                let follow = Follow {
-                    timeline_id: pending.timeline_id,
-                    ns: pending.ns,
-                    clock: pending.clock,
-                };
-                (i128::from(local), Some(follow))
+                i128::from(local)
             }
             TimelineMapping::Locking if now_ns < deadline => {
                 self.pending = Some(pending);
@@ -491,10 +468,10 @@ impl Playout {
             }
             TimelineMapping::Locking | TimelineMapping::Unavailable => {
                 debug!(waited_ms, "PTP did not lock for the deferred anchor");
-                (self.fallback(pending.timeline_id, pending.ns, pending.receipt_ns), None)
+                self.fallback(pending.timeline_id, pending.ns, pending.receipt_ns)
             }
         };
-        self.start(pending.rtp, local_ns, follow, now_ns);
+        self.start(pending.rtp, local_ns, now_ns);
         None
     }
 
@@ -563,25 +540,23 @@ impl Playout {
         {
             return Poll::Wait(retry);
         }
-        let lead = self.release_lead_ns();
-        let rate = self.source_rate;
-        let Some(anchor) = self.anchor.as_ref() else {
+        let Some(anchor) = self.anchor else {
             return Poll::Idle;
         };
         let now = i128::from(now_ns);
+        let lead = self.release_lead_ns();
         let mut pruned = 0usize;
         let poll = loop {
             let Some((&rtp, _)) = self.queue.first_key_value() else {
                 break Poll::Idle;
             };
-            let presentation_ns = presentation_ns(anchor, rate, rtp, now_ns);
-            let end = presentation_ns + samples_to_ns(AAC_FRAME_SAMPLES, rate);
+            let end = self.presentation_ns(anchor, rtp.saturating_add(AAC_FRAME_SAMPLES as u64));
             if end <= now {
                 self.queue.pop_first();
                 pruned += 1;
                 continue;
             }
-            let release = presentation_ns - lead;
+            let release = self.presentation_ns(anchor, rtp) - lead;
             if release > now {
                 break Poll::Wait(u64::try_from(release).unwrap_or(u64::MAX));
             }
@@ -590,7 +565,6 @@ impl Playout {
             };
             break Poll::Release(Released {
                 rtp: rtp as u32,
-                presentation_ns,
                 ssrc: packet.ssrc,
                 payload: packet.payload,
                 fade_in: std::mem::take(&mut self.fade_next),
@@ -601,23 +575,6 @@ impl Playout {
         }
         poll
     }
-}
-
-fn samples_to_ns(samples: i128, rate: u32) -> i128 {
-    samples * NS_PER_SEC / i128::from(rate.max(1))
-}
-
-/// Local presentation instant of RTP `rtp` under `anchor` at `now_ns`: through the followed PTP
-/// timeline while it maps, else the anchor's local instant plus elapsed samples.
-fn presentation_ns(anchor: &Anchor, rate: u32, rtp: u64, now_ns: u64) -> i128 {
-    let elapsed = samples_to_ns(i128::from(rtp) - i128::from(anchor.rtp), rate);
-    if let Some(follow) = &anchor.follow
-        && let Ok(network_ns) = u64::try_from(i128::from(follow.ns) + elapsed)
-        && let TimelineMapping::Locked(local) = follow.clock.map(follow.timeline_id, network_ns, now_ns)
-    {
-        return i128::from(local);
-    }
-    anchor.local_ns + elapsed
 }
 
 /// Host notifications, delivered in order on the delivery thread.
@@ -986,10 +943,6 @@ impl Output {
         }
         self.fade.apply(&mut samples, usize::from(self.output_channels));
         if let Some(session) = self.session.as_mut() {
-            // Due time of this packet's first sample. The AAC decoder and the resampler add a
-            // small fixed delay after this instant; that delay is not compensated.
-            let due = crate::util::instant_from_mono_ns(packet.presentation_ns);
-            session.audio_due(due);
             session.audio_process(&samples);
         }
     }
@@ -1105,11 +1058,6 @@ mod tests {
             panic!("anchor packet due at presentation - latency");
         };
         assert_eq!(first.rtp, 5_000);
-        assert_eq!(
-            first.presentation_ns,
-            i128::from(anchor_at),
-            "anchor sample is due at the anchor"
-        );
         assert!(first.fade_in, "anchor start fades in");
         let second_release = first_release + frame_ns(u64::from(FRAME));
         assert!(matches!(p.poll(second_release - 1_000), Poll::Wait(_)));
@@ -1167,7 +1115,7 @@ mod tests {
             )),
         };
         p.set_rate(request, receipt).unwrap();
-        assert_eq!(p.anchor.as_ref().map(|a| a.local_ns), Some(i128::from(receipt + 2 * S)));
+        assert_eq!(p.anchor.map(|a| a.local_ns), Some(i128::from(receipt + 2 * S)));
         let mut burst = 0u32;
         while let Poll::Release(_) = p.poll(receipt) {
             burst += 1;
@@ -1446,43 +1394,15 @@ mod tests {
         clock.add_sample(GM, ptp_peer(), (rx_ns + PTP_OFFSET) as i64, rx_ns);
     }
 
-    /// A locked timeline maps the anchor at once, and playout keeps following it: when the
-    /// grandmaster's clock moves against the local one, later packets move with it instead of
-    /// staying on the local clock from anchor time.
-    #[test]
-    fn locked_anchor_follows_the_grandmaster() {
-        let mut p = Playout::new(LATENCY, None);
-        fill(&mut p, 1, 0, 400);
-        let clock = PtpClock::new();
-        for i in 0..4 {
-            sync_sample(&clock, S + i * 125_000_000);
-        }
-        let at = S + 500_000_000;
-        p.set_rate(ptp_anchor(0, PTP_OFFSET + 9 * S, &clock), at).unwrap();
-        assert!(p.pending.is_none(), "a locked timeline maps without deferral");
-        match p.poll(at) {
-            Poll::Wait(until) => assert_eq!(until, 7 * S, "presentation minus latency"),
-            other => panic!("expected the PTP-mapped wait, got {other:?}"),
-        }
-
-        // The grandmaster now reads 5 ms further ahead of the local clock.
-        let rx = 2 * S;
-        clock.add_sample(GM, ptp_peer(), (rx + PTP_OFFSET + 5_000_000) as i64, rx);
-        match p.poll(rx) {
-            Poll::Wait(until) => assert_eq!(until, 7 * S - 5_000_000, "playout follows the grandmaster"),
-            other => panic!("expected the re-mapped wait, got {other:?}"),
-        }
-    }
-
-    fn ptp_anchor(rtp: u32, ns: u64, clock: &PtpClock) -> SetRateRequest {
+    fn locking(rtp: u32, ns: u64, clock: &PtpClock) -> SetRateRequest {
         SetRateRequest {
             rate: 1,
             anchor: Some((
                 rtp,
-                AnchorTime::Ptp {
+                AnchorTime::Locking {
                     timeline_id: GM,
                     ns,
-                    clock: clock.clone(),
+                    mapper: PtpMapper::new(clock.clone(), vec![ptp_peer()]),
                 },
             )),
         }
@@ -1513,7 +1433,7 @@ mod tests {
         sync_sample(&clock, 6 * S);
         let at = 6 * S + 200_000_000;
         // The sender wants rtp 0 presented at local 9 s.
-        p.set_rate(ptp_anchor(0, PTP_OFFSET + 9 * S, &clock), at).unwrap();
+        p.set_rate(locking(0, PTP_OFFSET + 9 * S, &clock), at).unwrap();
         match p.poll(at) {
             Poll::Wait(until) => assert_eq!(until, at + LOCK_POLL_NS, "re-map soon"),
             other => panic!("expected the lock wait, got {other:?}"),
@@ -1545,7 +1465,7 @@ mod tests {
         sync_sample(&clock, S);
         let receipt = S + 100_000_000;
         let ns = PTP_OFFSET + 50 * S;
-        p.set_rate(ptp_anchor(0, ns, &clock), receipt).unwrap();
+        p.set_rate(locking(0, ns, &clock), receipt).unwrap();
         match p.poll(receipt) {
             Poll::Wait(until) => assert_eq!(until, receipt + LOCK_POLL_NS),
             other => panic!("expected the lock wait, got {other:?}"),

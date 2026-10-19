@@ -20,10 +20,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::sleep;
 
-use crate::audio::sync::{
-  ADJUST_SPACING, BodyToken, FrameOp, SyncTimeline, apply_frame_ops, budget_used, first_output_source_offset,
-  plan_block, since_after, source_frames,
-};
 use crate::audio::{
   FLAC_BLOCK_SIZE, LIVE_ARENA_BYTES, LiveFlacEncoder, PcmRing, continuous_wav_header, round_up_to_flac_blocks,
 };
@@ -38,8 +34,6 @@ use crate::error::{Error, Result};
 //    PCM when Cast GETs `/stream` after a LOAD or re-LOAD.
 // 2. The body bursts that queued PCM unpaced, up to `CAST_READ_AHEAD` ahead of wall clock;
 //    pacing then holds Cast at that lead in steady state.
-// A synced body (calibrated model, live FLAC) instead drops audio due inside
-// [`SYNC_START_LEAD`] and does not use this pace.
 // 3. Silence preroll only when the ring is empty at GET (a genuinely empty queue), so a body
 //    with nothing real to send still starts; it is never injected mid-stream.
 //
@@ -69,8 +63,6 @@ pub const CAST_READ_AHEAD: Duration = Duration::from_secs(8);
 const PACE_LATE_SLACK: Duration = Duration::from_millis(50);
 /// Minimum interval between ring-overflow drop log lines (hot path stays quiet).
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
-/// How far ahead stream frame 0 of a synced body must be due (PAUSED report and PLAY latency).
-const SYNC_START_LEAD: Duration = Duration::from_millis(1_000);
 /// Content-Length matches continuous WAV data size + 44-byte header (avoids chunked TE).
 pub(crate) const LIVE_CONTENT_LENGTH: u64 = (u32::MAX / 2) as u64 + 44;
 
@@ -795,18 +787,25 @@ fn live_flac_byte_stream(
   bytes_served: Arc<AtomicU64>,
   last_body_write: Arc<RwLock<Option<Instant>>>,
 ) -> impl stream::Stream<Item = std::result::Result<Bytes, Infallible>> + Send {
-  let initial = begin_live_flac(
+  let ch = channels.max(1);
+  let initial = LiveFlacState {
     ring,
-    channels,
-    sample_rate,
-    header,
-    preroll_frames,
+    header: Some(header),
+    preroll_frames_left: preroll_frames,
+    i16_buf: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
     encoder,
+    channels: ch,
+    sample_rate: sample_rate.max(1),
     live_generation,
     generation,
+    bytes_sent: 0,
+    frames_emitted: 0,
+    pace_origin: None,
     bytes_served,
     last_body_write,
-  );
+    last_drop_log: None,
+    last_drops_seen: 0,
+  };
 
   stream::unfold(initial, |mut live| async move {
     if live.is_superseded() {
@@ -824,17 +823,9 @@ fn live_flac_byte_stream(
       let samples = n.saturating_mul(usize::from(live.channels));
       live.i16_buf.clear();
       live.i16_buf.resize(samples, 0);
-      if let (Some(body_timeline), Some(token)) = (&live.timeline, live.body) {
-        body_timeline.note_preroll(token, u64::try_from(n).unwrap_or(0));
-      }
       // Preroll silence does not sleep; it counts toward frames_emitted (it is played).
       match live.encode_current_i16_buf() {
-        Ok(chunk) => {
-          if live.timeline.is_some() {
-            live.remember_last_frame();
-          }
-          return Some(live.emit_chunk(chunk, n));
-        },
+        Ok(chunk) => return Some(live.emit_chunk(chunk, n)),
         Err(err) => {
           tracing::error!(error = %err, generation = live.generation, "LiveFlac preroll encode failed");
           return None;
@@ -848,17 +839,6 @@ fn live_flac_byte_stream(
         return None;
       }
       live.maybe_log_ring_drops();
-
-      if live.timeline.is_some() {
-        match live.pull_sync_block() {
-          SyncPull::Chunk(chunk) => return Some(live.emit_chunk(chunk, FLAC_BLOCK_SIZE)),
-          SyncPull::Wait => {
-            sleep(LIVE_UNDERRUN_SLEEP).await;
-            continue;
-          },
-          SyncPull::Stop => return None,
-        }
-      }
 
       // Steady state: wait for a full FLAC block of real PCM (no short mid-stream frames).
       if live.ring.available_frames() < FLAC_BLOCK_SIZE {
@@ -906,50 +886,6 @@ fn live_flac_byte_stream(
   })
 }
 
-#[expect(
-  clippy::too_many_arguments,
-  reason = "stream state is assembled once; splitting would obscure the data path"
-)]
-fn begin_live_flac(
-  ring: Arc<PcmRing>,
-  channels: u16,
-  sample_rate: u32,
-  header: Bytes,
-  preroll_frames: usize,
-  encoder: LiveFlacEncoder,
-  live_generation: Arc<AtomicU64>,
-  generation: u64,
-  bytes_served: Arc<AtomicU64>,
-  last_body_write: Arc<RwLock<Option<Instant>>>,
-) -> LiveFlacState {
-  let ch = channels.max(1);
-  let timeline = ring.sync_timeline();
-  let body = timeline.as_ref().map(|active| active.begin_body());
-  LiveFlacState {
-    ring,
-    header: Some(header),
-    preroll_frames_left: preroll_frames,
-    i16_buf: Vec::with_capacity(FLAC_BLOCK_SIZE.saturating_mul(usize::from(ch))),
-    encoder,
-    channels: ch,
-    sample_rate: sample_rate.max(1),
-    live_generation,
-    generation,
-    bytes_sent: 0,
-    frames_emitted: 0,
-    pace_origin: None,
-    bytes_served,
-    last_body_write,
-    last_drop_log: None,
-    last_drops_seen: 0,
-    timeline,
-    body,
-    frames_since_adjust: ADJUST_SPACING,
-    last_due: None,
-    last_frame: Vec::new(),
-  }
-}
-
 struct LiveFlacState {
   ring: Arc<PcmRing>,
   header: Option<Bytes>,
@@ -969,25 +905,6 @@ struct LiveFlacState {
   last_body_write: Arc<RwLock<Option<Instant>>>,
   last_drop_log: Option<Instant>,
   last_drops_seen: u64,
-  /// Present only for a synced Cast session. The default path leaves this empty.
-  timeline: Option<Arc<SyncTimeline>>,
-  body: Option<BodyToken>,
-  /// Output frames since the last drop or duplicate.
-  frames_since_adjust: u32,
-  last_due: Option<Instant>,
-  /// Last encoded frame, so a duplicate at the start of the next block has a seed.
-  last_frame: Vec<i16>,
-}
-
-enum SyncPull {
-  Chunk(Bytes),
-  Wait,
-  Stop,
-}
-
-enum SyncSource {
-  Short,
-  Ready(Option<u64>),
 }
 
 impl LiveFlacState {
@@ -1044,163 +961,8 @@ impl LiveFlacState {
     if pcm_frames > 0 {
       self.frames_emitted = self.frames_emitted.saturating_add(u64::try_from(pcm_frames).unwrap_or(0));
     }
-    if let (Some(timeline), Some(token)) = (&self.timeline, self.body) {
-      timeline.note_emitted(token, self.frames_emitted);
-    }
     (Ok(chunk), self)
   }
-
-  /// One synced FLAC block: consume queued nudges, map the block's due time, encode.
-  fn pull_sync_block(&mut self) -> SyncPull {
-    let Some(timeline) = self.timeline.as_ref().map(Arc::clone) else {
-      return SyncPull::Stop;
-    };
-    let Some(token) = self.body else {
-      return SyncPull::Stop;
-    };
-    if self.is_superseded() || !timeline.accepts(token) {
-      return SyncPull::Stop;
-    }
-    if !timeline.real_started() {
-      self.skip_to_start_lead();
-    }
-    let queued = timeline.take_queued();
-    let ops = plan_block(FLAC_BLOCK_SIZE, self.frames_since_adjust, queued);
-    let used = budget_used(&ops);
-    timeline.restore(queued.saturating_sub(used));
-    if !self.sync_source_ready(&timeline, token, &ops, used) {
-      return if self.is_superseded() || !timeline.accepts(token) {
-        SyncPull::Stop
-      } else {
-        SyncPull::Wait
-      };
-    }
-    let SyncSource::Ready(start) = self.pop_sync_source(source_frames(&ops)) else {
-      timeline.restore(used);
-      return SyncPull::Wait;
-    };
-    let Some(output) = apply_frame_ops(&self.i16_buf, usize::from(self.channels), &ops, &self.last_frame) else {
-      timeline.restore(used);
-      tracing::warn!(generation = self.generation, "sync FLAC block apply failed");
-      return SyncPull::Stop;
-    };
-    let expect = FLAC_BLOCK_SIZE.saturating_mul(usize::from(self.channels));
-    if output.len() != expect {
-      timeline.restore(used);
-      tracing::warn!(
-        generation = self.generation,
-        len = output.len(),
-        "sync FLAC block length mismatch"
-      );
-      return SyncPull::Stop;
-    }
-    self.i16_buf = output;
-    self.finish_sync_block(&timeline, token, &ops, start);
-    match self.encode_current_i16_buf() {
-      Ok(chunk) => SyncPull::Chunk(chunk),
-      Err(err) => {
-        tracing::error!(error = %err, generation = self.generation, "LiveFlac frame encode failed");
-        SyncPull::Stop
-      },
-    }
-  }
-
-  /// Before stream frame 0 is fixed, drop ring audio due sooner than [`SYNC_START_LEAD`]:
-  /// the PAUSED report and the PLAY latency have to fit before frame 0 is due.
-  /// Apple receivers prune audio already behind their playhead the same way.
-  fn skip_to_start_lead(&mut self) {
-    let target = Instant::now() + SYNC_START_LEAD;
-    let skipped = discard_audio_due_before(&self.ring, target, self.sample_rate, &mut self.i16_buf);
-    if skipped > 0 {
-      tracing::info!(generation = self.generation, skipped, "sync start skipped audio due too soon");
-    }
-  }
-
-  fn sync_source_ready(&self, timeline: &SyncTimeline, token: BodyToken, ops: &[FrameOp], used: i64) -> bool {
-    let need = source_frames(ops);
-    if self.ring.available_frames() >= need && !self.is_superseded() && timeline.accepts(token) {
-      true
-    } else {
-      timeline.restore(used);
-      false
-    }
-  }
-
-  /// [`SyncSource::Short`] when the ring underran. `Ready(None)` is a duplicate-only block.
-  fn pop_sync_source(&mut self, need: usize) -> SyncSource {
-    if need == 0 {
-      self.i16_buf.clear();
-      return SyncSource::Ready(None);
-    }
-    let (got, start) = self.ring.pop_i16_indexed(need, &mut self.i16_buf);
-    if got < need {
-      tracing::debug!(got, need, generation = self.generation, "sync FLAC short pop");
-      SyncSource::Short
-    } else {
-      SyncSource::Ready(start)
-    }
-  }
-
-  fn finish_sync_block(&mut self, timeline: &SyncTimeline, token: BodyToken, ops: &[FrameOp], start: Option<u64>) {
-    let batch = adjust_batch(self.frames_emitted, ops);
-    timeline.record_applied(token, &batch);
-    let source = start.and_then(|index| {
-      first_output_source_offset(ops).map(|off| index.saturating_add(u64::try_from(off).unwrap_or(0)))
-    });
-    let due = source.and_then(|index| self.ring.due_of(index)).or(self.last_due);
-    if let Some(presentation) = due {
-      timeline.note_real(token, self.frames_emitted, presentation);
-      self.last_due = Some(presentation);
-    }
-    self.frames_since_adjust = since_after(self.frames_since_adjust, ops);
-    self.remember_last_frame();
-  }
-
-  fn remember_last_frame(&mut self) {
-    let width = usize::from(self.channels).max(1);
-    let Some(start) = self.i16_buf.len().checked_sub(width) else {
-      return;
-    };
-    let Some(frame) = self.i16_buf.get(start..) else {
-      return;
-    };
-    self.last_frame.clear();
-    self.last_frame.extend_from_slice(frame);
-  }
-}
-
-/// Drop ring frames whose presentation time is strictly before `target`. Returns frames dropped.
-fn discard_audio_due_before(ring: &PcmRing, target: Instant, sample_rate: u32, scratch: &mut Vec<i16>) -> usize {
-  let rate = u128::from(sample_rate.max(1));
-  let mut skipped = 0_usize;
-  while let Some(due) = ring.head_index().and_then(|head| ring.due_of(head))
-    && due < target
-  {
-    let behind = target.saturating_duration_since(due).as_nanos().saturating_mul(rate) / 1_000_000_000;
-    let want = usize::try_from(behind).unwrap_or(usize::MAX).clamp(1, FLAC_BLOCK_SIZE * 16);
-    let popped = ring.pop_i16(want, scratch);
-    if popped == 0 {
-      break;
-    }
-    skipped = skipped.saturating_add(popped);
-  }
-  skipped
-}
-
-fn adjust_batch(stream_frame: u64, ops: &[FrameOp]) -> Vec<(u64, i8)> {
-  let mut out_at = stream_frame;
-  let mut batch = Vec::new();
-  for op in ops {
-    match *op {
-      FrameOp::Drop => batch.push((out_at, 1)),
-      FrameOp::Dup => {
-        batch.push((out_at, -1));
-        out_at = out_at.saturating_add(1);
-      },
-      FrameOp::Copy(n) => out_at = out_at.saturating_add(u64::try_from(n).unwrap_or(0)),
-    }
-  }
-  batch
 }
 
 struct LiveStreamState {
@@ -1416,26 +1178,6 @@ fn pace_plan(
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn start_lead_skips_audio_due_inside_one_second_and_keeps_the_rest() {
-    let ring = PcmRing::new(1, 80_000);
-    ring.enable_due_tracking(48_000);
-    let now = Instant::now();
-    let chunk = 4_800_usize;
-    for step in 0..15_u64 {
-      let due = now + Duration::from_millis(step * 100);
-      ring.push_f32_at(&vec![0.0; chunk], due);
-    }
-    let target = now + SYNC_START_LEAD;
-    let skipped = discard_audio_due_before(&ring, target, 48_000, &mut Vec::new());
-    assert_eq!(skipped, 10 * chunk, "audio due before the 1 s lead is dropped");
-    let head = ring.head_index().expect("head");
-    let due = ring.due_of(head).expect("due");
-    assert!(due >= target, "the first kept frame is due at or after the lead");
-    assert!(due.saturating_duration_since(target) < Duration::from_millis(5));
-    assert_eq!(discard_audio_due_before(&ring, target, 48_000, &mut Vec::new()), 0);
-  }
 
   #[test]
   fn live_body_threshold_is_full_content_length() {

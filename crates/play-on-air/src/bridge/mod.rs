@@ -41,7 +41,6 @@ mod remote;
 mod stall;
 mod start;
 mod state;
-mod sync;
 mod teardown;
 #[cfg(test)]
 mod test_support;

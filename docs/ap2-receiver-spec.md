@@ -677,6 +677,9 @@ scenario and confirm it emits `dvlc` after sender-driven changes.
 ## 7. Multi-room sync
 
 How Apple keeps several receivers in step, and what a Cast-backed receiver can reproduce.
+PlayOnAir does not time Cast speakers to the AirPlay timeline: a group that mixes PlayOnAir
+speakers with Apple receivers plays out of sync. The prototype and the 0.4.0 release below did,
+and 0.4.1 reverted it (see "Outcome").
 
 ### Sender: one anchor for the whole group
 
@@ -840,8 +843,8 @@ microphone's own clock.
   that clock against the grandmaster; Apple's receivers slave their timebase to PTP continuously.
 - The first start fell back to the unlocked anchor. The iPhone's `timingPeerList` lists the Mac's
   stable addresses, but the Mac sends PTP from its temporary IPv6 address, and the follower only
-  mapped timelines whose source address is a listed peer. PlayOnAir now matches the timeline by
-  the clock identity the sender names in SETRATEANCHORTIME.
+  mapped timelines whose source address is a listed peer. The 0.4.0 follower matched the timeline
+  by the clock identity the sender names in SETRATEANCHORTIME; 0.4.1 reverted it.
 - The Cast speaker joins about 2 s after the Apple receiver: the start skips audio due within the
   next 2 s, and the speaker plays its Cast session chime at the same time.
 - By ear, the Edifier run never sounded together: the Mac's click came 89 ms after the Cast one
@@ -851,13 +854,13 @@ microphone's own clock.
   The Cast speaker is on the AirPlay timeline; an Apple receiver is only as close to it as its
   output device's reported latency is to the real one.
 
-### Shipping behavior and calibration
+### 0.4.0 behavior and calibration (reverted in 0.4.1)
 
-PlayOnAir times every session whose Cast model is in its table (`Nest Audio`, `Google Nest Mini`,
+0.4.0 timed every session whose Cast model was in its table (`Nest Audio`, `Google Nest Mini`,
 exact `md` strings) on live FLAC: LOAD with `autoplay: false`, skip audio due within 1 s, PLAY at
 stream frame 0's due time minus the PLAY delay, then the 1 s drift loop. Other models, Google
-Home speaker groups and the WAV fallback keep the unsynced 8 s read-ahead path. Playout re-maps
-every packet through the locked PTP timeline instead of the anchor-time offset, which removes the
+Home speaker groups and the WAV fallback kept the unsynced 8 s read-ahead path. Playout re-mapped
+every packet through the locked PTP timeline instead of the anchor-time offset, which removed the
 slow wander above.
 
 Calibration runs: iPhone sender, this Mac's AirPlay Receiver out its built-in speakers (16.1 ms
@@ -876,9 +879,24 @@ over 25 ms, so picking a single peak jumps between them.
   10 ms for the Nest Audio), so its error wanders more within a session.
 - In a multi-select group of several PlayOnAir speakers, multizone moves the session to a group
   endpoint hosted on one of the speakers. Its `currentTime` is offset differently: with the
-  owner's calibration the Nest Mini drifted to about +350 ms. Drift correction therefore pauses
-  while a group endpoint hosts the session; the members stay together through multizone but are
-  not aligned with Apple receivers in the same AirPlay group.
+  owner's calibration the Nest Mini drifted to about +350 ms. 0.4.0 therefore paused drift
+  correction while a group endpoint hosted the session; the members stayed together through
+  multizone but were not aligned with Apple receivers in the same AirPlay group.
+
+### Outcome
+
+0.4.1 reverts the 0.4.0 sync code; playback is identical to 0.3.0.
+
+- A timed start replaces the 8 s burst on every Cast LOAD: the speaker loads paused and is fed in
+  real time, so after a skip or seek it buffers from nearly empty before PLAY. On Nest Minis this
+  brought back the slow skips the 0.3.0 burst had removed. Any future timing work keeps the burst
+  and controls only when PLAY fires.
+- Several PlayOnAir speakers selected together (multizone) paid the timed-start cost with drift
+  correction paused, so they gained nothing.
+- The sync helps only groups that mix Cast and Apple speakers; Cast-only and Apple-only groups
+  were already in step.
+- Found while testing and unverified on 0.3.0: a Cast re-LOAD after a flush and resume with about
+  1 s queued stayed in BUFFERING, and a track of pure digital silence stalled the Cast buffer.
 
 ## Open questions
 

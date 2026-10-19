@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Process-local epoch for [`mono_now_ns`]. Fixed at first call.
 static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -14,21 +14,6 @@ static MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 pub fn mono_now_ns() -> u64 {
     let epoch = MONO_EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_nanos() as u64
-}
-
-/// `MONO_EPOCH + ns`, the same clock as [`mono_now_ns`].
-///
-/// Negative `ns` lands before the epoch. Values that do not fit in a [`Duration`]
-/// saturate at the epoch.
-pub(crate) fn instant_from_mono_ns(ns: i128) -> Instant {
-    let epoch = *MONO_EPOCH.get_or_init(Instant::now);
-    if ns >= 0 {
-        let step = Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX));
-        epoch.checked_add(step).unwrap_or(epoch)
-    } else {
-        let abs = u64::try_from(ns.saturating_neg()).unwrap_or(u64::MAX);
-        epoch.checked_sub(Duration::from_nanos(abs)).unwrap_or(epoch)
-    }
 }
 
 /// Format a hardware address for RAOP service name: "AABBCCDDEEFF" (uppercase hex, no separators).
