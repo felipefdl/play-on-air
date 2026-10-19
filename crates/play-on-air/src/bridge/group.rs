@@ -808,8 +808,7 @@ mod tests {
   use tokio::task::JoinHandle;
 
   use crate::bridge::RingLookup;
-  use crate::bridge::start::PREBUFFER_FRAMES;
-  use crate::bridge::test_support::{CastCall, FakeCast, SwapRingLookup, test_device};
+  use crate::bridge::test_support::{CastCall, FakeCast, SwapRingLookup, started_ring, test_device};
   use crate::cast::{CastControl, MultizoneMember, PlaybackSessionUpdate};
   use crate::registry::DeviceRegistry;
 
@@ -844,10 +843,9 @@ mod tests {
       Self { bridge, cast, rings, events, run }
     }
 
-    /// A receiver's AirPlay stream of the multi-select starts (ring prefilled past the prebuffer).
+    /// A receiver's AirPlay stream of the multi-select starts (ring holds the start lead).
     fn airplay_start(&self, device_id: &str) -> Arc<PcmRing> {
-      let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 8));
-      ring.push_f32(&vec![0.01; PREBUFFER_FRAMES * 2]);
+      let ring = started_ring();
       self.rings.set(device_id, Some(Arc::clone(&ring)));
       self.send(AirPlaySessionEvent::Started {
         device_id: device_id.to_owned(),
@@ -1197,9 +1195,10 @@ mod tests {
     let _ring_a = h.airplay_start(A);
     h.wait_for("owner Playing", |it| it.playing_owner(A)).await;
     let ring_b = h.airplay_start(B);
-    // The sender keeps streaming: the drained ring refills once B stops following.
+    // The sender keeps streaming (about 5x real time, as an iPhone does after a skip): the
+    // drained ring refills to the start lead once B stops following.
     h.wait_for("standalone LOAD", |it| {
-      ring_b.push_f32(&[0.01; 512]);
+      ring_b.push_f32(&[0.01; 4_800]);
       it.cast.calls().contains(&CastCall::Load(B.to_owned()))
     })
     .await;
@@ -1220,9 +1219,10 @@ mod tests {
     let _ring_a = h.airplay_start(A);
     h.wait_for("owner Playing", |it| it.playing_owner(A)).await;
     let ring_b = h.airplay_start(B);
-    // The sender keeps streaming: the drained ring refills once B stops following.
+    // The sender keeps streaming (about 5x real time, as an iPhone does after a skip): the
+    // drained ring refills to the start lead once B stops following.
     h.wait_for("standalone LOAD", |it| {
-      ring_b.push_f32(&[0.01; 512]);
+      ring_b.push_f32(&[0.01; 4_800]);
       it.cast.calls().contains(&CastCall::Load(B.to_owned()))
     })
     .await;
@@ -1233,8 +1233,7 @@ mod tests {
   #[tokio::test]
   async fn single_receiver_streams_never_touch_multizone() {
     let h = Harness::start();
-    let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 8));
-    ring.push_f32(&vec![0.01; PREBUFFER_FRAMES * 2]);
+    let ring = started_ring();
     h.rings.set(A, Some(Arc::clone(&ring)));
     h.send(AirPlaySessionEvent::Started {
       device_id: A.to_owned(),

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.3
+
+- Fix: **skipping tracks no longer leaves a 10 s gap.** After a skip the Cast speaker was re-LOADed as soon as the new track's first audio arrived, often with under a second queued; a Nest speaker then plays half a second, runs dry and buffers about 10 s. Meanwhile the old stream kept handing the new track's audio to the speaker's stale, paused media, so the queue shrank with every skip. This was worst when PlayOnAir cannot open the AirPlay clock ports (for example in Docker next to another PTP user). Each skip now ends the old stream, and every Cast load waits until about 6 s of audio is queued (at most 6 s). From an iPhone a skip starts in about half a second.
+
 ## 0.4.2
 
 - Fix: **digital silence no longer stalls a Cast speaker.** FLAC coded a silent stretch in a few bytes per second, and a Cast speaker waits for about 32 KB before it plays, so a silent intro or more than about 8 s of silence in a track (a silent tail, a hidden track, an app streaming silence) left it buffering. PlayOnAir then re-LOADed it, could switch the speaker to WAV until restart, and the music came back late. Silence now streams at about 100 kbit/s; the audio is unchanged.

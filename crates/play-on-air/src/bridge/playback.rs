@@ -404,6 +404,8 @@ impl Bridge {
     let generation = *live_gen;
     session.flush_reload_requested = session.flush_reload_requested.saturating_add(1);
     let request = session.flush_reload_requested;
+    // The old body would hand the new track's audio to Cast's stale, paused media.
+    session.media.end_live_bodies();
     drop(devices);
     tracing::info!(%device_id, generation, request, "AirPlay flushed; re-LOAD owed to the next resume");
   }
@@ -430,8 +432,9 @@ mod tests {
 
   use crate::audio::PcmRing;
   use crate::bridge::load::ReloadOutcome;
+  use crate::bridge::start::CAST_START_LEAD;
   use crate::bridge::teardown::{TeardownCastPolicy, teardown_playing};
-  use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, test_playing_session};
+  use crate::bridge::test_support::{CastCall, FakeCast, insert_playing, started_ring, test_playing_session};
   use crate::media::MediaServer;
   use crate::registry::DeviceRegistry;
 
@@ -445,7 +448,7 @@ mod tests {
       &bridge,
       device_id,
       1,
-      test_playing_session(media, device_id, pool, Arc::new(PcmRing::new(2, 64))),
+      test_playing_session(media, device_id, pool, started_ring()),
     );
     (bridge, fake)
   }
@@ -578,6 +581,36 @@ mod tests {
       assert!(!session.flush_reload_owed(), "the re-LOAD covered the flush");
     });
     bridge.handle_session_end("dev-skip").await;
+  }
+
+  /// Live log: after a skip the sender had 0.8 s of the new track queued when it resumed, the
+  /// re-LOAD went out at once, and the Nest Audio played half a second then buffered ~10 s. The
+  /// re-LOAD now waits for the start lead and goes out as soon as the sender delivers it.
+  #[tokio::test]
+  async fn skip_reload_waits_for_the_start_lead() {
+    let (bridge, fake) = fake_bridge("dev-lead").await;
+    let ring = with_session(&bridge, "dev-lead", |session| Arc::clone(&session.ring));
+    let frames = |secs: f64| vec![0.01_f32; (secs * 48_000.0) as usize * 2];
+
+    bridge.handle_flush("dev-lead");
+    bridge.handle_pause("dev-lead", Instant::now());
+    ring.clear();
+    ring.push_f32(&frames(0.8));
+    bridge.handle_resume("dev-lead");
+    sleep(Duration::from_millis(400)).await;
+    assert!(
+      !fake.calls().contains(&CastCall::Load("dev-lead".to_owned())),
+      "no re-LOAD on 0.8 s queued"
+    );
+
+    ring.push_f32(&frames(CAST_START_LEAD.as_secs_f64() - 0.8));
+    let delivered = Instant::now();
+    wait_until("re-LOAD", &fake, |calls| calls.contains(&CastCall::Load("dev-lead".to_owned()))).await;
+    assert!(
+      delivered.elapsed() < Duration::from_millis(300),
+      "re-LOAD as soon as the lead is queued"
+    );
+    bridge.handle_session_end("dev-lead").await;
   }
 
   /// Skip while paused (and resumed much later): the flush stays owed, so the resume re-LOADs

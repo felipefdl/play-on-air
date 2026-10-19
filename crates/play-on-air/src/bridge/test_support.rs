@@ -8,10 +8,20 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use crate::audio::PcmRing;
+use crate::bridge::start::CAST_START_LEAD;
 use crate::bridge::state::{CastRoute, DeviceState, EgressKind, PlayingSession, SessionTasks};
 use crate::bridge::{Bridge, RingLookup};
 use crate::cast::CastControl;
 use crate::media::MediaServerHandle;
+
+/// Stereo 48 kHz ring of an AirPlay stream whose sender has sent ahead: it already holds
+/// [`CAST_START_LEAD`], so a LOAD starts at once (an empty ring waits out the start-lead cap).
+pub(super) fn started_ring() -> Arc<PcmRing> {
+  let lead_frames = 48_000 * usize::try_from(CAST_START_LEAD.as_secs()).expect("lead secs");
+  let ring = Arc::new(PcmRing::new(2, lead_frames * 2));
+  ring.push_f32(&vec![0.01; lead_frames * 2]);
+  ring
+}
 
 /// Minimal playing session for teardown / pause tests (no live Cast worker).
 pub(super) fn test_playing_session(
