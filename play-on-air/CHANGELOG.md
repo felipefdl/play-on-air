@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2
+
+- Fix: **digital silence no longer stalls a Cast speaker.** FLAC coded a silent stretch in a few bytes per second, and a Cast speaker waits for about 32 KB before it plays, so a silent intro or more than about 8 s of silence in a track (a silent tail, a hidden track, an app streaming silence) left it buffering. PlayOnAir then re-LOADed it, could switch the speaker to WAV until restart, and the music came back late. Silence now streams at about 100 kbit/s; the audio is unchanged.
+
 ## 0.4.1
 
 - **Reverts 0.4.0: playback is identical to 0.3.0.** The timed start in 0.4.0 replaced the 8 s burst on every Cast load for Nest Audio and Google Nest Mini, which made skips and seeks slow again, and it gave nothing to Google-only or Apple-only groups. Every speaker is back on the 0.3.0 path.
