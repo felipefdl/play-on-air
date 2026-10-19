@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1
+
+- **Reverts 0.4.0: playback is identical to 0.3.0.** The timed start in 0.4.0 replaced the 8 s burst on every Cast load for Nest Audio and Google Nest Mini, which made skips and seeks slow again, and it gave nothing to Google-only or Apple-only groups. Every speaker is back on the 0.3.0 path.
+- Group PlayOnAir speakers only with other PlayOnAir speakers, or Apple speakers only with Apple speakers: a group that mixes them plays out of sync.
+
+## 0.4.0
+
+- **Nest Audio and Google Nest Mini play in step with HomePods and other AirPlay 2 speakers** selected in the same AirPlay group: the speaker loads paused, starts at the AirPlay presentation time, and a once-a-second loop drops or repeats single samples to hold it there. Measured within about 3 ms of an Apple receiver. A synced speaker joins about 1 s after the others (it skips that audio). Other Cast models, Google Home speaker groups, and several PlayOnAir speakers selected together keep the previous timing.
+- **Playout follows the AirPlay clock continuously**: every packet is re-mapped through the locked PTP timeline instead of the offset taken when playback started.
+- Fix: a Mac in the AirPlay group no longer forces the unlocked timing fallback. The Mac sends PTP from a temporary IPv6 address the iPhone does not list as a peer; timelines now match by the clock identity the sender names.
+
 ## 0.3.0
 
 - **Picking several PlayOnAir speakers on the iPhone plays them in sync**: the first speaker loads and the others join its Cast session through Google's multizone, so Google keeps them aligned. Volume stays per speaker; removing any speaker keeps the rest playing.

@@ -12,8 +12,9 @@ as references so the findings can be re-checked.
 |---|---|
 | Live receiver on this Mac | ControlCenter on `127.0.0.1:7000`, `Server: AirTunes/980.77.5`, macOS 27.0.1 (26A434), model Mac16,8 |
 | Live receivers on the LAN | Apple TV 4K (AppleTV14,1, `AirTunes/980.77.2`, tvOS build 24J361); Sonos Era 100 (`AirTunes/366.0`, `sdk: AirPlay;2.7.1`, Apple's licensed receiver SDK) |
-| Binaries (arm64e, extracted from the dyld shared cache) | `AirPlayReceiver` (sha256 prefix `aceec85bae680346`), `AirPlaySupport` (`986cea3aa6ce4604`), `TimeSync` (`48a6f2c59b0f41fe`) |
-| Tools | `rea` 6.5.0 with the Ghidra 12.1.4 provider, `ipsw dyld disass` (symbolicated), `strings`, `nm`, a capstone ADRP/ADD cross-reference scan |
+| Binaries (arm64e, extracted from the dyld shared cache) | `AirPlayReceiver` (sha256 prefix `aceec85bae680346`), `AirPlaySupport` (`986cea3aa6ce4604`), `TimeSync` (`48a6f2c59b0f41fe`), `AirPlaySender` (`11b536177f42c917`, section 7) |
+| Tools | `rea` 6.5.0 (6.7.0 for section 7) with the Ghidra 12.1.4 provider, `ipsw dyld disass` (symbolicated), `strings`, `nm`, a capstone ADRP/ADD cross-reference scan |
+| Cast speakers (section 7) | Gym speaker (Nest Audio) and Pool Bathroom speaker (Google Nest Mini), Default Media Receiver, measured with a USB microphone on this Mac |
 
 Addresses below are virtual addresses inside the shared cache image of the named framework.
 Local symbols are present in this cache, so most functions are named; a few were inlined and are
@@ -109,7 +110,7 @@ Receiver-chosen anchor: when the request's host time cannot be used, the engine 
 branch, converts the media time to host time through the synchronizer, then host time to network
 time, and returns that as `renderStartNetworkTime*` (log `Anchored receiver TimingShim timebase:
 media=%.6f at PTP=%.6f`). Preference key `hoseSBARSupportsReceiverChoosesAnchor` gates this mode.
-Confidence: Medium (branch read; the exact sender condition that triggers it is not settled).
+Confidence: Medium (branch read). The sender only asks for it with a single receiver (section 7).
 
 Classic path (`APReceiverAudioSessionBufferedSetRateAndAnchorTime`, `0x22a003f58`): on rate 1 it
 first requires the clock to be locked (log `Cannot SetRateAndAnchorTime; IsLocked: NO.`), converts
@@ -673,12 +674,236 @@ Rule 2 is the untested part. To settle: run the multi-select switch with rule 2 
 that the constant stops; or capture the event channel of an Apple TV in the same multi-select
 scenario and confirm it emits `dvlc` after sender-driven changes.
 
+## 7. Multi-room sync
+
+How Apple keeps several receivers in step, and what a Cast-backed receiver can reproduce.
+PlayOnAir does not time Cast speakers to the AirPlay timeline: a group that mixes PlayOnAir
+speakers with Apple receivers plays out of sync. The prototype and the 0.4.0 release below did,
+and 0.4.1 reverted it (see "Outcome").
+
+### Sender: one anchor for the whole group
+
+- `bufferedAudioEngine_handleSetRateToOne` (AirPlaySender `0x1c88f67e4`) builds one anchor and
+  `bufferedAudioEngine_handleSetRateToOne_sendAnchorToAllHoses` (`0x1c88f7760`) sends the same
+  SETRATEANCHORTIME to every receiver. The anchor's media time is the first media time minus a
+  startup delay from `bufferedAudioEngine_getStartUpDelay` (`0x1c881ef80`): 400 ms (750 ms out of
+  pause), 300 ms / 600 ms with the priming optimization, 200 ms when the sender also plays locally,
+  or the `bufferedStartUpDelayMS` preference. Confidence: High.
+- The buffered adapter moves the host anchor earlier by `audioLatency - audioLatencyAdjust`
+  (`audioEngineBufferedAdapter_SetRateAndAnchorTime_Stage1`, `0x1c886cbd4`). Defaults come from
+  the sender's own settings: 2000 ms (`APSAudioLatencyForAVMs`, AirPlaySupport `0x1b8507418`) and
+  -250 ms (`APSAudioLatencyAdjustForAVMs`, `0x1b8507938`), so 2.25 s. Confidence: High.
+- No receiver value moves the group anchor or delays the other receivers. On this path the sender
+  reads only `SupportsReceiverChoosesAnchor` and `ClusterType` from a receiver. `audioLatencies` and
+  `outputLatencyMicros` appear in none of the three binaries. Confidence: High.
+- Receiver-chosen anchor: `bufferedAudioEngine_shouldUseReceiverChoosesAnchor` (`0x1c88f63ec`)
+  requires a buffered (not real-time) engine, exactly one receiver, no `ClusterType`, and
+  `SupportsReceiverChoosesAnchor`. The sender then sends GETANCHOR and starts its timebase on the
+  receiver's answer (`bufferedAudioEngine_startRemoteMediaTimebaseWithReceiverAnchor`,
+  `0x1c88f8e64`), retrying up to 50 failures. A group never uses it. Confidence: High.
+
+### Receiver: output latency and drift
+
+- Output latency, classic path: `__MainAudioEnsureSetup` (`0x229ffa9dc`) sums the output device's
+  `kAudioDevicePropertyLatency`, `kAudioDevicePropertySafetyOffset` and the largest stream latency
+  into `PlatformAudioLatency` (samples). `APReceiverAudioSessionBufferedUpdateLatency`
+  (`0x22a006740`) sets `audioLatencyOffset = timelineOffset + senderMinLatency - platformLatency`,
+  and `APReceiverAudioSessionBufferedReadAudio` (`0x22a0046d0`) adds it to packet timestamps, so
+  audio reaches the device early by its own latency. The buffered path has no cap; the realtime
+  path forces a -10 s offset when platform latency exceeds 500 ms and the sender's maximum.
+  Confidence: Medium (field mapping read from log arguments).
+- Hose path (the production path): output latency is applied inside the renderer, and the
+  synchronizer follows the PTP timebase with the varispeed time-pitch algorithm by default
+  (`hoseSBARPrefersVarispeedTimePitchAlgorithm`, default 1). `APSClockDriftMonitor`
+  (`0x1b85671b0`) polls every 1 s and only logs when host and remote timebases drift apart by more
+  than 15 ms. Confidence: High.
+- Drift loop, classic path (inlined in `APReceiverAudioSessionBufferedReadAudio`): once per
+  second, error = RTP due now on the PTP timeline minus the device playhead. A PID
+  (`PIDInit(0.7, 0.2, 1.2, 0.97, -50, 50)`) turns it into a rate: drop one sample per period when
+  behind, duplicate one when ahead, at most 1000 samples/s. At 4410 samples or more (100 ms at
+  44.1 kHz) it steps the offset instead (`bufferedRTPOffsetResetThreshold`). Confidence: Medium
+  (PID argument order inferred).
+- No millisecond sync target appears in the binaries. The bounds are the 15 ms drift log and the
+  ~100 ms step.
+
+### Mapping to a Cast speaker
+
+Sync lives in each receiver, so PlayOnAir has to make Cast play RTP `r` at
+`H(anchor) + (r - anchor_rtp) / sample_rate` by itself:
+
+| Apple receiver | Cast-backed equivalent |
+|---|---|
+| Device output latency from CoreAudio | Per-model PLAY-to-audible delay (measured below) |
+| Device playhead | MEDIA_STATUS `currentTime` minus a per-model offset (measured below) |
+| Drop or duplicate samples, at most 1000/s | Drop or duplicate samples in the FLAC PlayOnAir encodes; it reaches the speaker after the Cast buffer ahead of it |
+| Step past ~100 ms | Re-LOAD at the due position |
+
+### Cast measurements
+
+Method: a FLAC 48 kHz stereo track with a 12 ms chirp every 2 s, served as chunked HTTP to the
+Default Media Receiver from a sender on this Mac. A USB microphone 1 to 2 m away records the
+speaker; each chirp is located by matched filter and timestamped from the CoreAudio ADC host time.
+All times are on the Mac's monotonic clock and include the constant air and microphone path
+(a few ms). Each trial: LOAD with `autoplay: false`, wait 2 s after PAUSED, send PLAY, poll media
+status at 5 Hz for 12 s.
+
+| | Nest Audio, BUFFERED (20) | Nest Audio, LIVE (10) | Nest Mini, BUFFERED (20) | Nest Mini, LIVE (10) |
+|---|---|---|---|---|
+| PLAY sent to media 0 audible, mean | 152 ms | 140 ms | 172 ms | 172 ms |
+| Standard deviation | 12.8 ms | 4.8 ms | 6.7 ms | 5.9 ms |
+| Range | 140 to 202 ms | 136 to 153 ms | 157 to 184 ms | 159 to 177 ms |
+| `currentTime` ahead of audible, mean | 401 ms | 392 ms | -9 ms | -10 ms |
+| `currentTime` per poll, standard deviation | 13.7 ms | 13.4 ms | 44.3 ms | 43.5 ms |
+| `currentTime` 12 s mean, standard deviation across trials | 2.2 ms | 0.8 ms | 10.9 ms | 6.7 ms |
+
+- The Nest Audio's PAUSED status sometimes reports `currentTime` 0.256 before PLAY (5 of 30
+  trials). Playback still starts at media 0, with the same delay.
+- The Nest Audio's `currentTime` runs about 0.4 s ahead of what is audible; the Nest Mini's trails
+  it by about 10 ms. Both offsets are steady from trial to trial, so they work as per-model
+  constants.
+
+Long run, 20 minutes, `currentTime` polled at 1 Hz. The Nest Mini run served the track at most 8 s
+ahead of real time, as PlayOnAir does; served all at once, the 20-minute track made the Nest Mini
+go IDLE with an ERROR reason right after PLAY.
+
+| | Nest Audio | Nest Mini |
+|---|---|---|
+| Output clock against the Mac clock | -17.6 ppm (21 ms later after 20 min) | +1.6 ppm (1.9 ms earlier after 20 min) |
+| Chirp times against a straight line, standard deviation | 0.02 ms | 0.08 ms |
+| `currentTime` rate against the Mac clock | -16.8 ppm | +1.1 ppm |
+| `currentTime` ahead of audible, first third / last third | 392.2 / 392.5 ms | -11.5 / -11.7 ms |
+| `currentTime` 10-poll average, standard deviation | 2.8 ms | 6.6 ms |
+
+`currentTime` follows the speaker's output clock, so it can stand in for the device playhead in
+the classic drift loop.
+
+Not measured here: the iPhone grandmaster against this Mac's clock, HomePods in the same room,
+other Cast models, and Cast multizone followers behind a leader.
+
+### Prototype in a mixed group
+
+A prototype build ran PlayOnAir in a Linux VM bridged onto the LAN. It put the Gym speaker (Nest
+Audio) in one AirPlay group with this Mac's own output (Music on this Mac as the sender and PTP
+grandmaster) and implemented the mapping above:
+
+- Released packets carry their PTP presentation time to the host ring.
+- The body drops audio due sooner than 2 s, so LOAD, PAUSED and PLAY fit.
+- LOAD uses `autoplay: false`; PLAY goes out at stream frame 0's due time minus the PLAY delay.
+- A 1 s loop compares `currentTime` minus the model offset with the due position and drops or
+  duplicates at most 1000 samples/s in the FLAC.
+
+The microphone heard the Mac and the Cast speaker in alternating 15 s windows (system mute for
+the Mac, AirPlay volume for the Cast speaker).
+
+The Mac's output is late against the AirPlay timeline by what CoreAudio does not report. That lag
+was measured separately (chirp at the reported DAC time, heard by the same microphone): 84.5 ms
+for the Edifier M60 USB speakers (sd 0.35 ms), about 16 ms for the MacBook Pro speakers.
+
+| | Cast minus Mac output | Cast minus AirPlay timeline |
+|---|---|---|
+| No sync (shipping behavior), two sessions | +87 ms, +255 ms | random per session |
+| Sync, `currentTime` offset 392 ms, three sessions (Edifier) | -113, -115, -115 ms | about -30 ms |
+| Sync, offset 392 ms (MacBook Pro speakers) | -40 ms | about -24 ms |
+| Sync, offset 365 ms, four sessions (Edifier) | -98.5, -92.5, -90.9, -90.8 ms | -14 to -6 ms |
+
+- Timed PLAY lands within 1 to 2 ms of its target. The Cast command path adds about 150 ms
+  over the standalone PLAY delay, which the loop removes in about 20 s at the 1000 samples/s cap.
+- After convergence, the loop's smoothed error stays within about ±5 ms. Within one session the
+  heard offset varies with a 1 to 7 ms standard deviation per 2-minute window; between sessions
+  it varies by about ±4 ms.
+- The prototype's Nest Audio table uses a 290 ms PLAY delay and a 357 ms offset, extrapolated from
+  these runs.
+- The Mac sender tears the AirPlay session down after exactly 300 s whenever the windows were
+  alternated, so no Mac-sent session above ran past 5 minutes.
+- After a flush and resume from the Mac (about 1 s queued), the Cast re-LOAD never left
+  BUFFERING; a click track of digital silence also stalled the Cast buffer. Both are findings
+  about the shipping LOAD path, not about sync.
+
+### 30 minutes from an iPhone
+
+An iPhone (Safari playing the click track) sent to one AirPlay group: this Mac's AirPlay Receiver
+(Apple's receiver, out the Edifier) and the Gym speaker through the prototype, with the table
+above. The Mac took over as PTP grandmaster when it joined the group. The microphone alternated
+15 s windows by muting the Mac's system output only, so nothing reached the sender. Click times
+are first arrivals (the earliest peak within 20 ms before the strongest, since room reflections
+can be louder than the direct click), against a fit of the Mac's clicks that tracks the
+microphone's own clock.
+
+| Minutes | 0-6 | 6-12 | 12-18 | 18-24 | 24-30 |
+|---|---|---|---|---|---|
+| Cast minus AirPlay timeline, median of 2-minute medians | -0.2 ms | -7.4 ms | -12.7 ms | -12.9 ms | -5.9 ms |
+
+- The session ran the full 30 minutes with no drop, re-LOAD or step. The Cast speaker stayed
+  between +0.3 and -16.1 ms of the Mac receiver (2-minute medians), each 2-minute window with a
+  1.5 to 4 ms standard deviation. Over the run, the drift loop applied a net -634 samples against
+  the Cast clock, and its smoothed error stayed within about ±10 ms.
+- The offset wandered slowly (about 16 ms peak to peak over 30 minutes) instead of drifting off.
+  The playout maps the PTP timeline once, at the anchor, then releases by the VM's monotonic
+  clock, which chrony slews (2.4 ppm correction, 1.5 ms RMS offset). `[INFERENCE]` The wander is
+  that clock against the grandmaster; Apple's receivers slave their timebase to PTP continuously.
+- The first start fell back to the unlocked anchor. The iPhone's `timingPeerList` lists the Mac's
+  stable addresses, but the Mac sends PTP from its temporary IPv6 address, and the follower only
+  mapped timelines whose source address is a listed peer. The 0.4.0 follower matched the timeline
+  by the clock identity the sender names in SETRATEANCHORTIME; 0.4.1 reverted it.
+- The Cast speaker joins about 2 s after the Apple receiver: the start skips audio due within the
+  next 2 s, and the speaker plays its Cast session chime at the same time.
+- By ear, the Edifier run never sounded together: the Mac's click came 89 ms after the Cast one
+  (sd 2 ms), which is the Edifier's unreported 84.5 ms. In the same session, switching the Mac's
+  output to its built-in speakers (about 16 ms unreported) put the Mac 7 ms after the Cast
+  speaker, and the two sounded like one source; switching back to the Edifier split them again.
+  The Cast speaker is on the AirPlay timeline; an Apple receiver is only as close to it as its
+  output device's reported latency is to the real one.
+
+### 0.4.0 behavior and calibration (reverted in 0.4.1)
+
+0.4.0 timed every session whose Cast model was in its table (`Nest Audio`, `Google Nest Mini`,
+exact `md` strings) on live FLAC: LOAD with `autoplay: false`, skip audio due within 1 s, PLAY at
+stream frame 0's due time minus the PLAY delay, then the 1 s drift loop. Other models, Google
+Home speaker groups and the WAV fallback kept the unsynced 8 s read-ahead path. Playout re-mapped
+every packet through the locked PTP timeline instead of the anchor-time offset, which removed the
+slow wander above.
+
+Calibration runs: iPhone sender, this Mac's AirPlay Receiver out its built-in speakers (16.1 ms
+unreported, measured the same way as the Edifier's 84.7 ms) as the reference, 12 to 15 s windows
+that mute every source but one (the Mac by system mute, a Cast speaker by its receiver mute).
+Click times align each click's whole matched-filter envelope to the speaker's average envelope and
+take that template's first arrival: the Nest Mini smears a click into a train of near-equal peaks
+over 25 ms, so picking a single peak jumps between them.
+
+| Speaker | PLAY delay | `currentTime` offset | Cast minus AirPlay timeline (4 min) |
+|---|---|---|---|
+| Nest Audio (Gym) | 290 ms | 366 ms | +0.6 ms median, sd 2.3 ms, per-minute -2.1 to +1.3 ms |
+| Google Nest Mini (Pool) | 270 ms | 0 ms | -2.7 ms median, sd 6.3 ms, per-minute -8.2 to +0.1 ms |
+
+- The Nest Mini's `currentTime` is noisier (about 29 ms per one-second reading against about
+  10 ms for the Nest Audio), so its error wanders more within a session.
+- In a multi-select group of several PlayOnAir speakers, multizone moves the session to a group
+  endpoint hosted on one of the speakers. Its `currentTime` is offset differently: with the
+  owner's calibration the Nest Mini drifted to about +350 ms. 0.4.0 therefore paused drift
+  correction while a group endpoint hosted the session; the members stayed together through
+  multizone but were not aligned with Apple receivers in the same AirPlay group.
+
+### Outcome
+
+0.4.1 reverts the 0.4.0 sync code; playback is identical to 0.3.0.
+
+- A timed start replaces the 8 s burst on every Cast LOAD: the speaker loads paused and is fed in
+  real time, so after a skip or seek it buffers from nearly empty before PLAY. On Nest Minis this
+  brought back the slow skips the 0.3.0 burst had removed. Any future timing work keeps the burst
+  and controls only when PLAY fires.
+- Several PlayOnAir speakers selected together (multizone) paid the timed-start cost with drift
+  correction paused, so they gained nothing.
+- The sync helps only groups that mix Cast and Apple speakers; Cast-only and Apple-only groups
+  were already in step.
+- Found while testing and unverified on 0.3.0: a Cast re-LOAD after a flush and resume with about
+  1 s queued stayed in BUFFERING, and a track of pure digital silence stalled the Cast buffer.
+
 ## Open questions
 
 | Question | How to settle |
 |---|---|
 | PTP domain, priority1/2, offset filter | Capture UDP 319/320 during a session (root), or extract `IOgPTPPlugin` from the kernelcache. |
-| Exact trigger for receiver-chosen anchors | Capture a SETRATEANCHORTIME from an iPhone and check `networkTimeFlags`; or VM lldb breakpoint on `hoseSBAR_audioHosePrepareRTPTimestampsAndTransferBufferForSBAR`. |
+| Whether a HomePod in the same room hears the synced Cast speaker as one source | Group a HomePod with a Cast speaker in one room and listen; the Mac receiver stood in for it above. |
 | MediaRemote command numbers for `modernMediaRemoteCommand` | Decompile `-[AirPlayReceiverPlatform handleMRCommand:translatedAPCommand:withOptions:]`. |
 | Semantics of extended feature bits 68, 77, 82 | Unnamed in the binary; flip them on a test receiver and observe sender behavior. |
 | statusFlags bits 15 and 16 on Apple TV | Find the caller that ORs them into `sysInfo_getStatusFlags`' result. |
@@ -708,8 +933,14 @@ rea decompile /tmp/re/AirPlayReceiver <symbol-or-address> --provider ghidra --sn
 rea decompile /tmp/re/AirPlaySupport <symbol> --provider ghidra --snapshot <snap> --format md --filter-output raw_result.value
 rea function /tmp/re/AirPlayReceiver _audioSession_suspendNetworkReads --provider ghidra --snapshot <snap> --format json
 rea search /tmp/re/AirPlayReceiver "<format string>" --provider ghidra --snapshot <snap>
+ipsw dyld extract <dsc> AirPlaySender AirPlayReceiver AirPlaySupport TimeSync -o /tmp/ap-re
+rea trace /tmp/ap-re/AirPlaySender "<format string>" --provider ghidra --json
+rea decompile /tmp/ap-re/AirPlaySender <symbol-or-address> --provider ghidra --json
 plutil -p /System/Library/Extensions/IOTimeSyncFamily.kext/Contents/PlugIns/IOgPTPPlugin.kext/Contents/Info.plist
 ```
 
 Helper scripts (not committed) resolved `__cfstring` entries to their text and scanned `__text`
 with capstone for ADRP/ADD and BL references to map strings and callees to functions.
+Section 7's Cast measurements used a throwaway pychromecast sender (Cast TCP relayed through
+`/usr/bin/nc`, since Local Network privacy blocks non-platform binaries on this Mac) and a
+PortAudio capture of the microphone; neither is committed.
