@@ -52,6 +52,26 @@ const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/pair-add",
+        handler: handlers_ap2::handle_pair_add,
+    },
+    Route {
+        method: "POST",
+        path: "/pair-remove",
+        handler: handlers_ap2::handle_pair_remove,
+    },
+    Route {
+        method: "POST",
+        path: "/pair-list",
+        handler: handlers_ap2::handle_pair_list,
+    },
+    Route {
+        method: "POST",
+        path: "/configure",
+        handler: handlers_ap2::handle_configure,
+    },
+    Route {
+        method: "POST",
         path: "/fp-setup",
         handler: handlers::handle_fp_setup,
     },
