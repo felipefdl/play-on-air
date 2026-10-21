@@ -119,6 +119,14 @@ pub trait PairingStore: Send + Sync + 'static {
         false
     }
 
+    /// List every paired controller as `(device_id, public_key)`.
+    ///
+    /// Answers HomeKit `/pair-list`. The default returns an empty list; stores
+    /// that can enumerate their keys should override it.
+    fn list(&self) -> Vec<(String, [u8; 32])> {
+        Vec::new()
+    }
+
     /// Load the accessory's persistent Ed25519 **identity** seed, if one was saved.
     ///
     /// This is the server's *own* long-term secret (distinct from the paired peer
@@ -158,6 +166,12 @@ impl PairingStore for MemoryPairingStore {
     }
     fn has_any_pairing(&self) -> bool {
         self.keys.lock().map(|k| !k.is_empty()).unwrap_or(false)
+    }
+    fn list(&self) -> Vec<(String, [u8; 32])> {
+        self.keys
+            .lock()
+            .map(|k| k.iter().map(|(id, pk)| (id.clone(), *pk)).collect())
+            .unwrap_or_default()
     }
     fn remove(&self, device_id: &str) {
         if let Ok(mut keys) = self.keys.lock() {

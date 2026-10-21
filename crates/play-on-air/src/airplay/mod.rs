@@ -1,5 +1,7 @@
 //! AirPlay 2 receiver wrappers (one `RaopServer` per Chromecast).
 
+pub mod pairing;
+
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -509,6 +511,9 @@ impl AirPlayReceiver {
       .advertise(options.advertise);
     if let Some((event, general)) = options.ptp_ports {
       builder = builder.ptp_ports(event, general);
+    }
+    if let Some(dir) = pairing::pairing_dir() {
+      builder = builder.pairing_store(Arc::new(pairing::FilePairingStore::open(dir, &device_id_owned)));
     }
     let server = builder
       .build(handler)
