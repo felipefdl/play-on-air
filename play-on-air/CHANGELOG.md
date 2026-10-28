@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- **Add PlayOnAir speakers to the Apple Home app**, assign them to rooms, and play to them with Siri. Adding a speaker used to fail with "Unable to Add Accessory": PlayOnAir did not answer the Home app's pairing requests. Contributed by @mkrajinovic (#14).
+- **Speakers keep their AirPlay identity across restarts and updates**, so Home keeps them. Each speaker's pairing key and the controllers Home registers are saved in a state directory: the app's private `/data` on Home Assistant (included in backups), `/data` in the Docker image (mount a volume), and for the binary `--state-dir`, `$PLAY_ON_AIR_STATE_DIR`, or `~/.local/state/play-on-air` on Linux and `~/Library/Application Support/play-on-air` on macOS.
+- Security: Cast certificate checks could accept distrusted intermediate certificates (rustls-webpki, RUSTSEC-2026-0382); tokio I/O safety fix (RUSTSEC-2026-0386).
+- Discovery on Home Assistant and Linux (mdns-sd 0.21): outgoing mDNS packets stay within a standard 1500-byte network instead of allowing jumbo-sized ones, the mDNS daemon no longer deadlocks under event load, and record lifetimes count time the host spent asleep.
+
 ## 0.4.3
 
 - Fix: **skipping tracks no longer leaves a 10 s gap.** After a skip the Cast speaker was re-LOADed as soon as the new track's first audio arrived, often with under a second queued; a Nest speaker then plays half a second, runs dry and buffers about 10 s. Meanwhile the old stream kept handing the new track's audio to the speaker's stale, paused media, so the queue shrank with every skip. This was worst when PlayOnAir cannot open the AirPlay clock ports (for example in Docker next to another PTP user). Each skip now ends the old stream, and every Cast load waits until about 6 s of audio is queued (at most 6 s). From an iPhone a skip starts in about half a second.
