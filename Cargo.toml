@@ -27,7 +27,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 log = "0.4"
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 parking_lot = "0.12"
 rust_cast = "0.21"
 # Direct dep for custom Cast TLS connect (SO_RCVTIMEO on the real client socket and the

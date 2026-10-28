@@ -9,10 +9,10 @@ use crate::net::server::{BindConfig, HttpServer};
 use std::sync::Arc;
 
 fn random_hwaddr() -> Vec<u8> {
-    use rand::RngCore;
+    use rand::Rng;
 
     let mut hwaddr = [0u8; super::MAX_HWADDR_LEN];
-    rand::thread_rng().fill_bytes(&mut hwaddr);
+    rand::rng().fill_bytes(&mut hwaddr);
     // Locally administered, unicast MAC address.
     hwaddr[0] = (hwaddr[0] | 0x02) & !0x01;
     hwaddr.to_vec()

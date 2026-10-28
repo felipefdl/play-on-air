@@ -259,7 +259,7 @@ impl Sender {
     nonce[4..].copy_from_slice(&nonce_tail);
     let sealed = self
       .audio_cipher
-      .encrypt(Nonce::from_slice(&nonce), Payload { msg: aac, aad: &header[4..12] })
+      .encrypt(&Nonce::from(nonce), Payload { msg: aac, aad: &header[4..12] })
       .expect("seal audio packet");
     let total = 2 + header.len() + sealed.len() + nonce_tail.len();
     wire.extend_from_slice(&u16::try_from(total).expect("packet fits u16").to_be_bytes());
