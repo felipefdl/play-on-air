@@ -1112,15 +1112,14 @@ tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
   fn tcp_connect_cast_bound_to_local_listener() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
     let port = listener.local_addr().expect("local_addr").port();
-    let accept = std::thread::spawn(move || {
-      let (stream, _) = listener.accept().expect("accept");
-      drop(stream);
-    });
+    // Hold the accepted stream until the client is done: closing it at once can make the client's
+    // connect poll see POLLHUP with no socket error (macOS), failing the dial spuriously.
+    let accept = std::thread::spawn(move || listener.accept().expect("accept").0);
 
     let (stream, local) = tcp_connect_cast_bound("127.0.0.1", port).expect("bound connect to 127.0.0.1");
     assert!(local.is_loopback(), "local source should be loopback, got {local}");
     drop(stream);
-    accept.join().expect("accept thread");
+    drop(accept.join().expect("accept thread"));
   }
 
   #[test]
@@ -1224,14 +1223,12 @@ tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
       return; // Host without IPv6 loopback.
     };
     let port = listener.local_addr().expect("local_addr").port();
-    let accept = std::thread::spawn(move || {
-      let (stream, _) = listener.accept().expect("accept");
-      drop(stream);
-    });
+    // Hold the accepted stream until the client is done (see tcp_connect_cast_bound_to_local_listener).
+    let accept = std::thread::spawn(move || listener.accept().expect("accept").0);
     let (stream, local) = tcp_connect_cast_bound("::1", port).expect("IPv6 connect");
     assert_eq!(local, IpAddr::V6(Ipv6Addr::LOCALHOST));
     drop(stream);
-    accept.join().expect("accept thread");
+    drop(accept.join().expect("accept thread"));
   }
 
   #[test]
