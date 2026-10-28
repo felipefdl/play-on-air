@@ -21,23 +21,23 @@ socket2 = "0.6" # v6-only RTSP listener beside the IPv4 one
 httparse = "1"
 
 # Crypto
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-sha2 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
-rand = "0.8"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+sha2 = "0.11"
+md-5 = "0.11"
+hmac = "0.13"
+rand = "0.10"
 subtle = "2" # constant-time comparison of authenticators/proofs
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-num-bigint = "0.4"
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+num-bigint = "0.5"
 uuid = { version = "1", features = ["v4"] }
 
 # Encoding / parsing
 plist = "1.9"
 
 # Audio decode / resample / mixdown
-rubato = "3"
+rubato = "5"
 symphonia = { version = "0.6", features = ["aac"] }
 
 # Screen mirroring (optional, `video` feature): AES-CTR video, AES-CBC legacy RTP audio
@@ -56,7 +56,7 @@ hex = "0.4"
 astro-dnssd = "0.3"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 gethostname = "1"
 
 [features]
@@ -68,12 +68,12 @@ hls = ["video"]
 tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serial_test = "3"
-cpal = "0.17"
-rubato = "3"
+cpal = "0.18"
+rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 openh264 = "0.9"
-minifb = "0.28"
+minifb = "0.29"
 
 # PlayOnAir vendored tree: do not prune upstream optional/unused graph edges.
 [package.metadata.cargo-machete]

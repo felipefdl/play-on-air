@@ -69,6 +69,12 @@ id = "bedroom"
 hide = true
 ```
 
+## Apple Home
+
+Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
+
+Each speaker's pairing identity and the controllers Home registers live in the app's private `/data`, so Home keeps the speakers across restarts and updates, and Home Assistant backups include them. Uninstalling the app deletes them: after reinstalling, remove the speakers from Home and add them again.
+
 ## Image
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:

@@ -20,9 +20,11 @@ path = "src/lib.rs"
 axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
+dirs = { workspace = true }
 flacenc = { workspace = true }
 futures-util = { workspace = true }
-if-addrs = "0.13"
+hex = { workspace = true }
+if-addrs = "0.15"
 parking_lot = { workspace = true }
 rust_cast = { workspace = true }
 rustls = { workspace = true }
@@ -46,12 +48,12 @@ mdns-sd = { workspace = true }
 [dev-dependencies]
 # tests/e2e_buffered: synthetic AirPlay 2 sender (SRP, ChaCha20-Poly1305, plist) and fake Cast JSON.
 # All already in the graph via shairplay / rust_cast.
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 claxon = { workspace = true }
-num-bigint = "0.4"
+num-bigint = "0.5"
 plist = "1.9"
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 # Time control for prebuffer-timeout and similar bridge unit tests.
 tokio = { version = "1", features = ["test-util"] }

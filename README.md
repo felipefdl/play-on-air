@@ -84,6 +84,20 @@ Two Chromecasts with the same name get distinct AirPlay names: the model is appe
 
 `id` is a case-insensitive substring of the Cast friendly name or UUID. On Home Assistant, use the Configuration tab instead of editing the generated file by hand.
 
+## Apple Home
+
+Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
+
+PlayOnAir keeps each speaker's pairing identity and the controllers Home registers in a state directory, so Home keeps the speaker across restarts:
+
+| Run | State directory |
+|-----|-----------------|
+| Home Assistant | The app's private `/data` (included in Home Assistant backups) |
+| Container | `/data`. Mount a volume so pairing survives recreating the container: `docker run --network host -v play-on-air-state:/data ghcr.io/felipefdl/play-on-air:latest` |
+| Binary | `--state-dir PATH`, `$PLAY_ON_AIR_STATE_DIR`, or the platform default: `$XDG_STATE_HOME/play-on-air` (`~/.local/state/play-on-air`) on Linux, `~/Library/Application Support/play-on-air` on macOS |
+
+Deleting the directory gives every speaker a new identity: remove the speakers from Home and add them again.
+
 ## Limits
 
 | | |

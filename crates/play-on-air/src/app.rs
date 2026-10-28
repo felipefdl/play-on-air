@@ -1,6 +1,7 @@
 //! Application main loop: discovery, AirPlay ads, bridge, and shutdown.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 
-use crate::airplay::{AirPlayManager, AirPlaySessionEvent, cast_linear_to_airplay_db};
+use crate::airplay::{AirPlayManager, AirPlaySessionEvent, ReceiverOptions, cast_linear_to_airplay_db};
 use crate::bridge::{Bridge, SHUTDOWN_TIMEOUT as BRIDGE_SHUTDOWN_TIMEOUT};
 use crate::cast::{CastControl, CastPool, CastRemoteEvent};
 use crate::config::Config;
@@ -50,14 +51,17 @@ struct MaintainGuards {
 #[derive(Debug)]
 pub struct App {
   config: Config,
+  state_dir: Option<PathBuf>,
   registry: Arc<DeviceRegistry>,
 }
 
 impl App {
-  /// Create the app with loaded (or default) config.
-  pub fn new(config: Config) -> Self {
+  /// Create the app with loaded (or default) config and the persistent state directory
+  /// (`None` keeps AirPlay pairing state in memory).
+  pub fn new(config: Config, state_dir: Option<PathBuf>) -> Self {
     Self {
       config,
+      state_dir,
       registry: Arc::new(DeviceRegistry::new()),
     }
   }
@@ -76,7 +80,10 @@ impl App {
     let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();
     let (media_recovered_tx, mut media_recovered_rx) = mpsc::unbounded_channel::<String>();
     let (cast_remote_tx, mut cast_remote_rx) = mpsc::unbounded_channel::<CastRemoteEvent>();
-    let airplay = Arc::new(AirPlayManager::new(Some(event_tx)));
+    let airplay = Arc::new(AirPlayManager::new(Some(event_tx)).with_receiver_options(ReceiverOptions {
+      state_dir: self.state_dir,
+      ..ReceiverOptions::default()
+    }));
     let cast_pool = Arc::new(
       CastPool::new(Some(ownership_tx))
         .with_media_recovered(media_recovered_tx)
@@ -819,7 +826,7 @@ mod tests {
 
   #[tokio::test]
   async fn app_run_returns_after_one_shutdown_signal() {
-    let app = App::new(Config::default());
+    let app = App::new(Config::default(), None);
     let (tx, rx) = watch::channel(false);
     let signal = tokio::spawn(async move {
       // Let App::run spawn its tasks before signaling shutdown.

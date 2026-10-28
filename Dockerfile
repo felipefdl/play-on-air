@@ -68,6 +68,10 @@ LABEL org.opencontainers.image.title="PlayOnAir" \
   io.hass.arch="${BUILD_ARCH}"
 
 ENV PLAY_ON_AIR_CONFIG=/config/play-on-air.toml
+# Pairing identity and paired controllers (Home Assistant: the app's private /data).
+# Standalone docker: mount a volume here so Apple Home pairing survives container recreation.
+ENV PLAY_ON_AIR_STATE_DIR=/data
+VOLUME /data
 
 # Host network is required at runtime (set by HAOS config.yaml host_network).
 CMD ["/usr/local/bin/play-on-air-entrypoint"]

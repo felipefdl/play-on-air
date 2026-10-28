@@ -23,7 +23,7 @@ impl StreamResampler {
         }
         let params = SincInterpolationParameters {
             sinc_len: 64,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
@@ -65,7 +65,7 @@ impl StreamResampler {
                 Err(_) => continue,
             };
 
-            if let Ok(result) = self.resampler.process(&input, 0, None) {
+            if let Ok(result) = self.resampler.process(&input, None) {
                 let data = result.take_data();
                 if !data.is_empty() {
                     if !self.warmed_up {

@@ -326,6 +326,195 @@ pub(crate) fn handle_pair_pin_start(
     None
 }
 
+/// HomeKit pairing-admin `Method` values (HAP spec, "Pairing TLV Methods").
+const PAIRING_METHOD_ADD: u8 = 3;
+const PAIRING_METHOD_REMOVE: u8 = 4;
+const PAIRING_METHOD_LIST: u8 = 5;
+
+/// HomeKit TLV error codes used by the pairing-admin endpoints.
+const PAIRING_ERROR_UNKNOWN: u8 = 1;
+const PAIRING_ERROR_AUTHENTICATION: u8 = 2;
+
+/// Permissions value reported by `/pair-list`: the store keeps keys only, so every
+/// controller is listed as an admin (Home adds its controllers through an admin).
+const PAIRING_PERMISSION_ADMIN: u8 = 1;
+
+/// Pairing-admin response: `State = 2` plus an optional error.
+fn pairing_admin_response(error: Option<u8>) -> Vec<u8> {
+    let mut tlv = crate::crypto::tlv::TlvValues::new();
+    tlv.add(crate::crypto::tlv::TlvType::State as u8, &[2]);
+    if let Some(error) = error {
+        tlv.add(crate::crypto::tlv::TlvType::Error as u8, &[error]);
+    }
+    tlv.encode()
+}
+
+/// Validate a pairing-admin request and decode its TLV body.
+///
+/// Admin requests are only honored on a connection that completed pair-setup or
+/// pair-verify, so the body arrived over the encrypted channel. Transient
+/// pair-setup counts: the Home app sends its first `/pair-add` on that session.
+/// HAP restricts these endpoints to admin controllers; this receiver does not,
+/// because transient pairing is already open to the LAN (it plays audio
+/// without a PIN). Any LAN client can therefore add or remove controllers;
+/// removing the Home controllers drops the speaker from Home until it is added
+/// again. The body must carry `State = 1` and, when present, the expected
+/// `Method`.
+fn pairing_admin_request(
+    conn: &RaopConnection,
+    request: &HttpRequest,
+    method: u8,
+    endpoint: &str,
+) -> Result<crate::crypto::tlv::TlvValues, u8> {
+    use crate::crypto::tlv::{TlvType, TlvValues};
+
+    if !conn.is_ap2 {
+        tracing::warn!(endpoint, "pairing admin request on an unverified connection");
+        return Err(PAIRING_ERROR_AUTHENTICATION);
+    }
+    let tlv = request
+        .data()
+        .and_then(|data| TlvValues::decode(data).ok())
+        .ok_or(PAIRING_ERROR_UNKNOWN)?;
+    if tlv.get_type(TlvType::State) != Some(&[1]) {
+        tracing::warn!(endpoint, "pairing admin request without State=1");
+        return Err(PAIRING_ERROR_UNKNOWN);
+    }
+    if let Some(found) = tlv.get_type(TlvType::Method)
+        && found != [method]
+    {
+        tracing::warn!(endpoint, ?found, "pairing admin request with unexpected method");
+        return Err(PAIRING_ERROR_UNKNOWN);
+    }
+    Ok(tlv)
+}
+
+/// The controller identifier (`Identifier` TLV) of a pairing-admin request.
+fn pairing_admin_identifier(tlv: &crate::crypto::tlv::TlvValues) -> Option<&str> {
+    tlv.get_type(crate::crypto::tlv::TlvType::Identifier)
+        .and_then(|id| std::str::from_utf8(id).ok())
+        .filter(|id| !id.is_empty())
+}
+
+/// HomeKit `/pair-add`: store another controller's long-term public key.
+///
+/// The Home app sends this right after pairing to register the home's
+/// controllers, so they can later reconnect with pair-verify.
+pub(crate) fn handle_pair_add(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    use crate::crypto::tlv::TlvType;
+
+    response.add_header("Content-Type", "application/octet-stream");
+    let tlv = match pairing_admin_request(conn, request, PAIRING_METHOD_ADD, "pair-add") {
+        Ok(tlv) => tlv,
+        Err(error) => return Some(pairing_admin_response(Some(error))),
+    };
+    let identifier = pairing_admin_identifier(&tlv);
+    let public_key = tlv
+        .get_type(TlvType::PublicKey)
+        .and_then(|pk| <[u8; 32]>::try_from(pk).ok());
+    let (Some(identifier), Some(public_key)) = (identifier, public_key) else {
+        tracing::warn!("pair-add: missing or malformed identifier/public key");
+        return Some(pairing_admin_response(Some(PAIRING_ERROR_UNKNOWN)));
+    };
+
+    let store = &conn.shared.pairing_store;
+    if store.get(identifier).is_some_and(|existing| existing != public_key) {
+        // HAP: re-adding a known controller with a different key is an error.
+        tracing::warn!(identifier, "pair-add: controller already paired with a different key");
+        return Some(pairing_admin_response(Some(PAIRING_ERROR_UNKNOWN)));
+    }
+    store.put(identifier, public_key);
+    tracing::info!(identifier, "pair-add: controller key stored");
+    Some(pairing_admin_response(None))
+}
+
+/// HomeKit `/pair-remove`: forget a controller (sent when removed from Home).
+pub(crate) fn handle_pair_remove(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    response.add_header("Content-Type", "application/octet-stream");
+    let tlv = match pairing_admin_request(conn, request, PAIRING_METHOD_REMOVE, "pair-remove") {
+        Ok(tlv) => tlv,
+        Err(error) => return Some(pairing_admin_response(Some(error))),
+    };
+    let Some(identifier) = pairing_admin_identifier(&tlv) else {
+        tracing::warn!("pair-remove: missing identifier");
+        return Some(pairing_admin_response(Some(PAIRING_ERROR_UNKNOWN)));
+    };
+    conn.shared.pairing_store.remove(identifier);
+    tracing::info!(identifier, "pair-remove: controller removed");
+    Some(pairing_admin_response(None))
+}
+
+/// HomeKit `/pair-list`: report every stored controller.
+pub(crate) fn handle_pair_list(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    use crate::crypto::tlv::{TlvType, TlvValues};
+
+    response.add_header("Content-Type", "application/octet-stream");
+    if let Err(error) = pairing_admin_request(conn, request, PAIRING_METHOD_LIST, "pair-list") {
+        return Some(pairing_admin_response(Some(error)));
+    }
+    let mut tlv = TlvValues::new();
+    tlv.add(TlvType::State as u8, &[2]);
+    for (index, (identifier, public_key)) in conn.shared.pairing_store.list().iter().enumerate() {
+        if index > 0 {
+            tlv.add(TlvType::Separator as u8, &[]);
+        }
+        tlv.add(TlvType::Identifier as u8, identifier.as_bytes());
+        tlv.add(TlvType::PublicKey as u8, public_key);
+        tlv.add(TlvType::Permissions as u8, &[PAIRING_PERMISSION_ADMIN]);
+    }
+    Some(tlv.encode())
+}
+
+/// HomeKit `/configure`: the Home app's accessory-setup step after `/pair-add`.
+///
+/// The request carries the home's settings (binary plist); the reply describes the
+/// accessory's HomeKit identity, as shairport-sync answers it: pairing identifier,
+/// long-term public key, name, and HomeKit access control enabled at level 0
+/// ("everyone on the network"). Only honored on a verified connection.
+pub(crate) fn handle_configure(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    if !conn.is_ap2 {
+        tracing::warn!("configure on an unverified connection");
+        *response = HttpResponse::new("RTSP/1.0", 470, "Connection Authorization Required");
+        response.add_header("CSeq", request.header("CSeq").unwrap_or("0"));
+        return None;
+    }
+    let keys: Vec<String> = request
+        .data()
+        .and_then(|data| plist::from_bytes::<plist::Dictionary>(data).ok())
+        .map(|dict| dict.keys().cloned().collect())
+        .unwrap_or_default();
+    tracing::info!(?keys, "configure request");
+
+    let shared = &conn.shared;
+    let (_, verifying_key) = pairing_homekit::identity_keypair(&shared.identity_seed);
+    let mut dict = plist::Dictionary::new();
+    dict.insert("Identifier".into(), plist::Value::String(shared.pairing_id.clone()));
+    dict.insert("Enable_HK_Access_Control".into(), plist::Value::Boolean(true));
+    dict.insert(
+        "PublicKey".into(),
+        plist::Value::Data(verifying_key.to_bytes().to_vec()),
+    );
+    dict.insert("Device_Name".into(), plist::Value::String(shared.airplay_name.clone()));
+    dict.insert("Access_Control_Level".into(), plist::Value::Integer(0_u64.into()));
+    response.set_plist_body(&dict)
+}
+
 /// Build the `updateInfo` `POST /command` message queued on a freshly-opened
 /// event channel. Its `value` is the full `/info` dictionary, as Apple sends it
 /// (spec section 4). Identical for the RC-only and normal event channels.
@@ -1055,4 +1244,173 @@ pub(crate) fn handle_audio_mode(
         tracing::debug!(mode, "POST /audioMode");
     }
     None
+}
+
+#[cfg(test)]
+mod pairing_admin_tests {
+    use super::*;
+    use crate::crypto::tlv::{TlvType, TlvValues};
+    use crate::raop::connection::test_shared;
+    use crate::raop::{AudioFormat, AudioHandler, AudioSession};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    struct NoopHandler;
+
+    impl AudioHandler for NoopHandler {
+        fn audio_init(&self, _format: AudioFormat) -> Box<dyn AudioSession> {
+            unreachable!("pairing admin tests never start audio")
+        }
+    }
+
+    const CONTROLLER: &str = "8C2D6A3E-1F5B-4E1C-9C0A-6F0B2E7D4A11";
+    const KEY: [u8; 32] = [7; 32];
+
+    fn connection(verified: bool) -> RaopConnection {
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut conn = RaopConnection::new(test_shared(Arc::new(NoopHandler)), 1, addr, addr);
+        conn.is_ap2 = verified;
+        conn
+    }
+
+    fn request(path: &str, tlv: &TlvValues) -> HttpRequest {
+        let body = tlv.encode();
+        let mut msg = format!(
+            "POST {path} RTSP/1.0\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        msg.extend_from_slice(&body);
+        let mut req = HttpRequest::new();
+        req.add_data(&msg).unwrap();
+        req
+    }
+
+    fn add_body(identifier: &str, key: &[u8]) -> TlvValues {
+        let mut tlv = TlvValues::new();
+        tlv.add(TlvType::State as u8, &[1]);
+        tlv.add(TlvType::Method as u8, &[PAIRING_METHOD_ADD]);
+        tlv.add(TlvType::Identifier as u8, identifier.as_bytes());
+        tlv.add(TlvType::PublicKey as u8, key);
+        tlv.add(TlvType::Permissions as u8, &[PAIRING_PERMISSION_ADMIN]);
+        tlv
+    }
+
+    fn call(
+        conn: &mut RaopConnection,
+        handler: fn(&mut RaopConnection, &HttpRequest, &mut HttpResponse) -> Option<Vec<u8>>,
+        path: &str,
+        tlv: &TlvValues,
+    ) -> TlvValues {
+        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let body = handler(conn, &request(path, tlv), &mut response).expect("admin endpoints always answer");
+        TlvValues::decode(&body).unwrap()
+    }
+
+    #[test]
+    fn pair_add_stores_controller_key() {
+        let mut conn = connection(true);
+        let reply = call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        assert_eq!(reply.get_type(TlvType::State), Some(&[2][..]));
+        assert_eq!(reply.get_type(TlvType::Error), None);
+        assert_eq!(conn.shared.pairing_store.get(CONTROLLER), Some(KEY));
+    }
+
+    #[test]
+    fn pair_add_is_idempotent_for_the_same_key() {
+        let mut conn = connection(true);
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        let reply = call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        assert_eq!(reply.get_type(TlvType::Error), None);
+    }
+
+    #[test]
+    fn pair_add_rejects_a_different_key_for_a_known_controller() {
+        let mut conn = connection(true);
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        let reply = call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &[9; 32]));
+        assert_eq!(reply.get_type(TlvType::Error), Some(&[PAIRING_ERROR_UNKNOWN][..]));
+        assert_eq!(conn.shared.pairing_store.get(CONTROLLER), Some(KEY));
+    }
+
+    #[test]
+    fn pair_add_requires_a_verified_connection() {
+        let mut conn = connection(false);
+        let reply = call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        assert_eq!(
+            reply.get_type(TlvType::Error),
+            Some(&[PAIRING_ERROR_AUTHENTICATION][..])
+        );
+        assert_eq!(conn.shared.pairing_store.get(CONTROLLER), None);
+    }
+
+    #[test]
+    fn pair_add_rejects_a_malformed_key() {
+        let mut conn = connection(true);
+        let reply = call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &[1; 16]));
+        assert_eq!(reply.get_type(TlvType::Error), Some(&[PAIRING_ERROR_UNKNOWN][..]));
+    }
+
+    #[test]
+    fn configure_describes_the_accessory_identity() {
+        let mut conn = connection(true);
+        let mut body = Vec::new();
+        let mut settings = plist::Dictionary::new();
+        settings.insert("Name".into(), plist::Value::String("Kitchen".into()));
+        plist::to_writer_binary(&mut body, &settings).unwrap();
+        let mut msg = format!(
+            "POST /configure RTSP/1.0\r\nCSeq: 3\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        msg.extend_from_slice(&body);
+        let mut req = HttpRequest::new();
+        req.add_data(&msg).unwrap();
+
+        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let reply = handle_configure(&mut conn, &req, &mut response).expect("configure answers with a plist");
+        let dict: plist::Dictionary = plist::from_bytes(&reply).unwrap();
+        let (_, vk) = pairing_homekit::identity_keypair(&conn.shared.identity_seed);
+        assert_eq!(
+            dict.get("PublicKey").and_then(plist::Value::as_data),
+            Some(&vk.to_bytes()[..])
+        );
+        assert_eq!(
+            dict.get("Enable_HK_Access_Control").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        assert!(dict.contains_key("Identifier"));
+        assert!(dict.contains_key("Device_Name"));
+    }
+
+    #[test]
+    fn configure_requires_a_verified_connection() {
+        let mut conn = connection(false);
+        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let reply = handle_configure(&mut conn, &request("/configure", &TlvValues::new()), &mut response);
+        assert!(reply.is_none());
+        assert_eq!(response.status_code(), 470);
+    }
+
+    #[test]
+    fn pair_list_reports_stored_controllers_and_pair_remove_forgets_them() {
+        let mut conn = connection(true);
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+
+        let mut list = TlvValues::new();
+        list.add(TlvType::State as u8, &[1]);
+        list.add(TlvType::Method as u8, &[PAIRING_METHOD_LIST]);
+        let reply = call(&mut conn, handle_pair_list, "/pair-list", &list);
+        assert_eq!(reply.get_type(TlvType::State), Some(&[2][..]));
+        assert_eq!(reply.get_type(TlvType::Identifier), Some(CONTROLLER.as_bytes()));
+        assert_eq!(reply.get_type(TlvType::PublicKey), Some(&KEY[..]));
+
+        let mut remove = TlvValues::new();
+        remove.add(TlvType::State as u8, &[1]);
+        remove.add(TlvType::Method as u8, &[PAIRING_METHOD_REMOVE]);
+        remove.add(TlvType::Identifier as u8, CONTROLLER.as_bytes());
+        let reply = call(&mut conn, handle_pair_remove, "/pair-remove", &remove);
+        assert_eq!(reply.get_type(TlvType::Error), None);
+        assert_eq!(conn.shared.pairing_store.get(CONTROLLER), None);
+    }
 }

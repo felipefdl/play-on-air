@@ -25,7 +25,7 @@ pub fn decrypt_rtp_chacha(cipher: &ChaCha20Poly1305, packet: &[u8]) -> Option<Ve
     let aad = &packet[4..12];
     let ciphertext = &packet[RTP_HEADER_LEN..pkt_len - NONCE_TRAIL_LEN];
     cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad })
+        .decrypt(&Nonce::from(nonce), Payload { msg: ciphertext, aad })
         .ok()
 }
 
@@ -39,7 +39,7 @@ mod tests {
         nonce[4..12].copy_from_slice(&nonce_tail);
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: plaintext,
                     aad: &header[4..12],

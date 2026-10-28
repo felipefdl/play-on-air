@@ -85,6 +85,7 @@ impl Harness {
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)).with_receiver_options(ReceiverOptions {
       advertise: false,
       ptp_ports: Some((0, 0)),
+      state_dir: None,
     }));
     let cast_pool = Arc::new(CastPool::new(None));
     cast_pool.ensure(&device);
@@ -374,6 +375,9 @@ async fn pause_then_resume_continues_where_it_stopped() {
   harness.wait_for_tone(Tone::Low, 1.5, START_DEADLINE).await;
   harness.wait_for_tone(Tone::High, 1.5, START_DEADLINE).await;
 
+  // The bridge may issue Cast PAUSE before the sender finishes reading the rate-0 response,
+  // so the PAUSE ordering check is anchored at the request, not at the response.
+  let pause_sent_at = Instant::now();
   sender.pause().await;
   let paused_at = Instant::now();
   let paused_rtp = rtp_after(start.rtp, paused_at.duration_since(anchored));
@@ -399,7 +403,7 @@ async fn pause_then_resume_continues_where_it_stopped() {
   );
   let commands = harness.cast.commands();
   assert!(
-    commands.iter().any(|cmd| cmd.kind == "PAUSE" && cmd.at >= paused_at),
+    commands.iter().any(|cmd| cmd.kind == "PAUSE" && cmd.at >= pause_sent_at),
     "Cast PAUSE after rate 0: {commands:?}"
   );
   let captures = harness.cast.captures();
