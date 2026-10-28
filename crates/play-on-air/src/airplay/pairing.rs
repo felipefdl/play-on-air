@@ -5,39 +5,24 @@
 //! across restarts and controllers added by the Home app (`/pair-add`) can still
 //! pair-verify afterwards.
 //!
-//! Storage root: `$PLAY_ON_AIR_STATE_DIR` when set, otherwise `/data` when it is a
-//! directory (the Home Assistant app data volume). With neither, receivers keep the
-//! in-memory store and a fresh identity per start.
+//! Files live in [`pairing_dir`] under the state directory the binary resolves
+//! (`--state-dir`, `$PLAY_ON_AIR_STATE_DIR`, or the platform state directory). The
+//! identity seed is a private key: files are written owner-only (`0600` on Unix).
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use shairplay::PairingStore;
 
-/// Environment variable overriding the state directory.
-pub const STATE_DIR_ENV: &str = "PLAY_ON_AIR_STATE_DIR";
-
-/// Home Assistant app data volume, used when present and no override is set.
-const HA_DATA_DIR: &str = "/data";
-
-/// Subdirectory holding one pairing file per receiver.
+/// Subdirectory of the state directory holding one pairing file per receiver.
 const PAIRING_SUBDIR: &str = "pairing";
 
-/// The resolved pairing directory, if any (resolved once per process).
-pub fn pairing_dir() -> Option<&'static Path> {
-  static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-  DIR
-    .get_or_init(|| {
-      let root = std::env::var_os(STATE_DIR_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| Path::new(HA_DATA_DIR).is_dir().then(|| PathBuf::from(HA_DATA_DIR)))?;
-      Some(root.join(PAIRING_SUBDIR))
-    })
-    .as_deref()
+/// The pairing directory under `state_dir`.
+pub fn pairing_dir(state_dir: &Path) -> PathBuf {
+  state_dir.join(PAIRING_SUBDIR)
 }
 
 /// On-disk shape of one receiver's pairing state (keys hex-encoded).
@@ -174,34 +159,38 @@ fn file_stem(device_id: &str) -> String {
     .collect()
 }
 
+/// Write `file` to `path` atomically (owner-only temp file, fsync, rename).
 fn write_atomic(path: &Path, file: &PairingFile) -> std::io::Result<()> {
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent)?;
   }
   let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
   let tmp = path.with_extension("json.tmp");
-  std::fs::write(&tmp, bytes)?;
+  // A temp file left by a crash keeps its old mode on open; start from a fresh one.
+  if let Err(err) = std::fs::remove_file(&tmp)
+    && err.kind() != std::io::ErrorKind::NotFound
+  {
+    return Err(err);
+  }
+  #[cfg(unix)]
+  let mut out =
+    std::os::unix::fs::OpenOptionsExt::mode(std::fs::OpenOptions::new().write(true).create_new(true), 0o600)
+      .open(&tmp)?;
+  #[cfg(not(unix))]
+  let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+  out.write_all(&bytes)?;
+  out.sync_all()?;
+  drop(out);
   std::fs::rename(&tmp, path)
 }
 
 fn encode_key(key: &[u8; 32]) -> String {
-  key
-    .iter()
-    .flat_map(|byte| [byte >> 4, byte & 0x0f])
-    .map(|nibble| char::from_digit(u32::from(nibble), 16).unwrap_or('0'))
-    .collect()
+  hex::encode(key)
 }
 
-fn decode_key(hex: &str) -> Option<[u8; 32]> {
-  if hex.len() != 64 || !hex.is_ascii() {
-    return None;
-  }
+fn decode_key(text: &str) -> Option<[u8; 32]> {
   let mut key = [0_u8; 32];
-  let (pairs, _) = hex.as_bytes().as_chunks::<2>();
-  for (slot, pair) in key.iter_mut().zip(pairs) {
-    let text = std::str::from_utf8(pair).ok()?;
-    *slot = u8::from_str_radix(text, 16).ok()?;
-  }
+  hex::decode_to_slice(text, &mut key).ok()?;
   Some(key)
 }
 
@@ -209,44 +198,51 @@ fn decode_key(hex: &str) -> Option<[u8; 32]> {
 mod tests {
   use super::*;
 
-  fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("play-on-air-pairing-{name}-{}", std::process::id()));
-    if dir.exists() {
-      std::fs::remove_dir_all(&dir).unwrap();
-    }
-    dir
-  }
-
   #[test]
   fn identity_and_controllers_survive_reopen() {
-    let dir = temp_dir("reopen");
-    let store = FilePairingStore::open(&dir, "Chromecast-abc:1");
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilePairingStore::open(dir.path(), "Chromecast-abc:1");
     assert_eq!(store.load_identity(), None);
     store.save_identity([3; 32]);
     store.put("controller-1", [5; 32]);
 
-    let reopened = FilePairingStore::open(&dir, "Chromecast-abc:1");
+    let reopened = FilePairingStore::open(dir.path(), "Chromecast-abc:1");
     assert_eq!(reopened.load_identity(), Some([3; 32]));
     assert_eq!(reopened.get("controller-1"), Some([5; 32]));
     assert!(reopened.has_any_pairing());
     assert_eq!(reopened.list(), vec![("controller-1".to_owned(), [5; 32])]);
 
     reopened.remove("controller-1");
-    let after_remove = FilePairingStore::open(&dir, "Chromecast-abc:1");
+    let after_remove = FilePairingStore::open(dir.path(), "Chromecast-abc:1");
     assert_eq!(after_remove.get("controller-1"), None);
     assert_eq!(after_remove.load_identity(), Some([3; 32]));
-    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]
   fn corrupt_file_starts_fresh() {
-    let dir = temp_dir("corrupt");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("dev.json"), b"not json").unwrap();
-    let store = FilePairingStore::open(&dir, "dev");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dev.json"), b"not json").unwrap();
+    let store = FilePairingStore::open(dir.path(), "dev");
     assert_eq!(store.load_identity(), None);
     assert!(!store.has_any_pairing());
-    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn pairing_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A stale temp file from a crash must not pass its mode on to the pairing file.
+    let stale = dir.path().join("dev.json.tmp");
+    std::fs::write(&stale, b"{}").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let store = FilePairingStore::open(dir.path(), "dev");
+    store.save_identity([7; 32]);
+    let mode = std::fs::metadata(dir.path().join("dev.json")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!stale.exists());
   }
 
   #[test]
@@ -260,5 +256,6 @@ mod tests {
     assert_eq!(decode_key(&encode_key(&key)), Some(key));
     assert_eq!(decode_key("zz"), None);
     assert_eq!(decode_key(&"g".repeat(64)), None);
+    assert_eq!(decode_key(&"ab".repeat(31)), None);
   }
 }

@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use play_on_air::app::App;
-use play_on_air::config::Config;
+use play_on_air::config::{self, Config};
 
 /// Chromecast devices as AirPlay 2 speakers on the local network.
 #[derive(Debug, Parser)]
@@ -20,6 +20,13 @@ struct Cli {
   /// A missing file is fine — product defaults apply.
   #[arg(long, value_name = "PATH")]
   config: Option<PathBuf>,
+
+  /// Directory for persistent state (AirPlay pairing identity and paired controllers).
+  ///
+  /// If omitted, uses `$PLAY_ON_AIR_STATE_DIR` or the platform state directory
+  /// (`~/.local/state/play-on-air` on Linux, `~/Library/Application Support/play-on-air` on macOS).
+  #[arg(long, value_name = "PATH")]
+  state_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -43,7 +50,17 @@ async fn run() -> play_on_air::Result<()> {
   // Keep JoinHandle so the signal task is not dropped before the app exits.
   let signal_task = spawn_signal_handler(shutdown_tx);
 
-  let app = App::new(config);
+  let state_dir = config::resolve_state_dir(cli.state_dir.as_deref());
+  if let Some(dir) = &state_dir {
+    tracing::info!(state_dir = %dir.display(), "persistent state directory");
+  } else {
+    tracing::warn!(
+      "no state directory (no home directory and no --state-dir / ${}); AirPlay pairing resets on restart",
+      config::STATE_DIR_ENV
+    );
+  }
+
+  let app = App::new(config, state_dir);
   app.run(shutdown_rx).await?;
   signal_task.abort();
   Ok(())

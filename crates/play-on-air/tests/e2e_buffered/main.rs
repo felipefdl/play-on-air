@@ -85,6 +85,7 @@ impl Harness {
     let airplay = Arc::new(AirPlayManager::new(Some(event_tx)).with_receiver_options(ReceiverOptions {
       advertise: false,
       ptp_ports: Some((0, 0)),
+      state_dir: None,
     }));
     let cast_pool = Arc::new(CastPool::new(None));
     cast_pool.ensure(&device);

@@ -4,6 +4,7 @@ pub mod pairing;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -432,22 +433,30 @@ impl AudioHandler for RingHandler {
   }
 }
 
-/// Network options applied to every [`AirPlayReceiver`] a manager builds.
+/// Options applied to every [`AirPlayReceiver`] a manager builds.
 ///
-/// The product uses [`ReceiverOptions::default`]. In-process tests disable mDNS and use
-/// ephemeral PTP ports so a receiver touches nothing beyond its own listeners.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The product uses [`ReceiverOptions::default`] plus its resolved state directory. In-process
+/// tests disable mDNS, use ephemeral PTP ports, and keep pairing state in memory, so a receiver
+/// touches nothing beyond its own listeners.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverOptions {
   /// Register the `_raop._tcp` / `_airplay._tcp` mDNS services (product: `true`).
   pub advertise: bool,
   /// PTP `(event, general)` UDP ports; `None` keeps the AirPlay standard 319/320, `0` binds
   /// an ephemeral port.
   pub ptp_ports: Option<(u16, u16)>,
+  /// Persistent state directory; pairing files live in its `pairing/` subdirectory. `None`
+  /// keeps the pairing identity and controllers in memory (fresh identity per start).
+  pub state_dir: Option<PathBuf>,
 }
 
 impl Default for ReceiverOptions {
   fn default() -> Self {
-    Self { advertise: true, ptp_ports: None }
+    Self {
+      advertise: true,
+      ptp_ports: None,
+      state_dir: None,
+    }
   }
 }
 
@@ -484,7 +493,7 @@ impl AirPlayReceiver {
     device_id: impl Into<String>,
     name: impl Into<String>,
     event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
-    options: ReceiverOptions,
+    options: &ReceiverOptions,
   ) -> Result<Self> {
     let device_id_owned = device_id.into();
     let name_owned = name.into();
@@ -512,8 +521,9 @@ impl AirPlayReceiver {
     if let Some((event, general)) = options.ptp_ports {
       builder = builder.ptp_ports(event, general);
     }
-    if let Some(dir) = pairing::pairing_dir() {
-      builder = builder.pairing_store(Arc::new(pairing::FilePairingStore::open(dir, &device_id_owned)));
+    if let Some(state_dir) = &options.state_dir {
+      let store = pairing::FilePairingStore::open(&pairing::pairing_dir(state_dir), &device_id_owned);
+      builder = builder.pairing_store(Arc::new(store));
     }
     let server = builder
       .build(handler)
@@ -632,7 +642,7 @@ impl AirPlayManager {
 
   /// Build every receiver with `options` instead of the product defaults.
   #[must_use]
-  pub const fn with_receiver_options(mut self, options: ReceiverOptions) -> Self {
+  pub fn with_receiver_options(mut self, options: ReceiverOptions) -> Self {
     self.options = options;
     self
   }
@@ -654,7 +664,7 @@ impl AirPlayManager {
 
     self.remove(device_id);
 
-    let mut rx = AirPlayReceiver::build(device_id, airplay_name, self.event_tx.clone(), self.options)?;
+    let mut rx = AirPlayReceiver::build(device_id, airplay_name, self.event_tx.clone(), &self.options)?;
     rx.start().await?;
     {
       let mut guard = self.receivers.lock();
@@ -820,7 +830,7 @@ impl AirPlayManager {
     tokio::time::sleep(KICK_WITHDRAW_HOLD).await;
 
     // Re-advertise under same name (kicking flag still set — use direct insert path).
-    let mut replacement = AirPlayReceiver::build(device_id, &airplay_name, self.event_tx.clone(), self.options)?;
+    let mut replacement = AirPlayReceiver::build(device_id, &airplay_name, self.event_tx.clone(), &self.options)?;
     replacement.start().await?;
     {
       let mut guard = self.receivers.lock();

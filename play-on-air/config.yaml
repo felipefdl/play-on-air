@@ -29,3 +29,4 @@ map:
     read_only: false
 environment:
   PLAY_ON_AIR_CONFIG: /config/play-on-air.toml
+  PLAY_ON_AIR_STATE_DIR: /data

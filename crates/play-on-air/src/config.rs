@@ -16,6 +16,12 @@ pub const CONFIG_ENV: &str = "PLAY_ON_AIR_CONFIG";
 /// Default relative path when neither CLI nor env is set.
 pub const DEFAULT_CONFIG_PATH: &str = "play-on-air.toml";
 
+/// Environment variable that overrides the state directory.
+pub const STATE_DIR_ENV: &str = "PLAY_ON_AIR_STATE_DIR";
+
+/// Subdirectory of the platform state directory that holds PlayOnAir state.
+const STATE_SUBDIR: &str = "play-on-air";
+
 /// Runtime configuration (always present; may be empty defaults).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
@@ -131,6 +137,32 @@ fn resolve_config_path(cli_path: Option<&Path>) -> PathBuf {
   PathBuf::from(DEFAULT_CONFIG_PATH)
 }
 
+/// Resolve the directory for persistent state (AirPlay pairing identity and paired controllers).
+///
+/// Resolution order:
+/// 1. `cli_path` (`--state-dir`)
+/// 2. `$PLAY_ON_AIR_STATE_DIR` if set and non-empty
+/// 3. `play-on-air` under the platform state directory: `$XDG_STATE_HOME` or `~/.local/state` on
+///    Linux, `~/Library/Application Support` on macOS, the local app data folder on Windows
+///
+/// `None` only when the platform has no such directory (no home directory); state then lives in
+/// memory for this process.
+pub fn resolve_state_dir(cli_path: Option<&Path>) -> Option<PathBuf> {
+  let platform = dirs::state_dir().or_else(dirs::data_local_dir);
+  state_dir_from(cli_path, env::var(STATE_DIR_ENV).ok().as_deref(), platform)
+}
+
+/// Pure precedence for [`resolve_state_dir`] (explicit path, env value, platform directory).
+fn state_dir_from(cli_path: Option<&Path>, env_value: Option<&str>, platform: Option<PathBuf>) -> Option<PathBuf> {
+  if let Some(path) = cli_path {
+    return Some(path.to_path_buf());
+  }
+  if let Some(path) = env_value.map(str::trim).filter(|value| !value.is_empty()) {
+    return Some(PathBuf::from(path));
+  }
+  platform.map(|dir| dir.join(STATE_SUBDIR))
+}
+
 fn matches_device(pattern: &str, cast_name: &str, cast_id: &str) -> bool {
   let pat = pattern.to_ascii_lowercase();
   let name = cast_name.to_ascii_lowercase();
@@ -243,5 +275,23 @@ name = "Y"
     let cfg = Config::load_optional(Some(tmp.path())).expect("load");
     assert_eq!(cfg.devices.len(), 1);
     assert_eq!(cfg.devices[0].name.as_deref(), Some("Y"));
+  }
+
+  #[test]
+  fn state_dir_precedence_is_cli_then_env_then_platform() {
+    let platform = Some(PathBuf::from("/home/alice/.local/state"));
+    assert_eq!(
+      state_dir_from(Some(Path::new("/cli")), Some("/env"), platform.clone()),
+      Some(PathBuf::from("/cli"))
+    );
+    assert_eq!(
+      state_dir_from(None, Some(" /env "), platform.clone()),
+      Some(PathBuf::from("/env"))
+    );
+    assert_eq!(
+      state_dir_from(None, Some("  "), platform),
+      Some(PathBuf::from("/home/alice/.local/state/play-on-air"))
+    );
+    assert_eq!(state_dir_from(None, None, None), None);
   }
 }

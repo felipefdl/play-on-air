@@ -17,8 +17,12 @@ axum = { version = "0.8", features = [] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 claxon = "0.4"
+# Platform state directory default (pairing identity and paired controllers).
+dirs = "7"
 flacenc = "0.5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Pairing file key encoding. Already in the graph via shairplay.
+hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }

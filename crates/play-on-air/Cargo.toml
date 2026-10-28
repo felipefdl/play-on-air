@@ -20,8 +20,10 @@ path = "src/lib.rs"
 axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
+dirs = { workspace = true }
 flacenc = { workspace = true }
 futures-util = { workspace = true }
+hex = { workspace = true }
 if-addrs = "0.13"
 parking_lot = { workspace = true }
 rust_cast = { workspace = true }

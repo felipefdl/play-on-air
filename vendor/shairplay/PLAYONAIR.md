@@ -122,6 +122,16 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
     once, then at most one per 250 ms, the last value of a burst always sent by a trailing timer.
     The current volume (`GET_PARAMETER volume`, `/info` `initialVolume`) only holds applied values.
     Single-receiver sessions apply every value and send no acknowledgement.
+27. **Apple Home accessory setup** (HAP pairing admin). `POST /pair-add`, `/pair-remove` and
+    `/pair-list` take HAP TLV8 (`State = 1`, `Method` 3/4/5) and answer `State = 2`, with
+    `Error` 1 (unknown: malformed body, wrong method, re-adding a known controller with a
+    different key) or 2 (authentication). `/pair-list` reports every stored controller as admin.
+    `POST /configure` answers the accessory identity (`Identifier`, `PublicKey`, `Device_Name`,
+    `Enable_HK_Access_Control = true`, `Access_Control_Level = 0`), as shairport-sync does, and
+    logs the request keys. All four need a connection that completed pair-setup (transient
+    included) or pair-verify (else `Authentication` / RTSP 470); there is no admin-permission
+    check (accepted deviations). `PairingStore::list()` enumerates controllers (default empty;
+    `MemoryPairingStore` implements it). PlayOnAir persists the store per receiver.
 
 ### AirPlay 2 dependencies kept
 
@@ -150,5 +160,10 @@ removing video is out of scope.
   the absolute start offset can differ from the sender's intent (bounded by 1 s after the first
   unlocked anchor). The PTP follower never transmits and does not take part
   in master election.
+- **Pairing admin without admin permission:** HAP lets only admin controllers add, remove or
+  list pairings. Here any connection that finished pair-setup can, transient included: the Home
+  app's first `/pair-add` arrives on its transient session, and transient pairing already lets
+  any LAN client play without a PIN (`acl=0`, `Access_Control_Level = 0`). A LAN client can
+  remove the Home controllers; the speaker then has to be added to Home again.
 
 Keep upstream license files. Prefer contributing hard-stop upstream and dropping the vendor when released.

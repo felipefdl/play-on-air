@@ -352,9 +352,14 @@ fn pairing_admin_response(error: Option<u8>) -> Vec<u8> {
 /// Validate a pairing-admin request and decode its TLV body.
 ///
 /// Admin requests are only honored on a connection that completed pair-setup or
-/// pair-verify, so the controller is authenticated and the body arrived over the
-/// encrypted channel. The body must carry `State = 1` and, when present, the
-/// expected `Method`.
+/// pair-verify, so the body arrived over the encrypted channel. Transient
+/// pair-setup counts: the Home app sends its first `/pair-add` on that session.
+/// HAP restricts these endpoints to admin controllers; this receiver does not,
+/// because transient pairing is already open to the LAN (it plays audio
+/// without a PIN). Any LAN client can therefore add or remove controllers;
+/// removing the Home controllers drops the speaker from Home until it is added
+/// again. The body must carry `State = 1` and, when present, the expected
+/// `Method`.
 fn pairing_admin_request(
     conn: &RaopConnection,
     request: &HttpRequest,
