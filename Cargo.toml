@@ -178,6 +178,12 @@ cargo_common_metadata = "allow"
 debug = true
 overflow-checks = true
 
+# Optimize dependencies (crypto, codecs, and the vendored shairplay) in dev and test builds.
+# The e2e timing tests need decrypt/decode/encode to run faster than real time; unoptimized
+# RustCrypto code is too slow for that on CI runners. PlayOnAir's own code stays at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = true
 codegen-units = 1
