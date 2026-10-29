@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+- **Renaming a speaker in the Apple Home app renames its AirPlay speaker**, so Siri finds it by the name you gave it, by speaker or by room. Siri used to answer that it can't play there, because PlayOnAir kept advertising the Cast name. The Home name wins over a configured rename; removing the speaker from Home brings back the Cast or configured name.
+- Images are published only with a GitHub release: `latest` is the latest release instead of the latest build from `main`, and `sha-*` tags are no longer pushed.
+- Building from source needs Rust 1.99.1 or newer.
+
 ## 0.5.0
 
 - **Add PlayOnAir speakers to the Apple Home app**, assign them to rooms, and play to them with Siri. Adding a speaker used to fail with "Unable to Add Accessory": PlayOnAir did not answer the Home app's pairing requests. Contributed by @mkrajinovic (#14).
