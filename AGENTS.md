@@ -78,7 +78,6 @@ Observed sender, Apple Home, and Cast behavior, with the advertisement experimen
 ```
 play-on-air/
   AGENTS.md          # this file
-  CLAUDE.md          # symlink → AGENTS.md
   VISION.md          # product intent
   LICENSE.md         # MIT, Felipe Lima
   README.md

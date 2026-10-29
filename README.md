@@ -5,11 +5,14 @@
 
 # PlayOnAir
 
-Chromecast devices as AirPlay 2 speakers on the local network.
+AirPlay 2 for your Google Cast speakers.
 
-Your Chromecasts show up in the AirPlay picker on iPhone, iPad, and Mac. One process on your LAN. No accounts, no cloud, no telemetry.
+Nest speakers, Chromecasts, and TVs with Chromecast built-in show up in the AirPlay picker on iPhone, iPad, and Mac. Play to one, or select several and they play in sync. Add them to the Apple Home app, put them in rooms, and ask Siri to play there.
 
-PlayOnAir discovers Google Cast devices, advertises each as an AirPlay 2 receiver, and bridges audio to the matching Chromecast. The Cast hop is lossless FLAC when the device accepts it (WAV fallback otherwise), never a default second lossy encode.
+- **Lossless to the speaker.** AirPlay audio is decoded once and sent to Cast as FLAC (WAV when a device rejects FLAC), never re-encoded to a lossy format.
+- **Multi-room in sync.** Speakers selected together play through Google Cast multizone, the same mechanism the Google Home app uses.
+- **Apple Home and Siri.** Assign speakers to rooms and play to them by name or by room.
+- **Zero setup.** Install and start. No config file, no accounts, no cloud, no telemetry. Runs as a Home Assistant app, a Docker image, or a single binary.
 
 ---
 
@@ -28,8 +31,10 @@ Cast devices appear in the AirPlay picker under their Cast names. App details: [
 ### Container image
 
 ```bash
-docker run --rm --network host ghcr.io/felipefdl/play-on-air:latest
+docker run --rm --network host -v play-on-air-state:/data ghcr.io/felipefdl/play-on-air:latest
 ```
+
+The `play-on-air-state` volume keeps each speaker's AirPlay identity and Apple Home pairing when the container is recreated.
 
 | Image | Notes |
 |-------|--------|
@@ -42,6 +47,7 @@ Optional config via a volume when you need rename/hide (not required to play). T
 
 ```bash
 docker run --rm --network host \
+  -v play-on-air-state:/data \
   -v "$PWD/config:/config" \
   ghcr.io/felipefdl/play-on-air:latest
 ```
@@ -60,6 +66,14 @@ play-on-air
 No config file and no flags required. Keep the process running on a machine on the same LAN as the Chromecasts and the phone.
 
 **macOS:** grant **Local Network** access for the app that hosts the binary (Terminal, iTerm, your IDE, and so on) under **System Settings → Privacy & Security → Local Network**. Without it, discovery may work but Cast TCP fails with `No route to host`. If the app is not listed yet, run `play-on-air` once from Terminal.app so macOS can prompt.
+
+## Using it
+
+Open the AirPlay picker (Control Center, the Music app, or the menu bar on a Mac) and pick a Cast speaker. Pause, skip, seek, and volume work as with any AirPlay speaker; switching to another output stops the speaker at once.
+
+**Several speakers at once:** select them together and they play in sync. The first one starts the stream; the others join it through Google Cast multizone. Pause, skip, and seek act on the whole group; volume stays per speaker. Deselecting a speaker removes it from the group, including the one that started. Temporary Google speaker groups created this way never appear as extra AirPlay speakers; speaker groups made in the Google Home app still do.
+
+**If something else takes the speaker:** Google Assistant, YouTube, or another Cast app ends the bridge and disconnects AirPlay so the phone leaves Now Playing. Another phone AirPlaying to the same speaker wins; prior audio stops (iOS may take a moment to clear Now Playing).
 
 ## Optional: rename or hide
 
@@ -94,7 +108,7 @@ PlayOnAir keeps each speaker's pairing identity, the controllers Home registers,
 | Run | State directory |
 |-----|-----------------|
 | Home Assistant | The app's private `/data` (included in Home Assistant backups) |
-| Container | `/data`. Mount a volume so pairing survives recreating the container: `docker run --network host -v play-on-air-state:/data ghcr.io/felipefdl/play-on-air:latest` |
+| Container | `/data`: the `play-on-air-state` volume in the commands above |
 | Binary | `--state-dir PATH`, `$PLAY_ON_AIR_STATE_DIR`, or the platform default: `$XDG_STATE_HOME/play-on-air` (`~/.local/state/play-on-air`) on Linux, `~/Library/Application Support/play-on-air` on macOS |
 
 Deleting the directory gives every speaker a new identity: remove the speakers from Home and add them again.
@@ -109,10 +123,6 @@ Deleting the directory gives every speaker a new identity: remove the speakers f
 | LAN process | Same network as the Cast devices; no cloud or accounts |
 | No mixed-vendor sync | Group PlayOnAir speakers only with other PlayOnAir speakers, or Apple speakers only with Apple speakers. Cast cannot take Apple multi-room timing, so a group that mixes PlayOnAir speakers with HomePods or other AirPlay speakers plays out of sync. |
 | Apple Home status | The Home tile of a PlayOnAir speaker shows **No Response** (it shows what is playing while your iPhone streams to it), with no controls. The home hub connects only to add, remove, or rename the speaker, never to check status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication. shairport-sync has the same limit. |
-
-**Several PlayOnAir speakers at once:** select them together in the AirPlay picker and they play in sync. The first one starts the stream; the others join it through Google Cast multizone, the same mechanism the Google Home app uses to add speakers to a playing stream. Pause, skip, and seek act on the whole group; volume stays per speaker. Deselecting a speaker removes it from the group, including the one that started. Temporary Google speaker groups created this way never appear as extra AirPlay speakers; speaker groups made in the Google Home app still do.
-
-**If something else takes the speaker:** Google Assistant, YouTube, or another Cast app ends the bridge and disconnects AirPlay so the phone leaves Now Playing. Another phone AirPlaying to the same speaker wins; prior audio stops (iOS may take a moment to clear Now Playing).
 
 ## More
 
