@@ -66,7 +66,7 @@ No config file and no flags required. Keep the process running on a machine on t
 
 Never required to play audio. Empty defaults keep Cast names and show every discovered device.
 
-Two Chromecasts with the same name get distinct AirPlay names: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured rename is used exactly as written.
+Two Chromecasts with the same name get distinct AirPlay names: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured rename is used exactly as written. A speaker added to Apple Home uses the name given in the Home app instead (see [Apple Home](#apple-home)).
 
 - **Home Assistant:** Configuration tab (log level, rename, hide). Full field reference: [play-on-air/DOCS.md](play-on-air/DOCS.md).
 - **Binary / container:** optional TOML (`--config PATH`, `$PLAY_ON_AIR_CONFIG`, or `./play-on-air.toml`).
@@ -86,9 +86,11 @@ Two Chromecasts with the same name get distinct AirPlay names: the model is appe
 
 ## Apple Home
 
-Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
+Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri, by speaker name or by room; your iPhone streams to it. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
 
-PlayOnAir keeps each speaker's pairing identity and the controllers Home registers in a state directory, so Home keeps the speaker across restarts:
+Renaming the speaker in the Home app renames its AirPlay speaker too, within a few seconds (after the current stream ends, if one is playing), so Siri and the AirPlay picker use the same name. The Home name wins over a configured rename; removing the speaker from Home brings back the Cast or configured name.
+
+PlayOnAir keeps each speaker's pairing identity, the controllers Home registers, and its Home name in a state directory, so Home keeps the speaker across restarts:
 
 | Run | State directory |
 |-----|-----------------|
@@ -107,7 +109,7 @@ Deleting the directory gives every speaker a new identity: remove the speakers f
 | Audio only | No video, screen mirroring, or A/V lip sync |
 | LAN process | Same network as the Cast devices; no cloud or accounts |
 | No mixed-vendor sync | Group PlayOnAir speakers only with other PlayOnAir speakers, or Apple speakers only with Apple speakers. Cast cannot take Apple multi-room timing, so a group that mixes PlayOnAir speakers with HomePods or other AirPlay speakers plays out of sync. |
-| Apple Home status | A speaker added to Home plays from the AirPlay picker, but its Home tile shows **No Response** (it can show what is playing while your iPhone streams to it), and Siri can refuse to play to it ("select the speaker from the AirPlay menu"). The home hub never connects to third-party AirPlay receivers for status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication. shairport-sync has the same limit. |
+| Apple Home status | The Home tile of a PlayOnAir speaker shows **No Response** (it shows what is playing while your iPhone streams to it), with no controls. The home hub connects only to add, remove, or rename the speaker, never to check status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication. shairport-sync has the same limit. |
 
 **Several PlayOnAir speakers at once:** select them together in the AirPlay picker and they play in sync. The first one starts the stream; the others join it through Google Cast multizone, the same mechanism the Google Home app uses to add speakers to a playing stream. Pause, skip, and seek act on the whole group; volume stays per speaker. Deselecting a speaker removes it from the group, including the one that started. Temporary Google speaker groups created this way never appear as extra AirPlay speakers; speaker groups made in the Google Home app still do.
 

@@ -40,7 +40,7 @@ Examples:
 - Match id `Living Room`, AirPlay name `TV` → picker shows **TV**.
 - Match id `bedroom`, Hide enabled → that speaker never appears in AirPlay.
 
-Two Chromecasts with the same name get distinct AirPlay names without any configuration: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured AirPlay name is used exactly as written.
+Two Chromecasts with the same name get distinct AirPlay names without any configuration: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured AirPlay name is used exactly as written. A speaker added to Apple Home uses the name given in the Home app instead (see [Apple Home](#apple-home)).
 
 Save, then **Restart** the app so the entrypoint reloads options.
 
@@ -71,9 +71,11 @@ hide = true
 
 ## Apple Home
 
-Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
+Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri, by speaker name or by room; your iPhone streams to it. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
 
-Each speaker's pairing identity and the controllers Home registers live in the app's private `/data`, so Home keeps the speakers across restarts and updates, and Home Assistant backups include them. Uninstalling the app deletes them: after reinstalling, remove the speakers from Home and add them again.
+Renaming the speaker in the Home app renames its AirPlay speaker too, within a few seconds (after the current stream ends, if one is playing), so Siri and the AirPlay picker use the same name. The Home name wins over an **AirPlay name** set in the Configuration tab; removing the speaker from Home brings back the Cast or configured name.
+
+Each speaker's pairing identity, the controllers Home registers, and its Home name live in the app's private `/data`, so Home keeps the speakers across restarts and updates, and Home Assistant backups include them. Uninstalling the app deletes them: after reinstalling, remove the speakers from Home and add them again.
 
 ## Image
 
@@ -117,7 +119,7 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Several PlayOnAir speakers | Selected together in the AirPlay picker, they play in sync through Google Cast multizone: the first starts the stream and the others join it. Pause, skip, and seek act on the group; volume stays per speaker; deselecting any speaker (including the first) leaves the rest playing |
 | Mixed speakers | PlayOnAir speakers selected together with HomePods or other AirPlay speakers are not in sync with them: Cast cannot take Apple multi-room timing |
 | Speaker groups | Temporary Google speaker groups (created when a stream expands to more speakers) are not shown in AirPlay; speaker groups made in the Google Home app are |
-| Apple Home status | A speaker added to Home plays from the AirPlay picker, but its Home tile shows **No Response** (it can show what is playing while your iPhone streams to it), and Siri can refuse to play to it ("select the speaker from the AirPlay menu"). The home hub never connects to third-party AirPlay receivers for status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication |
+| Apple Home status | The Home tile of a PlayOnAir speaker shows **No Response** (it shows what is playing while your iPhone streams to it), with no controls. The home hub connects only to add, remove, or rename the speaker, never to check status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication |
 
 ## Store assets
 

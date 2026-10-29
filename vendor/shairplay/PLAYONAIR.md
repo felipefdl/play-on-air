@@ -128,10 +128,15 @@ kicked the speaker advertisement but **iPhone Now Playing stayed connected**.
     different key) or 2 (authentication). `/pair-list` reports every stored controller as admin.
     `POST /configure` answers the accessory identity (`Identifier`, `PublicKey`, `Device_Name`,
     `Enable_HK_Access_Control = true`, `Access_Control_Level = 0`), as shairport-sync does, and
-    logs the request keys. All four need a connection that completed pair-setup (transient
-    included) or pair-verify (else `Authentication` / RTSP 470); there is no admin-permission
-    check (accepted deviations). `PairingStore::list()` enumerates controllers (default empty;
-    `MemoryPairingStore` implements it). PlayOnAir persists the store per receiver.
+    logs the `ConfigurationDictionary` keys. A non-empty `Device_Name` in it (the Home app's
+    name; every home device sends it again after a rename) is recorded with
+    `PairingStore::set_home_name` and echoed in the reply; `PairingStore::home_name` reads it
+    back (defaults: nothing kept). Stores forget it when the last controller is removed. The
+    host decides whether to advertise it. All four need a connection that completed pair-setup
+    (transient included) or pair-verify (else `Authentication` / RTSP 470); there is no
+    admin-permission check (accepted deviations). `PairingStore::list()` enumerates controllers
+    (default empty; `MemoryPairingStore` implements it, and the Home name). PlayOnAir persists
+    the store per receiver and advertises the Home name.
 
 ### AirPlay 2 dependencies kept
 
