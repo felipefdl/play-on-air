@@ -501,6 +501,39 @@ async fn flush_then_new_anchor_drops_old_track() {
   harness.stop().await;
 }
 
+/// (d) The sender ends the session (`TEARDOWN`, as when the iPhone switches to another
+/// output): Cast gets a media STOP right away instead of playing out its read-ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn teardown_stops_cast_playback() {
+  let _serial = SERIAL.lock().await;
+  let harness = Harness::start("teardown").await;
+  let (low, _high) = fixtures();
+  let mut sender = Sender::connect(harness.rtsp_port).await;
+
+  let start = Cursor { seq: 11, rtp: 0x0010_0000 };
+  let _end = sender
+    .send_frames(start, frames_for(20), |i| (&low, (i % FRAMES_PER_UNIT) as usize))
+    .await;
+  sender.play_at_now(start.rtp).await;
+  harness.wait_for_tone(Tone::Low, 1.0, START_DEADLINE).await;
+
+  let teardown_sent_at = Instant::now();
+  sender.teardown().await;
+  let deadline = teardown_sent_at + Duration::from_secs(3);
+  let media_stop = |commands: &[fake_cast::Command]| {
+    commands
+      .iter()
+      .any(|cmd| cmd.kind == "STOP" && cmd.destination != "receiver-0" && cmd.at >= teardown_sent_at)
+  };
+  while !media_stop(&harness.cast.commands()) && Instant::now() < deadline {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  let commands = harness.cast.commands();
+  assert!(media_stop(&commands), "no Cast media STOP within 3 s of TEARDOWN: {commands:?}");
+
+  harness.stop().await;
+}
+
 /// Cast pool against the fake device: `SET_PLAYBACK_DEVICES` carries the receiver app session
 /// id and the full member list to `receiver-0`, and after the answered session move media
 /// control runs on the session host, on the app's new transport (a message to the old one

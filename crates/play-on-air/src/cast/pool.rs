@@ -487,11 +487,6 @@ enum CastWorkerCmd {
   MediaStatus { reply: SyncSender<Result<MediaPlayback>> },
   /// Best-effort stop; always replies after attempt (or immediately if no session).
   StopBestEffort { reply: SyncSender<()> },
-  /// Bridge-initiated session end: clear ownership tracking without Cast STOP.
-  ///
-  /// Lets probes stand down immediately so a missing media session is not declared
-  /// as "another app took the receiver" after our own teardown.
-  SessionEnded,
   /// Replace the now-playing metadata of the live media (no reply; latest wins).
   UpdateMetadata { track: CastTrack },
   /// Send multizone `SET_PLAYBACK_DEVICES` for the active session and return the answer.
@@ -969,25 +964,16 @@ impl CastControl for CastPool {
 
   /// Mark a bridge-initiated session end so ownership probes stand down.
   ///
-  /// Fire-and-forget: sets a cross-thread stand-down flag immediately, then queues a
-  /// worker command that clears the tracked active load without sending Cast STOP.
-  /// Call this on full session teardown (terminal stall, session end) **before** or
-  /// with [`Self::stop_best_effort`] so a missing media session is not declared as
-  /// "another app took the receiver".
+  /// Sets a cross-thread stand-down flag at once and leaves the tracked load in place, so the
+  /// [`Self::stop_best_effort`] that follows a full teardown still finds the media session to
+  /// STOP (and then clears it). Until the next LOAD, a missing media session is not declared
+  /// as "another app took the receiver".
   ///
   /// Do **not** call on replace-path teardowns: a new LOAD may already own (or is
   /// about to own) the active session.
   fn session_ended(&self, device_id: &str) {
-    let guard = self.workers.lock();
-    let Some(handle) = guard.get(device_id) else {
-      return;
-    };
-    // Instant stand-down: probe must not declare loss while SessionEnded is still queued.
-    handle.ownership_stand_down.store(true, Ordering::Release);
-    let tx = handle.cmd_tx.clone();
-    drop(guard);
-    if tx.send(CastWorkerCmd::SessionEnded).is_err() {
-      tracing::debug!(%device_id, "session_ended: worker gone");
+    if let Some(handle) = self.workers.lock().get(device_id) {
+      handle.ownership_stand_down.store(true, Ordering::Release);
     }
   }
 
@@ -1343,14 +1329,6 @@ fn worker_main(
         // STOP may fail after take; ensure ownership state is fully cleared either way.
         state.clear_active_session();
         let _send = reply.send(());
-      },
-      CastWorkerCmd::SessionEnded => {
-        state.clear_active_session();
-        state.ownership_stand_down.store(true, Ordering::Release);
-        tracing::debug!(
-          device_id = %state.device_id,
-          "Cast session ended by bridge; ownership probe stand-down"
-        );
       },
       CastWorkerCmd::UpdateMetadata { track } => {
         // Latest wins: a newer queued update supersedes this one.
@@ -3527,12 +3505,6 @@ mod tests {
   }
 
   #[test]
-  fn session_ended_without_worker_is_noop() {
-    let pool = CastPool::new(None);
-    pool.session_ended("no-such");
-  }
-
-  #[test]
   fn ownership_probe_stands_down_without_active_or_after_bridge_end() {
     assert!(ownership_probe_stands_down(true, false), "no tracked session ⇒ stand down");
     assert!(
@@ -3569,23 +3541,8 @@ mod tests {
     );
     assert!(
       ownership_probe_stands_down(/* active_is_none */ false, /* bridge_ended */ true),
-      "instant stand-down flag path (cmd still queued) stands down"
+      "stand-down flag with the load still tracked (STOP not sent yet) stands down"
     );
-  }
-
-  #[test]
-  fn session_ended_on_live_worker_does_not_emit_ownership_lost() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let pool = CastPool::new(Some(tx));
-    let device = sample_device("session-ended-no-steal");
-    pool.ensure(&device);
-    // Bridge-initiated end while no media was ever loaded: must not kick.
-    pool.session_ended(&device.id);
-    // Allow worker to drain SessionEnded.
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(rx.try_recv().is_err(), "session_ended must not emit ownership_lost");
-    pool.shutdown();
-    wait_until_worker_gone(&pool, &device.id);
   }
 
   #[test]

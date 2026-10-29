@@ -47,8 +47,6 @@ mod test_support;
 mod volume;
 mod worker;
 
-pub use self::teardown::{SessionEndStep, session_end_steps};
-
 /// Bound for joining device workers once shutdown is requested.
 const SHUTDOWN_WORKER_JOIN: Duration = Duration::from_secs(3);
 /// Bound for ending live sessions (media, Cast STOP) and detached teardowns on bridge exit.

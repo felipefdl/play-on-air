@@ -585,15 +585,21 @@ impl Bridge {
           slot.state = DeviceState::Playing { generation, session: Box::new(playing) };
           None
         },
-        Some(_) | None => Some(playing),
+        // A newer start owns the slot and LOADs over this media; a STOP could land on its
+        // session instead (STOP acts on whatever the Cast worker tracks).
+        Some(slot) if matches!(slot.state, DeviceState::Starting { .. } | DeviceState::Playing { .. }) => {
+          Some((playing, TeardownCastPolicy::SkipStopForReplace))
+        },
+        // Cancelled (Ended during LOAD), joined a group as a follower, or removed: stop Cast now.
+        Some(_) | None => Some((playing, TeardownCastPolicy::StopBestEffort)),
       };
       drop(devices);
       result
     };
 
-    if let Some(orphaned) = orphan {
-      tracing::info!(%device_id, generation, "start superseded before Playing install; tearing down");
-      self.detach_teardown(orphaned, TeardownCastPolicy::StopBestEffort);
+    if let Some((orphaned, policy)) = orphan {
+      tracing::info!(%device_id, generation, ?policy, "start superseded before Playing install; tearing down");
+      self.detach_teardown(orphaned, policy);
     } else if let Some(uuid) = group {
       self.group_owner_playing(&uuid, device_id);
     }

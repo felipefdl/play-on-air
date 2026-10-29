@@ -1,4 +1,4 @@
-//! Session end and replace teardown (media first, ownership clear, then best-effort Cast STOP).
+//! Session end and replace teardown (probe stand-down, media first, then best-effort Cast STOP).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,30 +24,6 @@ pub(super) enum TeardownCastPolicy {
   /// Skip STOP so the per-device pool worker is not HOL-blocked before the new LOAD.
   /// Old [`MediaServer`] is still shut down so the prior HTTP body stops immediately.
   SkipStopForReplace,
-}
-
-/// Ordered teardown steps for a full session end (media first, then Cast STOP).
-///
-/// [`Bridge::handle_session_end`] always runs these in order: media HTTP first,
-/// clear pool ownership tracking, then timed best-effort Cast STOP. Media must
-/// not wait on STOP success. Ownership clear must not wait on STOP either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionEndStep {
-  /// Shut down the local media HTTP server (stop underrun immediately).
-  MediaShutdown,
-  /// Clear Cast pool ownership tracking so probes stand down (no false steal).
-  ClearSessionOwnership,
-  /// Best-effort Cast STOP with timeout (may fail or time out).
-  CastStopBestEffort,
-}
-
-/// Shipped full session-end order (media → ownership clear → Cast STOP).
-pub const fn session_end_steps() -> [SessionEndStep; 3] {
-  [
-    SessionEndStep::MediaShutdown,
-    SessionEndStep::ClearSessionOwnership,
-    SessionEndStep::CastStopBestEffort,
-  ]
 }
 
 /// Whether replace teardown should skip Cast STOP (new LOAD replaces the app session).
@@ -134,8 +110,9 @@ pub(super) async fn teardown_playing(session: PlayingSession, policy: TeardownCa
     session.late_stop_allowed.store(false, Ordering::Release);
   } else {
     // Full end: stand ownership probes down immediately (before long joins / STOP I/O)
-    // so a terminal-stall media absence cannot be declared as a false steal.
-    // Do not clear on replace — a new LOAD may already own (or will own) active.
+    // so a terminal-stall media absence cannot be declared as a false steal. The pool
+    // keeps the tracked media session, so the Cast STOP below still reaches it.
+    // Not on replace: a new LOAD may already own (or will own) active.
     session.pool.session_ended(&media_key);
   }
   session.session_alive.store(false, Ordering::Release);
@@ -206,13 +183,12 @@ fn end_media_and_maybe_cast_stop(
   media.shutdown();
   if replace_skips_cast_stop(policy) {
     // New LOAD is about to replace the Cast app session; avoid HOL-blocking it.
-    // Do not session_ended here — that would clear the superseding LOAD's active.
+    // No STOP: it would stop whatever session the worker holds, possibly the new LOAD's.
     return;
   }
-  // Ownership was already stood down via `session_ended` at the start of full
-  // teardown. Issue Cast STOP best-effort (no-ops if SessionEnded already cleared
-  // active; still useful when only stop_best_effort is used from other paths).
-  // Retry once on timeout/failure so Nest/Cast does not keep pulling a dead URL.
+  // Probes already stood down via `session_ended` at the start of full teardown; the
+  // worker still tracks this session's media, so STOP ends playback now instead of the
+  // speaker playing out its read-ahead. Retry once on timeout/failure.
   let stop_timeout = Duration::from_secs(2);
   if !pool.stop_best_effort(device_id, stop_timeout) {
     tracing::warn!(%device_id, "Cast STOP best-effort failed or timed out; retrying once");
@@ -397,15 +373,6 @@ mod tests {
   use crate::bridge::test_support::{FixedRingLookup, http_get_status_ok, insert_playing, test_playing_session};
   use crate::media::MediaServer;
   use crate::registry::{Device, DeviceRegistry};
-
-  #[test]
-  fn session_end_steps_media_before_cast_stop() {
-    let steps = session_end_steps();
-    assert_eq!(steps.len(), 3);
-    assert_eq!(steps[0], SessionEndStep::MediaShutdown);
-    assert_eq!(steps[1], SessionEndStep::ClearSessionOwnership);
-    assert_eq!(steps[2], SessionEndStep::CastStopBestEffort);
-  }
 
   #[test]
   fn replace_teardown_skips_cast_stop() {

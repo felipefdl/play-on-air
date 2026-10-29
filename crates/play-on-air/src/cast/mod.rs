@@ -262,7 +262,8 @@ pub trait CastControl: Send + Sync + std::fmt::Debug {
   fn media_playback(&self, key: &str) -> Result<MediaPlayback>;
   /// Media STOP with a wall-clock bound; `true` when acknowledged.
   fn stop_best_effort(&self, key: &str, timeout: std::time::Duration) -> bool;
-  /// Bridge-initiated end: stand ownership probes down without a Cast STOP.
+  /// Full session end: stand ownership probes down now; the tracked media session stays for the
+  /// [`Self::stop_best_effort`] that follows.
   fn session_ended(&self, key: &str);
   /// Replace the live media's now-playing metadata (fire-and-forget).
   fn update_metadata(&self, key: &str, track: CastTrack);
