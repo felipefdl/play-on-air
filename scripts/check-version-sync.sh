@@ -62,7 +62,7 @@ check 'Dockerfile ARG BUILD_VERSION' "$docker_version"
 changelog_version=$(sed -n 's/^## \([^[:space:]]*\)[[:space:]]*$/\1/p' play-on-air/CHANGELOG.md | head -n 1)
 check 'play-on-air/CHANGELOG.md latest section' "$changelog_version"
 
-# Pinned image tags in docs (latest, <version>, and sha-* tags are not pinned).
+# Pinned image tags in docs (`latest` and the `<version>` placeholder are not pinned).
 # play-on-air/DOCS.md must pin the image at the app version; README.md may pin it.
 for doc in README.md play-on-air/DOCS.md; do
   tags=$(grep -oE 'play-on-air:[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' "$doc" | sed 's/^play-on-air://; s/\.$//' || true)

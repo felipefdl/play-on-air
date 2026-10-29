@@ -33,9 +33,8 @@ docker run --rm --network host ghcr.io/felipefdl/play-on-air:latest
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/felipefdl/play-on-air:latest` | Latest build from `main` |
+| `ghcr.io/felipefdl/play-on-air:latest` | Latest release |
 | `ghcr.io/felipefdl/play-on-air:<version>` | Pinned release (see GitHub Releases) |
-| `ghcr.io/felipefdl/play-on-air:sha-<short>` | Immutable short SHA |
 
 Architectures: `linux/amd64`, `linux/arm64`.
 

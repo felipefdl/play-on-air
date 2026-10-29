@@ -123,7 +123,7 @@ Do not claim done on green unit tests alone if format, clippy, or supply-chain g
 
 ## Deploy and release (version sync — hard)
 
-One version string everywhere. Never ship GHCR without a matching GitHub Release (and never leave a Release for a version that was not built).
+One version string everywhere. Images reach GHCR only by publishing a GitHub Release; pushes to `main` and pull requests build the image without pushing it.
 
 | Surface | Source of truth |
 |---------|-----------------|
@@ -133,21 +133,22 @@ One version string everywhere. Never ship GHCR without a matching GitHub Release
 | Docker default | `Dockerfile` → `ARG BUILD_VERSION` |
 | Docs image tags | root `README.md`, `play-on-air/DOCS.md` |
 | Changelog | `play-on-air/CHANGELOG.md` section `## x.y.z` |
-| GHCR tags | `ghcr.io/felipefdl/play-on-air:x.y.z` (+ `latest` on main) |
-| Git tag + GitHub Release | `vX.Y.Z` created by `.github/workflows/docker.yml` **release** job after image merge |
+| Git tag + GitHub Release | `vX.Y.Z`, published with `gh release create` |
+| GHCR tags | `ghcr.io/felipefdl/play-on-air:x.y.z` and `latest`, pushed by `.github/workflows/docker.yml` when that release is published; a tag that disagrees with any surface above fails before the build |
 
 ### Ship flow (agents and humans)
 
-1. Bump **all** version surfaces in the same change (list above).
-2. Add a `## x.y.z` block at the top of `play-on-air/CHANGELOG.md`.
-3. Merge to `main` (or push tag `vX.Y.Z`).
-4. Wait for **docker** workflow: build → multi-arch merge → **release** job.
-5. Confirm:
-   - GHCR: `ghcr.io/felipefdl/play-on-air:x.y.z`
-   - GitHub Releases: `vX.Y.Z` with the same version and changelog notes
-6. Only then tell users to upgrade the HA app / pull the image.
+Home Assistant reads `play-on-air/config.yaml` from `main` and offers the update as soon as the bump lands there, so the image is published before `main` moves.
 
-Do **not** create ad-hoc GitHub Releases by hand with a different version than `config.yaml`. Do **not** bump GHCR-only without the release job. If the release job fails, fix and re-run; do not claim the version shipped.
+1. On local `main`, bump **all** version surfaces and add a `## x.y.z` block at the top of `play-on-air/CHANGELOG.md`; commit `chore(release): x.y.z`. Run the quality gate.
+2. Push only the tag, which uploads the commit without moving `main`:
+   `git tag -a vX.Y.Z -m "PlayOnAir X.Y.Z" && git push origin vX.Y.Z`
+3. Publish the release with the changelog section as notes:
+   `gh release create vX.Y.Z --verify-tag --title "PlayOnAir X.Y.Z" --notes "$(awk -v v=X.Y.Z '$0 == "## " v {p=1; next} p && /^## / {exit} p' play-on-air/CHANGELOG.md)"`
+4. Wait for the **docker** workflow run of that release (version check → build → merge) and confirm `ghcr.io/felipefdl/play-on-air:x.y.z` exists.
+5. `git push origin main`. Only then tell users to upgrade the HA app or pull the image.
+
+If the release run fails, fix it and re-run the failed jobs; the version has not shipped until the image exists.
 
 ## README and repo files
 

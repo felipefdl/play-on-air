@@ -1,21 +1,22 @@
-# Native multi-arch image build → GHCR (amd64 + arm64), digest push + manifest merge.
+# Native multi-arch image build (amd64 + arm64). Pull requests and pushes to main only build the
+# image. Publishing a GitHub Release (`gh release create vX.Y.Z`) pushes `x.y.z` and `latest` to GHCR.
 name: docker
 
 on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   pull_request:
-  workflow_dispatch:
+  release:
+    types:
+      - published
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: play-on-air
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 jobs:
@@ -32,16 +33,9 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="$(sed -n 's/^version: *"\(.*\)"/\1/p' play-on-air/config.yaml | head -n1)"
-            if [[ -z "${VERSION}" ]]; then
-              VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-            fi
-          fi
+          VERSION="$(sed -n 's/^version: *"\(.*\)"/\1/p' play-on-air/config.yaml | head -n1)"
           if [[ -z "${VERSION}" ]]; then
-            echo "could not resolve version" >&2
+            echo "could not resolve version from play-on-air/config.yaml" >&2
             exit 1
           fi
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
@@ -50,11 +44,18 @@ jobs:
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
           echo "Resolved version=${VERSION} image=${IMAGE}"
 
-      # Every downstream job (build, merge, release) needs this job, so a mismatch blocks publishing.
+      # Build and merge need this job, so a release tag that does not match every version surface
+      # fails before anything is pushed.
       - name: Check version sync
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: scripts/check-version-sync.sh "${VERSION}"
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "release" && "${RELEASE_TAG}" != v* ]]; then
+            echo "release tag '${RELEASE_TAG}' must be vX.Y.Z" >&2
+            exit 1
+          fi
+          scripts/check-version-sync.sh "${RELEASE_TAG#v}"
 
   build:
     needs: version
@@ -77,7 +78,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'release'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -89,9 +90,9 @@ jobs:
           platform="${{ matrix.platform }}"
           echo "PLATFORM_PAIR=${platform//\//-}" >> "${GITHUB_ENV}"
 
-      # Pull requests: build only (no registry push).
-      - name: Build (pull request)
-        if: github.event_name == 'pull_request'
+      # Pull requests and main: build only (no registry push).
+      - name: Build
+        if: github.event_name != 'release'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -105,10 +106,10 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
-      # Default branch / tags / dispatch: push by digest for later manifest merge.
+      # Published release: push by digest for the manifest merge.
       - name: Build and push by digest
         id: build
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'release'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -130,7 +131,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'release'
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
@@ -142,7 +143,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'release'
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
@@ -151,7 +152,7 @@ jobs:
           retention-days: 1
 
   merge:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'release'
     needs:
       - version
       - build
@@ -189,84 +190,9 @@ jobs:
             exit 1
           fi
 
-          tags=("-t" "${IMAGE}:${VERSION}")
-          if [[ "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            tags+=("-t" "${IMAGE}:latest")
-          fi
-          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
-          tags+=("-t" "${IMAGE}:sha-${short_sha}")
-
           docker buildx imagetools create \
-            "${tags[@]}" \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
             "${digests[@]}"
 
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
-
-  # GitHub Release must match the GHCR image version (same config.yaml / tag).
-  release:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs:
-      - version
-      - merge
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Create or update GitHub Release for this version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.version.outputs.version }}
-          IMAGE: ${{ needs.version.outputs.image }}
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-          TITLE="PlayOnAir ${VERSION}"
-
-          # Body: CHANGELOG section for this version (fallback to short pointer).
-          BODY_FILE="$(mktemp)"
-          {
-            echo "## Container"
-            echo ""
-            echo "\`\`\`"
-            echo "${IMAGE}:${VERSION}"
-            echo "${IMAGE}:latest"
-            echo "\`\`\`"
-            echo ""
-            echo "Home Assistant app version in \`play-on-air/config.yaml\` must match this tag."
-            echo ""
-            if [[ -f play-on-air/CHANGELOG.md ]]; then
-              # Extract "## x.y.z" section until next "## ".
-              awk -v ver="${VERSION}" '
-                $0 == "## " ver {p=1; next}
-                p && /^## / {exit}
-                p {print}
-              ' play-on-air/CHANGELOG.md | sed '/./,$!d' > /tmp/changelog-section.txt || true
-              if [[ -s /tmp/changelog-section.txt ]]; then
-                echo "## Changes"
-                echo ""
-                cat /tmp/changelog-section.txt
-              fi
-            fi
-          } > "${BODY_FILE}"
-
-          if git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already exists"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "${TAG}" -m "${TITLE}"
-            git push origin "${TAG}"
-          fi
-
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release edit "${TAG}" --title "${TITLE}" --notes-file "${BODY_FILE}"
-            echo "Updated GitHub Release ${TAG}"
-          else
-            gh release create "${TAG}" --title "${TITLE}" --notes-file "${BODY_FILE}" --target "${GITHUB_SHA}"
-            echo "Created GitHub Release ${TAG}"
-          fi
