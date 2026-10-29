@@ -71,6 +71,8 @@ New crates must set `[lints] workspace = true`.
 5. Pairing / FairPlay / encrypted RTSP stay on the AP2 path. Do not ship an AP1 “fallback that just works.”
 6. Video, screen mirroring, and lip-synced TV audio are **not supported**.
 
+Observed sender, Apple Home, and Cast behavior, with the advertisement experiments that broke pairing or playback: [`docs/live-findings.md`](docs/live-findings.md). Read it before changing pairing, `statusFlags` / `features` / TXT keys, or how a session ends; add new live results there.
+
 ## Layout
 
 ```
