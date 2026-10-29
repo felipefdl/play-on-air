@@ -4,7 +4,7 @@
 
 PlayOnAir is a small local network bridge: Chromecast devices on the LAN appear as **AirPlay 2** speakers. You run one binary on a machine that can reach those devices. iPhone, iPad, and Mac send AirPlay 2 audio to PlayOnAir; PlayOnAir re-streams that audio to the matching Chromecast at the highest fidelity the wire allows.
 
-It is personal open source (MIT), maintained by Felipe Lima. It is not a TagoIO product and has no cloud account, dashboard, or telemetry.
+It is personal open source (MIT), maintained by Felipe Lima. It has no cloud account, dashboard, or telemetry.
 
 ## Problem
 
@@ -96,8 +96,8 @@ iOS/macOS ──AirPlay 2──► PlayOnAir ──FLAC LIVE HTTP + Cast──�
 
 ## Quality bar for the codebase
 
-Maximum. Match the Rust high bar used on Zyrdon’s server workspace: edition 2024, strict Clippy, rustfmt 120/2, no `unwrap` in production paths, typed errors, supply-chain checks, tests for new surfaces. Details live in `AGENTS.md`.
+Maximum: edition 2024, strict Clippy, rustfmt 120/2, no `unwrap` in production paths, typed errors, supply-chain checks, tests for new surfaces. Details live in `AGENTS.md`.
 
 ## Name
 
-**PlayOnAir** is the product name. Repository / folder: `play-on-air`. Crate and binary names stay English kebab/snake as decided in implementation; they must not invent TagoIO or third-party branding.
+**PlayOnAir** is the product name. Repository / folder: `play-on-air`. Crate and binary names stay English kebab/snake as decided in implementation; they must not invent third-party branding.

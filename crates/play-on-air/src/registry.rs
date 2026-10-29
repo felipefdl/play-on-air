@@ -550,7 +550,7 @@ mod tests {
   #[test]
   fn mark_pending_leave_by_instance_exact() {
     let reg = DeviceRegistry::new();
-    let _ = reg.appear(sample_with_instance("abc123", "Gym", "Nest-Audio-abc123"));
+    let _ = reg.appear(sample_with_instance("abc123", "Den", "Nest-Audio-abc123"));
     let now = Instant::now();
     // Substring must not match.
     assert!(
@@ -575,7 +575,7 @@ mod tests {
   #[test]
   fn mark_pending_leave_by_id_exact() {
     let reg = DeviceRegistry::new();
-    let _ = reg.appear(sample_with_instance("abc123", "Gym", "Nest-Audio-abc123"));
+    let _ = reg.appear(sample_with_instance("abc123", "Den", "Nest-Audio-abc123"));
     let now = Instant::now();
     let (id, mark) = reg
       .mark_pending_leave_by_instance("abc123", now, DEFAULT_PENDING_LEAVE)

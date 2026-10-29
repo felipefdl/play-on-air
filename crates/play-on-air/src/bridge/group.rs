@@ -830,7 +830,7 @@ mod tests {
   impl Harness {
     fn start() -> Self {
       let registry = Arc::new(DeviceRegistry::new());
-      for (id, name) in [(A, "Pool Bathroom speaker"), (B, "Gym speaker"), (C, "Kitchen speaker")] {
+      for (id, name) in [(A, "Patio speaker"), (B, "Den speaker"), (C, "Kitchen speaker")] {
         let _appeared = registry.appear(test_device(id, name));
       }
       let cast = Arc::new(FakeCast::default());
@@ -914,7 +914,7 @@ mod tests {
 
   fn moved_to_group_endpoint() -> PlaybackSessionUpdate {
     PlaybackSessionUpdate {
-      name: Some("Pool Bathroom speaker + 1".to_owned()),
+      name: Some("Patio speaker + 1".to_owned()),
       failed_devices: Vec::new(),
       endpoint: Some(SessionEndpoint {
         device_id: "5c23adbc-893b-446c-bb38-a935d16e1be4".to_owned(),
@@ -979,7 +979,7 @@ mod tests {
       .await;
     let moved_host = "cast-session:127.0.0.1:32300";
     h.cast.answer(Ok(PlaybackSessionUpdate {
-      name: Some("Gym speaker + 1".to_owned()),
+      name: Some("Den speaker + 1".to_owned()),
       failed_devices: Vec::new(),
       endpoint: Some(SessionEndpoint {
         device_id: "7d0c1f2e-0000-4000-8000-000000000001".to_owned(),
@@ -1151,7 +1151,7 @@ mod tests {
   #[tokio::test]
   async fn speaker_group_volume_goes_to_its_members_while_its_session_plays_elsewhere() {
     let h = Harness::start();
-    let mut group = test_device(B, "Gym and Pool").with_model(crate::registry::CAST_GROUP_MODEL);
+    let mut group = test_device(B, "Den and Patio").with_model(crate::registry::CAST_GROUP_MODEL);
     group.port = 32_128;
     let _known = h.bridge.registry.appear(group);
     h.cast.set_members(
@@ -1268,10 +1268,10 @@ mod tests {
   #[test]
   fn session_name_follows_google_home_style() {
     assert_eq!(session_name(&[]), None);
-    assert_eq!(session_name(&ids(&["Gym speaker"])).as_deref(), Some("Gym speaker"));
+    assert_eq!(session_name(&ids(&["Den speaker"])).as_deref(), Some("Den speaker"));
     assert_eq!(
-      session_name(&ids(&["Pool Bathroom speaker", "Gym speaker"])).as_deref(),
-      Some("Pool Bathroom speaker + 1")
+      session_name(&ids(&["Patio speaker", "Den speaker"])).as_deref(),
+      Some("Patio speaker + 1")
     );
   }
 }

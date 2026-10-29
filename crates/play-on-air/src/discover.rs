@@ -323,7 +323,7 @@ pub fn parse_txt_blob(txt: &str) -> std::collections::HashMap<String, String> {
   map
 }
 
-/// Split on unescaped whitespace so `fn=Gym\ speaker` stays one part.
+/// Split on unescaped whitespace so `fn=Den\ speaker` stays one part.
 fn split_txt_parts(s: &str) -> Vec<String> {
   let mut parts = Vec::new();
   let mut cur = String::new();
@@ -911,7 +911,7 @@ mod tests {
     let out = r"
 Lookup Nest-Audio-x._googlecast._tcp.local.
 21:42:29.847  Nest-Audio-x._googlecast._tcp.local. can be reached at 56cb7fe7-e13f-3256-2532-5c4a304c57fa.local.:8009 (interface 15) Flags: 1
- id=56cb7fe7e13f325625325c4a304c57fa cd=ABC ve=05 md=Nest\ Audio fn=Gym\ speaker ca=199172 st=0
+ id=56cb7fe7e13f325625325c4a304c57fa cd=ABC ve=05 md=Nest\ Audio fn=Den\ speaker ca=199172 st=0
 ";
     let info = parse_lookup_output(out).expect("lookup");
     assert_eq!(info.hostname, "56cb7fe7-e13f-3256-2532-5c4a304c57fa.local");
@@ -919,7 +919,7 @@ Lookup Nest-Audio-x._googlecast._tcp.local.
     assert!(info.address.is_none());
     let d = device_from_resolve("Nest-Audio-x", &info);
     assert_eq!(d.id, "56cb7fe7e13f325625325c4a304c57fa");
-    assert_eq!(d.name, "Gym speaker");
+    assert_eq!(d.name, "Den speaker");
     assert_eq!(d.port, 8009);
     assert_eq!(d.instance, "Nest-Audio-x");
   }
@@ -965,8 +965,8 @@ Lookup multi-homed._googlecast._tcp.local.
 
   #[test]
   fn unescape_spaces_in_txt() {
-    let m = parse_txt_blob(r"fn=Gym\ speaker id=abc");
-    assert_eq!(m.get("fn").map(String::as_str), Some("Gym speaker"));
+    let m = parse_txt_blob(r"fn=Den\ speaker id=abc");
+    assert_eq!(m.get("fn").map(String::as_str), Some("Den speaker"));
     assert_eq!(m.get("id").map(String::as_str), Some("abc"));
   }
 
@@ -1072,7 +1072,7 @@ Lookup Google-Cast-Group-abc._googlecast._tcp.local.
     let out = r"
 Lookup Google-Cast-Group-0123456789abcdef0123456789abcdef._googlecast._tcp.local.
 10:00:00.001  Google-Cast-Group-0123456789abcdef0123456789abcdef._googlecast._tcp.local. can be reached at leader.local.:32227 (interface 4) Flags: 1
- id=7e5621b9-9750-22b2-4ef6-a17173a19135 cd=7e5621b9-9750-22b2-4ef6-a17173a19135 md=Google\ Cast\ Group fn=Pool\ Bathroom\ speaker\ +\ 1 ca=198756 st=0
+ id=7e5621b9-9750-22b2-4ef6-a17173a19135 cd=7e5621b9-9750-22b2-4ef6-a17173a19135 md=Google\ Cast\ Group fn=Patio\ speaker\ +\ 1 ca=198756 st=0
 ";
     let info = parse_lookup_output(out).expect("lookup");
     let service = cast_service_from_resolve("Google-Cast-Group-0123456789abcdef0123456789abcdef", &info);
@@ -1080,7 +1080,7 @@ Lookup Google-Cast-Group-0123456789abcdef0123456789abcdef._googlecast._tcp.local
       panic!("dynamic group must not become a device: {service:?}");
     };
     assert_eq!(capabilities, 198_756);
-    assert_eq!(device.name, "Pool Bathroom speaker + 1");
+    assert_eq!(device.name, "Patio speaker + 1");
   }
 
   #[test]
@@ -1098,7 +1098,7 @@ Lookup Google-Cast-Group-0123456789abcdef0123456789abcdef._googlecast._tcp.local
     let speaker = ResolveInfo {
       hostname: "nest.local".to_owned(),
       port: 8009,
-      txt: "id=s fn=Gym ca=198660".to_owned(),
+      txt: "id=s fn=Den ca=198660".to_owned(),
       address: Some("10.0.0.8".to_owned()),
     };
     assert!(matches!(

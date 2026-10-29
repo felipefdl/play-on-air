@@ -267,8 +267,8 @@ mod tests {
   use crate::registry::DeviceRegistry;
 
   const GROUP: &str = "13777DD6-C2C9-449C-8D93-5F8FA75EAEF0";
-  const GYM: &str = "56cb7fe7e13f325625325c4a304c57fa";
-  const POOL: &str = "d417a9b9bf1ebe211639512dad18be1d";
+  const DEN: &str = "56cb7fe7e13f325625325c4a304c57fa";
+  const PATIO: &str = "d417a9b9bf1ebe211639512dad18be1d";
   const SPEAKER: &str = "aaaa0000aaaa0000aaaa0000aaaa0000";
   const HOST_KEY: &str = "cast-session:127.0.0.1:32230";
 
@@ -307,16 +307,16 @@ mod tests {
     assert_eq!(scaled_member_levels(&[], 0.5), Vec::<f32>::new());
   }
 
-  /// Bridge on a recording [`FakeCast`]; the registry knows the "Gym and Pool" group, its two
-  /// members, and a lone speaker. The group endpoint lists Gym at 0.2 and Pool at 0.6.
+  /// Bridge on a recording [`FakeCast`]; the registry knows the "Den and Patio" group, its two
+  /// members, and a lone speaker. The group endpoint lists Den at 0.2 and Patio at 0.6.
   fn group_bridge() -> (Arc<Bridge>, Arc<FakeCast>) {
     let registry = Arc::new(DeviceRegistry::new());
-    let mut group = test_device(GROUP, "Gym and Pool").with_model(CAST_GROUP_MODEL);
+    let mut group = test_device(GROUP, "Den and Patio").with_model(CAST_GROUP_MODEL);
     group.port = 32_128;
     for device in [
       group,
-      test_device(GYM, "Gym speaker"),
-      test_device(POOL, "Pool Bathroom speaker"),
+      test_device(DEN, "Den speaker"),
+      test_device(PATIO, "Patio speaker"),
       test_device(SPEAKER, "Kitchen speaker"),
     ] {
       let _new = registry.appear(device);
@@ -383,11 +383,14 @@ mod tests {
     let (bridge, fake) = group_bridge();
     play(&bridge, GROUP, HOST_KEY).await;
 
-    // Target mean from Gym at 0.2 and Pool at 0.6; the third member is not discovered.
+    // Target mean from Den at 0.2 and Patio at 0.6; the third member is not discovered.
     bridge.handle_volume(GROUP, -6.0).await;
     let mut volumes = wait_for_volumes(&fake, 2).await;
     volumes.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(volumes.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(), vec![GYM, POOL]);
+    assert_eq!(
+      volumes.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+      vec![DEN, PATIO]
+    );
     let levels: Vec<f32> = volumes.iter().map(|(_, level)| *level).collect();
     let target = airplay_db_to_cast_linear(-6.0);
     assert_levels(&levels, &scaled_member_levels(&[0.2, 0.6], target));
@@ -417,9 +420,9 @@ mod tests {
     loop {
       let volumes = fake.volumes();
       let latest = |key: &str| volumes.iter().rev().find(|(k, _)| k == key).map(|(_, level)| *level);
-      if let (Some(gym), Some(pool)) = (latest(GYM), latest(POOL))
-        && (gym - expected[0]).abs() < 1e-5
-        && (pool - expected[1]).abs() < 1e-5
+      if let (Some(den), Some(patio)) = (latest(DEN), latest(PATIO))
+        && (den - expected[0]).abs() < 1e-5
+        && (patio - expected[1]).abs() < 1e-5
       {
         break;
       }

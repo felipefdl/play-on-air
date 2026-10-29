@@ -32,7 +32,7 @@ Product intent: [`VISION.md`](VISION.md).
 | MSRV | 1.99.1 (`rust-version` in the workspace and `vendor/shairplay`); CI, the Docker builder, and clippy `msrv` pin the same toolchain |
 | Layout | Cargo workspace at repo root when crates exist; `crates/<name>/` with matching package name |
 | Format | `rustfmt.toml`: max width **120**, tab spaces **2**, edition 2024 |
-| Clippy | Workspace lints at **deny** (Zyrdon server bar); `clippy.toml` thresholds; `-D warnings` in CI/gate |
+| Clippy | Workspace lints at **deny**; `clippy.toml` thresholds; `-D warnings` in CI/gate |
 | Unsafe | `unsafe_code = forbid` unless a crate documents a tiny, reviewed exception with reason |
 | Supply chain | `cargo deny` + `cargo audit` + `cargo machete` when the workspace exists |
 | Tests | Prefer `cargo nextest` when available; unit + integration for new surfaces |
@@ -41,7 +41,7 @@ Product intent: [`VISION.md`](VISION.md).
 
 ## Lint policy (non-negotiable)
 
-Mirror the Zyrdon server high bar once `Cargo.toml` exists:
+Workspace lint bar (`[workspace.lints]` in `Cargo.toml`):
 
 - `unsafe_code = forbid`
 - Clippy groups `all`, `pedantic`, `nursery`, `cargo` at **deny**, with a short allow-list only for known noise
@@ -153,8 +153,6 @@ Home Assistant reads `play-on-air/config.yaml` from `main` and offers the update
 If the release run fails, fix it and re-run the failed jobs; the version has not shipped until the image exists.
 
 ## README and repo files
-
-Personal MIT project. Do **not** apply TagoIO `repo-standards` branding (no assets.tago.io logos, no “Built by the TagoIO team”).
 
 When public files exist:
 

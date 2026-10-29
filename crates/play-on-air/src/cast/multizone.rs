@@ -214,16 +214,16 @@ mod tests {
       devices: vec![
         PlaybackDevice {
           device_id: "d417a9b9bf1ebe211639512dad18be1d".to_owned(),
-          ip_address: "172.27.10.145".to_owned(),
+          ip_address: "192.0.2.145".to_owned(),
           port: 8009,
         },
         PlaybackDevice {
           device_id: "56cb7fe7e13f325625325c4a304c57fa".to_owned(),
-          ip_address: "172.27.10.213".to_owned(),
+          ip_address: "192.0.2.213".to_owned(),
           port: 8009,
         },
       ],
-      session_name: Some("Pool Bathroom speaker + 1".to_owned()),
+      session_name: Some("Patio speaker + 1".to_owned()),
     }
   }
 
@@ -237,10 +237,10 @@ mod tests {
         "type": "SET_PLAYBACK_DEVICES",
         "sessionId": "0816e28f",
         "deviceList": [
-          {"deviceId": "d417a9b9bf1ebe211639512dad18be1d", "ipAddress": "172.27.10.145", "port": 8009},
-          {"deviceId": "56cb7fe7e13f325625325c4a304c57fa", "ipAddress": "172.27.10.213", "port": 8009},
+          {"deviceId": "d417a9b9bf1ebe211639512dad18be1d", "ipAddress": "192.0.2.145", "port": 8009},
+          {"deviceId": "56cb7fe7e13f325625325c4a304c57fa", "ipAddress": "192.0.2.213", "port": 8009},
         ],
-        "sessionName": "Pool Bathroom speaker + 1",
+        "sessionName": "Patio speaker + 1",
       })
     );
   }
@@ -254,15 +254,15 @@ mod tests {
 
   #[test]
   fn parses_live_playback_session_updated() {
-    let live = r#"{"changedDevices":["56cb7fe7e13f325625325c4a304c57fa"],"failedDevices":[],"name":"Pool Bathroom speaker + 1","requestId":7,"sessionEndpoint":{"deviceId":"5c23adbc-893b-446c-bb38-a935d16e1be4","ipAddress":"172.27.10.145","localDeviceId":"5c23adbc-893b-446c-bb38-a935d16e1be4","port":32227,"sessionId":"0816e28f"},"type":"PLAYBACK_SESSION_UPDATED"}"#;
+    let live = r#"{"changedDevices":["56cb7fe7e13f325625325c4a304c57fa"],"failedDevices":[],"name":"Patio speaker + 1","requestId":7,"sessionEndpoint":{"deviceId":"5c23adbc-893b-446c-bb38-a935d16e1be4","ipAddress":"192.0.2.145","localDeviceId":"5c23adbc-893b-446c-bb38-a935d16e1be4","port":32227,"sessionId":"0816e28f"},"type":"PLAYBACK_SESSION_UPDATED"}"#;
     let update = parse_set_playback_devices_reply(live, 7).expect("answer").expect("ok");
-    assert_eq!(update.name.as_deref(), Some("Pool Bathroom speaker + 1"));
+    assert_eq!(update.name.as_deref(), Some("Patio speaker + 1"));
     assert_eq!(update.failed_devices, Vec::<String>::new());
     assert_eq!(
       update.endpoint,
       Some(SessionEndpoint {
         device_id: "5c23adbc-893b-446c-bb38-a935d16e1be4".to_owned(),
-        ip_address: "172.27.10.145".to_owned(),
+        ip_address: "192.0.2.145".to_owned(),
         port: 32227,
         session_id: Some("0816e28f".to_owned()),
       })
@@ -303,10 +303,10 @@ mod tests {
     );
   }
 
-  /// Live answer of the "Gym and Pool" static group endpoint while it hosted nothing.
+  /// Live answer of the "Den and Patio" static group endpoint while it hosted nothing.
   #[test]
   fn parses_live_multizone_status() {
-    let live = r#"{"requestId":901,"status":{"devices":[{"capabilities":196612,"deviceId":"d417a9b9-bf1e-be21-1639-512dad18be1d","name":"Pool Bathroom speaker","volume":{"level":0.7659151554107666,"muted":false}},{"capabilities":196612,"deviceId":"56cb7fe7-e13f-3256-2532-5c4a304c57fa","name":"Gym speaker","volume":{"level":0.6158643364906311,"muted":false}}]},"type":"MULTIZONE_STATUS"}"#;
+    let live = r#"{"requestId":901,"status":{"devices":[{"capabilities":196612,"deviceId":"d417a9b9-bf1e-be21-1639-512dad18be1d","name":"Patio speaker","volume":{"level":0.7659151554107666,"muted":false}},{"capabilities":196612,"deviceId":"56cb7fe7-e13f-3256-2532-5c4a304c57fa","name":"Den speaker","volume":{"level":0.6158643364906311,"muted":false}}]},"type":"MULTIZONE_STATUS"}"#;
     let members = parse_multizone_status_reply(live, 901).expect("answer").expect("ok");
     let ids: Vec<&str> = members.iter().map(|member| member.device_id.as_str()).collect();
     assert_eq!(ids, ["d417a9b9bf1ebe211639512dad18be1d", "56cb7fe7e13f325625325c4a304c57fa"]);

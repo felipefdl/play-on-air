@@ -14,7 +14,7 @@ as references so the findings can be re-checked.
 | Live receivers on the LAN | Apple TV 4K (AppleTV14,1, `AirTunes/980.77.2`, tvOS build 24J361); Sonos Era 100 (`AirTunes/366.0`, `sdk: AirPlay;2.7.1`, Apple's licensed receiver SDK) |
 | Binaries (arm64e, extracted from the dyld shared cache) | `AirPlayReceiver` (sha256 prefix `aceec85bae680346`), `AirPlaySupport` (`986cea3aa6ce4604`), `TimeSync` (`48a6f2c59b0f41fe`), `AirPlaySender` (`11b536177f42c917`, section 7) |
 | Tools | `rea` 6.5.0 (6.7.0 for section 7) with the Ghidra 12.1.4 provider, `ipsw dyld disass` (symbolicated), `strings`, `nm`, a capstone ADRP/ADD cross-reference scan |
-| Cast speakers (section 7) | Gym speaker (Nest Audio) and Pool Bathroom speaker (Google Nest Mini), Default Media Receiver, measured with a USB microphone on this Mac |
+| Cast speakers (section 7) | A Nest Audio and a Google Nest Mini, Default Media Receiver, measured with a USB microphone on this Mac |
 
 Addresses below are virtual addresses inside the shared cache image of the named framework.
 Local symbols are present in this cache, so most functions are named; a few were inlined and are
@@ -782,8 +782,8 @@ other Cast models, and Cast multizone followers behind a leader.
 
 ### Prototype in a mixed group
 
-A prototype build ran PlayOnAir in a Linux VM bridged onto the LAN. It put the Gym speaker (Nest
-Audio) in one AirPlay group with this Mac's own output (Music on this Mac as the sender and PTP
+A prototype build ran PlayOnAir in a Linux VM bridged onto the LAN. It put a Nest Audio speaker in
+one AirPlay group with this Mac's own output (Music on this Mac as the sender and PTP
 grandmaster) and implemented the mapping above:
 
 - Released packets carry their PTP presentation time to the host ring.
@@ -797,14 +797,14 @@ the Mac, AirPlay volume for the Cast speaker).
 
 The Mac's output is late against the AirPlay timeline by what CoreAudio does not report. That lag
 was measured separately (chirp at the reported DAC time, heard by the same microphone): 84.5 ms
-for the Edifier M60 USB speakers (sd 0.35 ms), about 16 ms for the MacBook Pro speakers.
+for a pair of USB speakers (sd 0.35 ms), about 16 ms for the Mac's built-in speakers.
 
 | | Cast minus Mac output | Cast minus AirPlay timeline |
 |---|---|---|
 | No sync (shipping behavior), two sessions | +87 ms, +255 ms | random per session |
-| Sync, `currentTime` offset 392 ms, three sessions (Edifier) | -113, -115, -115 ms | about -30 ms |
-| Sync, offset 392 ms (MacBook Pro speakers) | -40 ms | about -24 ms |
-| Sync, offset 365 ms, four sessions (Edifier) | -98.5, -92.5, -90.9, -90.8 ms | -14 to -6 ms |
+| Sync, `currentTime` offset 392 ms, three sessions (USB speakers) | -113, -115, -115 ms | about -30 ms |
+| Sync, offset 392 ms (built-in speakers) | -40 ms | about -24 ms |
+| Sync, offset 365 ms, four sessions (USB speakers) | -98.5, -92.5, -90.9, -90.8 ms | -14 to -6 ms |
 
 - Timed PLAY lands within 1 to 2 ms of its target. The Cast command path adds about 150 ms
   over the standalone PLAY delay, which the loop removes in about 20 s at the 1000 samples/s cap.
@@ -822,7 +822,7 @@ for the Edifier M60 USB speakers (sd 0.35 ms), about 16 ms for the MacBook Pro s
 ### 30 minutes from an iPhone
 
 An iPhone (Safari playing the click track) sent to one AirPlay group: this Mac's AirPlay Receiver
-(Apple's receiver, out the Edifier) and the Gym speaker through the prototype, with the table
+(Apple's receiver, out the USB speakers) and the Nest Audio through the prototype, with the table
 above. The Mac took over as PTP grandmaster when it joined the group. The microphone alternated
 15 s windows by muting the Mac's system output only, so nothing reached the sender. Click times
 are first arrivals (the earliest peak within 20 ms before the strongest, since room reflections
@@ -847,10 +847,10 @@ microphone's own clock.
   by the clock identity the sender names in SETRATEANCHORTIME; 0.4.1 reverted it.
 - The Cast speaker joins about 2 s after the Apple receiver: the start skips audio due within the
   next 2 s, and the speaker plays its Cast session chime at the same time.
-- By ear, the Edifier run never sounded together: the Mac's click came 89 ms after the Cast one
-  (sd 2 ms), which is the Edifier's unreported 84.5 ms. In the same session, switching the Mac's
-  output to its built-in speakers (about 16 ms unreported) put the Mac 7 ms after the Cast
-  speaker, and the two sounded like one source; switching back to the Edifier split them again.
+- By ear, the USB speaker run never sounded together: the Mac's click came 89 ms after the Cast
+  one (sd 2 ms), which is the USB speakers' unreported 84.5 ms. In the same session, switching the
+  Mac's output to its built-in speakers (about 16 ms unreported) put the Mac 7 ms after the Cast
+  speaker, and the two sounded like one source; switching back to the USB speakers split them again.
   The Cast speaker is on the AirPlay timeline; an Apple receiver is only as close to it as its
   output device's reported latency is to the real one.
 
@@ -864,7 +864,7 @@ every packet through the locked PTP timeline instead of the anchor-time offset, 
 slow wander above.
 
 Calibration runs: iPhone sender, this Mac's AirPlay Receiver out its built-in speakers (16.1 ms
-unreported, measured the same way as the Edifier's 84.7 ms) as the reference, 12 to 15 s windows
+unreported, measured the same way as the USB speakers' 84.7 ms) as the reference, 12 to 15 s windows
 that mute every source but one (the Mac by system mute, a Cast speaker by its receiver mute).
 Click times align each click's whole matched-filter envelope to the speaker's average envelope and
 take that template's first arrival: the Nest Mini smears a click into a train of near-equal peaks
@@ -872,8 +872,8 @@ over 25 ms, so picking a single peak jumps between them.
 
 | Speaker | PLAY delay | `currentTime` offset | Cast minus AirPlay timeline (4 min) |
 |---|---|---|---|
-| Nest Audio (Gym) | 290 ms | 366 ms | +0.6 ms median, sd 2.3 ms, per-minute -2.1 to +1.3 ms |
-| Google Nest Mini (Pool) | 270 ms | 0 ms | -2.7 ms median, sd 6.3 ms, per-minute -8.2 to +0.1 ms |
+| Nest Audio | 290 ms | 366 ms | +0.6 ms median, sd 2.3 ms, per-minute -2.1 to +1.3 ms |
+| Google Nest Mini | 270 ms | 0 ms | -2.7 ms median, sd 6.3 ms, per-minute -8.2 to +0.1 ms |
 
 - The Nest Mini's `currentTime` is noisier (about 29 ms per one-second reading against about
   10 ms for the Nest Audio), so its error wanders more within a session.

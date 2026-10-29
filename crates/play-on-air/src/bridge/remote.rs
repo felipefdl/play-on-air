@@ -245,8 +245,15 @@ mod tests {
 
     let registry = Arc::new(DeviceRegistry::new());
     let _new = registry.appear(
-      Device::new("grp", "Gym and Pool", "127.0.0.1", "grp.local", 32_128, "Google-Cast-Group-grp")
-        .with_model(CAST_GROUP_MODEL),
+      Device::new(
+        "grp",
+        "Den and Patio",
+        "127.0.0.1",
+        "grp.local",
+        32_128,
+        "Google-Cast-Group-grp",
+      )
+      .with_model(CAST_GROUP_MODEL),
     );
     let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
     let bridge = Bridge::new(registry, Arc::clone(&pool));
