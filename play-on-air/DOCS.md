@@ -117,6 +117,7 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Several PlayOnAir speakers | Selected together in the AirPlay picker, they play in sync through Google Cast multizone: the first starts the stream and the others join it. Pause, skip, and seek act on the group; volume stays per speaker; deselecting any speaker (including the first) leaves the rest playing |
 | Mixed speakers | PlayOnAir speakers selected together with HomePods or other AirPlay speakers are not in sync with them: Cast cannot take Apple multi-room timing |
 | Speaker groups | Temporary Google speaker groups (created when a stream expands to more speakers) are not shown in AirPlay; speaker groups made in the Google Home app are |
+| Apple Home status | A speaker added to Home plays from the AirPlay picker and with Siri, but its Home tile shows **No Response** (it can show what is playing while your iPhone streams to it). The home hub never connects to third-party AirPlay receivers for status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication |
 
 ## Store assets
 

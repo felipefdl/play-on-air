@@ -107,6 +107,7 @@ Deleting the directory gives every speaker a new identity: remove the speakers f
 | Audio only | No video, screen mirroring, or A/V lip sync |
 | LAN process | Same network as the Cast devices; no cloud or accounts |
 | No mixed-vendor sync | Group PlayOnAir speakers only with other PlayOnAir speakers, or Apple speakers only with Apple speakers. Cast cannot take Apple multi-room timing, so a group that mixes PlayOnAir speakers with HomePods or other AirPlay speakers plays out of sync. |
+| Apple Home status | A speaker added to Home plays from the AirPlay picker and with Siri, but its Home tile shows **No Response** (it can show what is playing while your iPhone streams to it). The home hub never connects to third-party AirPlay receivers for status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication. shairport-sync has the same limit. |
 
 **Several PlayOnAir speakers at once:** select them together in the AirPlay picker and they play in sync. The first one starts the stream; the others join it through Google Cast multizone, the same mechanism the Google Home app uses to add speakers to a playing stream. Pause, skip, and seek act on the whole group; volume stays per speaker. Deselecting a speaker removes it from the group, including the one that started. Temporary Google speaker groups created this way never appear as extra AirPlay speakers; speaker groups made in the Google Home app still do.
 
