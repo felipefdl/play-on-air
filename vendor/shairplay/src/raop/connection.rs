@@ -392,7 +392,7 @@ pub(crate) fn test_shared(handler: Arc<dyn AudioHandler>) -> Arc<RaopShared> {
         video_eiv: Arc::new(std::sync::RwLock::new(None)),
         pairing_id: String::new(),
         device_id: String::new(),
-        airplay_name: String::new(),
+        airplay_name: "Advertised speaker".to_owned(),
         active_audio: std::sync::Mutex::new(None),
         session_tasks: std::sync::Mutex::new(Vec::new()),
         next_connection_id: AtomicU64::new(1),

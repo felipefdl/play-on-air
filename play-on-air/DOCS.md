@@ -40,7 +40,7 @@ Examples:
 - Match id `Living Room`, AirPlay name `TV` → picker shows **TV**.
 - Match id `bedroom`, Hide enabled → that speaker never appears in AirPlay.
 
-Two Chromecasts with the same name get distinct AirPlay names without any configuration: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured AirPlay name is used exactly as written. A speaker added to Apple Home uses the name given in the Home app instead (see [Apple Home](#apple-home)).
+Two Chromecasts with the same name get distinct AirPlay names without any configuration: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured AirPlay name is used exactly as written. While a speaker is in Apple Home, its name in the Home app wins (see [Apple Home](#apple-home)).
 
 Save, then **Restart** the app so the entrypoint reloads options.
 
@@ -73,7 +73,7 @@ hide = true
 
 Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri, by speaker name or by room; your iPhone streams to it. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
 
-Renaming the speaker in the Home app renames its AirPlay speaker too, within a few seconds (after the current stream ends, if one is playing), so Siri and the AirPlay picker use the same name. The Home name wins over an **AirPlay name** set in the Configuration tab; removing the speaker from Home brings back the Cast or configured name.
+While a speaker is in Apple Home, the Home app owns its AirPlay name. Adding it keeps the name it had, renaming it in the Home app renames its AirPlay speaker within a few seconds (after the current stream ends, if one is playing), and renaming the Chromecast in Google Home or an **AirPlay name** set in the Configuration tab leaves it alone. Removing the speaker from Home hands its name back to Google Home or the configured AirPlay name.
 
 Each speaker's pairing identity, the controllers Home registers, and its Home name live in the app's private `/data`, so Home keeps the speakers across restarts and updates, and Home Assistant backups include them. Uninstalling the app deletes them: after reinstalling, remove the speakers from Home and add them again.
 
@@ -94,7 +94,7 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Symptom | What to check |
 |---------|----------------|
 | iOS/macOS AirPlay picker is empty | App is **Started**; host and phone on the same LAN; wait a few seconds after start for discovery; Log tab for discovery errors. |
-| Device name wrong or still visible | Configuration **Optional rename / hide** match id is a substring of the real Cast name; app was restarted after save. A suffix such as `(Nest Audio)` or `(7e56)` means another Chromecast has the same name; rename one of them in the Google Home app or set an AirPlay name here. |
+| Device name wrong or still visible | Configuration **Optional rename / hide** match id is a substring of the real Cast name; app was restarted after save. A suffix such as `(Nest Audio)` or `(7e56)` means another Chromecast has the same name; rename one of them in the Google Home app or set an AirPlay name here. A speaker in Apple Home keeps its name from the Home app: rename it there (the Log shows `AirPlay keeps the name from the Apple Home app` after a Google Home rename). |
 | Speaker still shows AirPlay after "Hey Google" | When Google Assistant or another Cast app takes the speaker, the Log shows `Cast ownership lost` and PlayOnAir disconnects the AirPlay client. iOS can take a moment to clear Now Playing. If that line never appears, restart the app. |
 | Silent after AirPlaying again (after another Cast app took the speaker) | Each new AirPlay stream starts a fresh Cast session. The Log shows `bridge session Cast load ok` when the speaker accepted it; if it is missing, check the Log for Cast errors around that time. |
 | iPhone volume shows 100% but Nest is quieter | PlayOnAir reports the Cast speaker's volume to AirPlay once it can reach the speaker. Disconnect and reconnect AirPlay on the phone to pick up the current value. |

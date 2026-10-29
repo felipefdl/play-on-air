@@ -429,7 +429,26 @@ pub(crate) fn handle_pair_add(
     }
     store.put(identifier, public_key);
     tracing::info!(identifier, "pair-add: controller key stored");
+    adopt_advertised_home_name(store.as_ref(), &conn.shared.airplay_name);
     Some(pairing_admin_response(None))
+}
+
+/// Record the advertised name as the Home name of an accessory that has controllers but
+/// no Home name.
+///
+/// Adding an accessory to a home keeps the name it advertised: only a later rename in
+/// the Home app sends `Device_Name` in `/configure`. Called after `/pair-add` and when a
+/// server is built on a store that was paired without a Home name.
+pub(crate) fn adopt_advertised_home_name(store: &dyn crate::raop::PairingStore, airplay_name: &str) {
+    let name = airplay_name.trim();
+    if name.is_empty() || !store.has_any_pairing() || store.home_name().is_some() {
+        return;
+    }
+    tracing::info!(
+        home_name = name,
+        "accessory is in a home: its advertised name is its Home name"
+    );
+    store.set_home_name(name);
 }
 
 /// HomeKit `/pair-remove`: forget a controller (sent when removed from Home).
@@ -1462,6 +1481,22 @@ mod pairing_admin_tests {
         assert_eq!(conn.shared.pairing_store.home_name().as_deref(), Some("Office"));
         call(&mut conn, handle_pair_remove, "/pair-remove", &remove(CONTROLLER));
         assert_eq!(conn.shared.pairing_store.home_name(), None);
+    }
+
+    #[test]
+    fn joining_a_home_keeps_the_advertised_name_until_a_rename() {
+        const OTHER: &str = "D7DE8FB4-3440-4126-9D9E-A10B5ADD9393";
+        let mut conn = connection(true);
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        assert_eq!(
+            conn.shared.pairing_store.home_name().as_deref(),
+            Some("Advertised speaker")
+        );
+
+        // A Home rename replaces it, and a later controller (the home hub) leaves it alone.
+        configure(&mut conn, &rename_body("Office"));
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(OTHER, &[9; 32]));
+        assert_eq!(conn.shared.pairing_store.home_name().as_deref(), Some("Office"));
     }
 
     #[test]

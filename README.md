@@ -65,7 +65,7 @@ No config file and no flags required. Keep the process running on a machine on t
 
 Never required to play audio. Empty defaults keep Cast names and show every discovered device.
 
-Two Chromecasts with the same name get distinct AirPlay names: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured rename is used exactly as written. A speaker added to Apple Home uses the name given in the Home app instead (see [Apple Home](#apple-home)).
+Two Chromecasts with the same name get distinct AirPlay names: the model is appended when it differs (`Kitchen (Nest Audio)`), otherwise a short id (`Kitchen (7e56)`). Names are stable across restarts. A configured rename is used exactly as written. While a speaker is in Apple Home, its name in the Home app wins (see [Apple Home](#apple-home)).
 
 - **Home Assistant:** Configuration tab (log level, rename, hide). Full field reference: [play-on-air/DOCS.md](play-on-air/DOCS.md).
 - **Binary / container:** optional TOML (`--config PATH`, `$PLAY_ON_AIR_CONFIG`, or `./play-on-air.toml`).
@@ -87,7 +87,7 @@ Two Chromecasts with the same name get distinct AirPlay names: the model is appe
 
 Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri, by speaker name or by room; your iPhone streams to it. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
 
-Renaming the speaker in the Home app renames its AirPlay speaker too, within a few seconds (after the current stream ends, if one is playing), so Siri and the AirPlay picker use the same name. The Home name wins over a configured rename; removing the speaker from Home brings back the Cast or configured name.
+While a speaker is in Apple Home, the Home app owns its AirPlay name. Adding it keeps the name it had, renaming it in the Home app renames its AirPlay speaker within a few seconds (after the current stream ends, if one is playing), and renaming the Chromecast in Google Home or a configured rename leaves it alone. Removing the speaker from Home hands its name back to Google Home or the configured rename.
 
 PlayOnAir keeps each speaker's pairing identity, the controllers Home registers, and its Home name in a state directory, so Home keeps the speaker across restarts:
 

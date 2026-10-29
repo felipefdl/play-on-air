@@ -45,6 +45,8 @@ struct MaintainGuards {
   known_ids: Mutex<HashSet<String>>,
   /// Device ids with an outstanding `spawn_blocking` volume seed (not merely timed-out await).
   volume_seed_inflight: Mutex<HashSet<String>>,
+  /// Last seen Cast name per present device, to log Google Home renames.
+  cast_names: Mutex<HashMap<String, String>>,
 }
 
 /// Top-level runtime owning shared state.
@@ -341,9 +343,10 @@ async fn maintain_airplay(
   }
 
   let devices = registry.list();
-  // Hidden devices are absent; a Home name (set in the Apple Home app) wins; same-name
+  // Hidden devices are absent; a Home name (the speaker is in Apple Home) wins; same-name
   // devices get distinct, order-independent names. A changed name rebuilds the receiver.
   let home_names = airplay.home_names(devices.iter().map(|device| device.id.as_str()));
+  log_cast_renames(&devices, &home_names, config, guards);
   let names = airplay_names(&devices, config, &home_names);
   let mut desired: HashSet<String> = HashSet::new();
   let mut present_ids: HashSet<String> = HashSet::new();
@@ -399,6 +402,43 @@ async fn maintain_airplay(
   drop_orphan_cast_workers(cast_pool, bridge, airplay, &desired).await;
 
   Ok(())
+}
+
+/// Log Chromecast renames (Google Home) and say which name AirPlay keeps instead.
+fn log_cast_renames(
+  devices: &[Device],
+  home_names: &HashMap<String, String>,
+  config: &Config,
+  guards: &MaintainGuards,
+) {
+  let mut seen = guards.cast_names.lock();
+  for device in devices {
+    let Some(previous) = seen.insert(device.id.clone(), device.name.clone()) else {
+      continue;
+    };
+    if previous == device.name {
+      continue;
+    }
+    if let Some(home_name) = home_names.get(&device.id) {
+      tracing::info!(
+        id = %device.id,
+        from = %previous,
+        to = %device.name,
+        airplay_name = %home_name,
+        "Chromecast renamed; AirPlay keeps the name from the Apple Home app"
+      );
+    } else if config.device_override(&device.name, &device.id).renamed {
+      tracing::info!(
+        id = %device.id,
+        from = %previous,
+        to = %device.name,
+        "Chromecast renamed; AirPlay keeps the configured name"
+      );
+    } else {
+      tracing::info!(id = %device.id, from = %previous, to = %device.name, "Chromecast renamed");
+    }
+  }
+  seen.retain(|id, _| devices.iter().any(|device| &device.id == id));
 }
 
 fn apply_due_leaves(registry: &DeviceRegistry, guards: &MaintainGuards) {

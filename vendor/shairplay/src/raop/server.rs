@@ -262,6 +262,7 @@ impl RaopServerBuilder {
             pairing_store.save_identity(seed);
             seed
         });
+        super::handlers_ap2::adopt_advertised_home_name(pairing_store.as_ref(), &airplay_name);
 
         let shared = Arc::new(RaopShared {
             hwaddr: hwaddr.clone(),

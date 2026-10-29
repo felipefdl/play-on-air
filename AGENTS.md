@@ -67,7 +67,7 @@ New crates must set `[lints] workspace = true`.
 1. **No second lossy encode** on the default path. Decode once; egress FLAC over chunked HTTP (`streamType` LIVE). WAV/LPCM BUFFERED is the fallback when a device rejects FLAC.
 2. Support AP2 **realtime** and **buffered** audio as clients send them. Do not require the user to pick a mode.
 3. Discovery is continuous. Device gone → withdraw AirPlay advertisement; device back → re-advertise.
-4. Default AirPlay name = Chromecast advertised name (identity map). Optional TOML overrides name or sets hide.
+4. Default AirPlay name = Chromecast advertised name (identity map). Optional TOML overrides name or sets hide. While a speaker is in Apple Home, its Home app name wins.
 5. Pairing / FairPlay / encrypted RTSP stay on the AP2 path. Do not ship an AP1 “fallback that just works.”
 6. Video, screen mirroring, and lip-synced TV audio are **not supported**.
 

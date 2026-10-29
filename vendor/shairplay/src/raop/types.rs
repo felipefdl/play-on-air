@@ -148,16 +148,19 @@ pub trait PairingStore: Send + Sync + 'static {
     /// [`load_identity`](Self::load_identity) to keep a stable identity.
     fn save_identity(&self, _seed: [u8; 32]) {}
 
-    /// The name the Apple Home app gave this accessory (`Device_Name` in `/configure`).
+    /// The name the Apple Home app knows this accessory by.
     ///
-    /// The receiver only records it; the host decides whether to advertise it. Stores
-    /// forget it when the last controller is removed (the accessory left the home). The
-    /// default keeps nothing.
+    /// An accessory that joins a home keeps its advertised name, recorded on the first
+    /// `/pair-add` (or when a server is built on a store with controllers but no name). A
+    /// rename in the Home app replaces it with `Device_Name` from `/configure`. The
+    /// receiver only records it; the host decides whether to advertise it. Stores forget
+    /// it when the last controller is removed (the accessory left the home). The default
+    /// keeps nothing.
     fn home_name(&self) -> Option<String> {
         None
     }
 
-    /// Record the Home name sent in `/configure`. The default is a no-op.
+    /// Record the Home name (see [`home_name`](Self::home_name)). The default is a no-op.
     fn set_home_name(&self, _name: &str) {}
 }
 

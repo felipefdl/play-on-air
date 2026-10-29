@@ -157,7 +157,7 @@ impl PairingStore for FilePairingStore {
   fn set_home_name(&self, name: &str) {
     let mut state = self.state.lock();
     if state.home_name.as_deref() != Some(name) {
-      tracing::info!(home_name = %name, "speaker renamed in Apple Home");
+      tracing::info!(home_name = %name, "saved the speaker's Apple Home name");
       state.home_name = Some(name.to_owned());
       self.persist(&state);
     }

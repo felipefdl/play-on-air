@@ -520,3 +520,41 @@ fn server_build_generates_and_persists_random_identity() {
         "build() should generate and persist an identity seed when the store has none"
     );
 }
+
+#[test]
+fn server_build_adopts_the_advertised_name_for_a_store_already_in_a_home() {
+    use shairplay::{AudioFormat, AudioHandler, AudioSession, MemoryPairingStore, PairingStore, RaopServer};
+    use std::sync::Arc;
+
+    struct NoopHandler;
+    impl AudioHandler for NoopHandler {
+        fn audio_init(&self, _f: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(NoopSession)
+        }
+    }
+    struct NoopSession;
+    impl AudioSession for NoopSession {
+        fn audio_process(&mut self, _: &[f32]) {}
+    }
+    let build = |name: &str, store: &Arc<MemoryPairingStore>| {
+        RaopServer::builder()
+            .name(name)
+            .pairing_store(store.clone())
+            .build(Arc::new(NoopHandler))
+            .expect("build")
+    };
+
+    // Not in a home: nothing to adopt.
+    let unpaired = Arc::new(MemoryPairingStore::default());
+    let _server = build("Den", &unpaired);
+    assert_eq!(unpaired.home_name(), None);
+
+    // Paired without a Home name: the advertised name becomes it; a later build under
+    // another name keeps it.
+    let paired = Arc::new(MemoryPairingStore::default());
+    paired.put("controller", [1; 32]);
+    let _server = build("Den", &paired);
+    assert_eq!(paired.home_name().as_deref(), Some("Den"));
+    let _server = build("Kitchen", &paired);
+    assert_eq!(paired.home_name().as_deref(), Some("Den"));
+}
