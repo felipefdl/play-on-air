@@ -29,9 +29,6 @@ pub const CONTENT_TYPE_WAV: &str = "audio/wav";
 /// Cast media namespace (wire).
 pub const MEDIA_NAMESPACE: &str = "urn:x-cast:com.google.cast.media";
 
-/// Cast receiver namespace (wire).
-pub const RECEIVER_NAMESPACE: &str = "urn:x-cast:com.google.cast.receiver";
-
 /// How Cast should stream the media URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastStreamKind {

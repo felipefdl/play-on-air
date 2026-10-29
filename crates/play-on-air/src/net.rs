@@ -448,44 +448,6 @@ pub fn spawn_cast_connect_relay(dest_host: &str, dest_port: u16) -> io::Result<(
   Ok((Ipv4Addr::LOCALHOST.to_string(), port, shutdown))
 }
 
-/// Try TCP connect to `host:port` from each preferred local IPv4 and log results.
-///
-/// Used after Cast connect failures so the next log capture shows which interface
-/// still works while AirPlay is active. IPv6 destinations get the unbound probe only.
-pub fn probe_cast_reachability(host: &str, port: u16) {
-  let target = host.trim().trim_end_matches('.');
-  if target.is_empty() {
-    return;
-  }
-  let Ok(dest) = resolve_dest_addr(target, port) else {
-    tracing::warn!(%target, port, "Cast reachability probe: no IP address for host");
-    return;
-  };
-  if let SocketAddr::V4(dest_v4) = dest {
-    for local in preferred_local_ipv4s_for_peer(Some(*dest_v4.ip())) {
-      match tcp_connect_from(Some(local), dest, CAST_CONNECT_TIMEOUT) {
-        Ok(stream) => {
-          tracing::info!(%local, %dest, "Cast reachability probe: bound ok");
-          drop(stream);
-        },
-        Err(err) => {
-          tracing::warn!(%local, %dest, error = %err, "Cast reachability probe: bound failed");
-        },
-      }
-    }
-  }
-  match tcp_connect_from(None, dest, CAST_CONNECT_TIMEOUT) {
-    Ok(stream) => {
-      let local = local_ip_of(&stream).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-      tracing::info!(%local, %dest, "Cast reachability probe: unbound ok");
-      drop(stream);
-    },
-    Err(err) => {
-      tracing::warn!(%dest, error = %err, "Cast reachability probe: unbound failed");
-    },
-  }
-}
-
 /// Resolve a Cast host (IP literal or mDNS hostname) to a connectable socket address.
 fn resolve_dest_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
   let mut addr = resolve_host_addr(host)

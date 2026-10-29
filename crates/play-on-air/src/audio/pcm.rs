@@ -157,12 +157,6 @@ fn f32_to_i16(sample: f32) -> i16 {
   scaled.round() as i16
 }
 
-/// Convert interleaved i16 to f32 in place helper for tests/fixtures.
-#[cfg(test)]
-pub fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
-  samples.iter().map(|&s| f32::from(s) / 32_767.0).collect()
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
