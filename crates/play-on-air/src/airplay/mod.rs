@@ -675,10 +675,17 @@ impl AirPlayManager {
   /// Names the Apple Home app gave these devices (`/configure` `Device_Name`), by device id.
   ///
   /// Only devices currently added to Home have one; it is dropped when Home removes them.
-  pub fn home_names<'a>(&self, device_ids: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+  pub fn home_names<I>(&self, device_ids: I) -> HashMap<String, String>
+  where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+  {
     device_ids
       .into_iter()
-      .filter_map(|id| self.pairing_store(id).home_name().map(|name| (id.to_owned(), name)))
+      .filter_map(|device_id| {
+        let id = device_id.as_ref();
+        self.pairing_store(id).home_name().map(|name| (id.to_owned(), name))
+      })
       .collect()
   }
 
