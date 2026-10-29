@@ -1,8 +1,13 @@
 # Changelog
 
+## 0.5.2
+
+- **While a speaker is in Apple Home, the Home app owns its AirPlay name.** Adding a speaker to Home keeps the name it had, and renaming the Chromecast in Google Home no longer changes it while it is in Home: rename it in the Home app. Removing it from Home hands the name back to Google Home or the configured rename. Speakers added to Home under 0.5.1 keep their current name.
+- The log records when a Chromecast is renamed in Google Home, and which name AirPlay keeps.
+
 ## 0.5.1
 
-- **Renaming a speaker in the Apple Home app renames its AirPlay speaker**, so Siri finds it by the name you gave it, by speaker or by room. Siri used to answer that it can't play there, because PlayOnAir kept advertising the Cast name. The Home name wins over a configured rename; removing the speaker from Home brings back the Cast or configured name.
+- **Renaming a speaker in the Apple Home app renames its AirPlay speaker**, so the AirPlay picker shows the name you gave it. The Home name wins over a configured rename; removing the speaker from Home brings back the Cast or configured name.
 - Images are published only with a GitHub release: `latest` is the latest release instead of the latest build from `main`, and `sha-*` tags are no longer pushed.
 - Building from source needs Rust 1.99.1 or newer.
 
