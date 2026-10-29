@@ -147,12 +147,25 @@ pub trait PairingStore: Send + Sync + 'static {
     /// The default is a no-op (identity is not persisted). Implement together with
     /// [`load_identity`](Self::load_identity) to keep a stable identity.
     fn save_identity(&self, _seed: [u8; 32]) {}
+
+    /// The name the Apple Home app gave this accessory (`Device_Name` in `/configure`).
+    ///
+    /// The receiver only records it; the host decides whether to advertise it. Stores
+    /// forget it when the last controller is removed (the accessory left the home). The
+    /// default keeps nothing.
+    fn home_name(&self) -> Option<String> {
+        None
+    }
+
+    /// Record the Home name sent in `/configure`. The default is a no-op.
+    fn set_home_name(&self, _name: &str) {}
 }
 
 /// In-memory pairing store (lost on restart). Use for testing or wrap with file I/O.
 #[derive(Default)]
 pub struct MemoryPairingStore {
     keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    home_name: std::sync::Mutex<Option<String>>,
 }
 
 impl PairingStore for MemoryPairingStore {
@@ -174,8 +187,20 @@ impl PairingStore for MemoryPairingStore {
             .unwrap_or_default()
     }
     fn remove(&self, device_id: &str) {
-        if let Ok(mut keys) = self.keys.lock() {
+        let now_empty = self.keys.lock().is_ok_and(|mut keys| {
             keys.remove(device_id);
+            keys.is_empty()
+        });
+        if now_empty && let Ok(mut name) = self.home_name.lock() {
+            *name = None;
+        }
+    }
+    fn home_name(&self) -> Option<String> {
+        self.home_name.lock().ok()?.clone()
+    }
+    fn set_home_name(&self, name: &str) {
+        if let Ok(mut current) = self.home_name.lock() {
+            *current = Some(name.to_string());
         }
     }
 }

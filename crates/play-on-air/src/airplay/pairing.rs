@@ -1,9 +1,10 @@
-//! Persistent `HomeKit` pairing state (accessory identity + paired controllers).
+//! Persistent `HomeKit` pairing state (accessory identity, paired controllers, Home name).
 //!
-//! Each AirPlay receiver keeps its Ed25519 identity seed and the long-term public
-//! keys of paired controllers in one JSON file, so the advertised `pk` stays stable
-//! across restarts and controllers added by the Home app (`/pair-add`) can still
-//! pair-verify afterwards.
+//! Each AirPlay receiver keeps its Ed25519 identity seed, the long-term public keys of
+//! paired controllers, and the name the Home app gave it in one JSON file, so the
+//! advertised `pk` stays stable across restarts, controllers added by the Home app
+//! (`/pair-add`) can still pair-verify afterwards, and a speaker renamed in Home keeps
+//! that AirPlay name.
 //!
 //! Files live in [`pairing_dir`] under the state directory the binary resolves
 //! (`--state-dir`, `$PLAY_ON_AIR_STATE_DIR`, or the platform state directory). The
@@ -32,6 +33,8 @@ struct PairingFile {
   identity: Option<String>,
   #[serde(default)]
   controllers: BTreeMap<String, String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  home_name: Option<String>,
 }
 
 /// In-memory state mirrored to [`PairingFile`].
@@ -39,12 +42,14 @@ struct PairingFile {
 struct PairingState {
   identity: Option<[u8; 32]>,
   controllers: BTreeMap<String, [u8; 32]>,
+  home_name: Option<String>,
 }
 
-/// File-backed [`PairingStore`] for one receiver.
+/// [`PairingStore`] for one receiver, backed by its pairing file (or memory only).
 #[derive(Debug)]
 pub struct FilePairingStore {
-  path: PathBuf,
+  /// `None`: no state directory, state lives for this process only.
+  path: Option<PathBuf>,
   state: Mutex<PairingState>,
 }
 
@@ -57,7 +62,7 @@ impl FilePairingStore {
     let path = dir.join(format!("{}.json", file_stem(device_id)));
     let state = match std::fs::read(&path) {
       Ok(bytes) => match serde_json::from_slice::<PairingFile>(&bytes) {
-        Ok(file) => PairingState::from_file(&file),
+        Ok(file) => PairingState::from_file(file),
         Err(err) => {
           tracing::warn!(path = %path.display(), %err, "pairing file unreadable; starting fresh");
           PairingState::default()
@@ -69,13 +74,27 @@ impl FilePairingStore {
         PairingState::default()
       },
     };
-    Self { path, state: Mutex::new(state) }
+    Self {
+      path: Some(path),
+      state: Mutex::new(state),
+    }
   }
 
-  /// Write the current state atomically (temp file + rename).
+  /// A store kept in memory only (no state directory): a fresh identity per process.
+  pub fn in_memory() -> Self {
+    Self {
+      path: None,
+      state: Mutex::new(PairingState::default()),
+    }
+  }
+
+  /// Write the current state atomically (temp file + rename); no-op in memory.
   fn persist(&self, state: &PairingState) {
-    if let Err(err) = write_atomic(&self.path, &state.to_file()) {
-      tracing::warn!(path = %self.path.display(), %err, "failed to persist pairing state");
+    let Some(path) = &self.path else {
+      return;
+    };
+    if let Err(err) = write_atomic(path, &state.to_file()) {
+      tracing::warn!(path = %path.display(), %err, "failed to persist pairing state");
     }
   }
 }
@@ -92,11 +111,18 @@ impl PairingStore for FilePairingStore {
     }
   }
 
+  /// Removing the last controller means the speaker left the home: forget its Home name.
   fn remove(&self, device_id: &str) {
     let mut state = self.state.lock();
     if state.controllers.remove(device_id).is_some() {
+      if state.controllers.is_empty()
+        && let Some(name) = state.home_name.take()
+      {
+        tracing::info!(home_name = %name, "speaker left Apple Home; dropping its Home name");
+      }
       self.persist(&state);
     }
+    drop(state);
   }
 
   fn has_any_pairing(&self) -> bool {
@@ -123,10 +149,24 @@ impl PairingStore for FilePairingStore {
     self.persist(&state);
     drop(state);
   }
+
+  fn home_name(&self) -> Option<String> {
+    self.state.lock().home_name.clone()
+  }
+
+  fn set_home_name(&self, name: &str) {
+    let mut state = self.state.lock();
+    if state.home_name.as_deref() != Some(name) {
+      tracing::info!(home_name = %name, "speaker renamed in Apple Home");
+      state.home_name = Some(name.to_owned());
+      self.persist(&state);
+    }
+    drop(state);
+  }
 }
 
 impl PairingState {
-  fn from_file(file: &PairingFile) -> Self {
+  fn from_file(file: PairingFile) -> Self {
     Self {
       identity: file.identity.as_deref().and_then(decode_key),
       controllers: file
@@ -134,6 +174,7 @@ impl PairingState {
         .iter()
         .filter_map(|(id, hex)| decode_key(hex).map(|key| (id.clone(), key)))
         .collect(),
+      home_name: file.home_name.filter(|name| !name.trim().is_empty()),
     }
   }
 
@@ -141,6 +182,7 @@ impl PairingState {
     PairingFile {
       identity: self.identity.as_ref().map(encode_key),
       controllers: self.controllers.iter().map(|(id, key)| (id.clone(), encode_key(key))).collect(),
+      home_name: self.home_name.clone(),
     }
   }
 }
@@ -225,6 +267,24 @@ mod tests {
     let store = FilePairingStore::open(dir.path(), "dev");
     assert_eq!(store.load_identity(), None);
     assert!(!store.has_any_pairing());
+  }
+
+  #[test]
+  fn home_name_survives_reopen_until_the_last_controller_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilePairingStore::open(dir.path(), "dev");
+    store.put("iphone", [1; 32]);
+    store.put("hub", [2; 32]);
+    store.set_home_name("Office Speaker");
+
+    let reopened = FilePairingStore::open(dir.path(), "dev");
+    assert_eq!(reopened.home_name().as_deref(), Some("Office Speaker"));
+
+    reopened.remove("hub");
+    assert_eq!(reopened.home_name().as_deref(), Some("Office Speaker"));
+    reopened.remove("iphone");
+    assert_eq!(reopened.home_name(), None);
+    assert_eq!(FilePairingStore::open(dir.path(), "dev").home_name(), None);
   }
 
   #[cfg(unix)]

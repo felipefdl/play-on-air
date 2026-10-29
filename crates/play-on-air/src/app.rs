@@ -341,8 +341,10 @@ async fn maintain_airplay(
   }
 
   let devices = registry.list();
-  // Hidden devices are absent; same-name devices get distinct, order-independent names.
-  let names = airplay_names(&devices, config);
+  // Hidden devices are absent; a Home name (set in the Apple Home app) wins; same-name
+  // devices get distinct, order-independent names. A changed name rebuilds the receiver.
+  let home_names = airplay.home_names(devices.iter().map(|device| device.id.as_str()));
+  let names = airplay_names(&devices, config, &home_names);
   let mut desired: HashSet<String> = HashSet::new();
   let mut present_ids: HashSet<String> = HashSet::new();
   // Snapshot before ensure so we can log advertise transitions once.

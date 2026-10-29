@@ -1,11 +1,13 @@
 //! AirPlay display names over Chromecast advertised names.
 //!
-//! Default: identity map (Cast `fn` → AirPlay name). Optional TOML may rename or hide
-//! ([`Config::device_override`]). When two visible Cast devices share a friendly name,
-//! the auto-named ones get a deterministic suffix so Bonjour does not pick its own
-//! non-deterministic ` (2)` rename for the second AirPlay advertisement.
+//! Default: identity map (Cast `fn` → AirPlay name). A speaker added to Apple Home takes
+//! the name given in the Home app, so Siri and the AirPlay picker agree. Optional TOML may
+//! rename or hide ([`Config::device_override`]). When two visible Cast devices share a
+//! friendly name, the auto-named ones get a deterministic suffix so Bonjour does not pick
+//! its own non-deterministic ` (2)` rename for the second AirPlay advertisement.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use crate::config::Config;
 use crate::registry::Device;
@@ -15,6 +17,7 @@ const MIN_ID_SUFFIX_LEN: usize = 4;
 
 /// AirPlay advertisement names for every non-hidden device, keyed by Cast id.
 ///
+/// - A Home name (`home_names`, by Cast id) is used verbatim and wins over a config rename.
 /// - A config rename is used verbatim.
 /// - A unique Cast name is used as-is.
 /// - Auto-named devices whose name collides (case-insensitive, as Bonjour compares)
@@ -22,19 +25,25 @@ const MIN_ID_SUFFIX_LEN: usize = 4;
 ///   unique in the collision group and differs from the name, else `Name (<id suffix>)`
 ///   with the shortest (≥ 4 chars) Cast-id prefix that is unique in the group.
 ///
-/// The result depends only on the set of devices (ids, names, models) and config,
-/// never on discovery order, so names are stable across restarts.
+/// Config `hide` still hides a device. The result depends only on the set of devices
+/// (ids, names, models), config, and Home names, never on discovery order, so names are
+/// stable across restarts.
 #[must_use]
-pub fn airplay_names(devices: &[Device], config: &Config) -> HashMap<String, String> {
+pub fn airplay_names<S: BuildHasher>(
+  devices: &[Device],
+  config: &Config,
+  home_names: &HashMap<String, String, S>,
+) -> HashMap<String, String> {
   let mut visible: Vec<Candidate<'_>> = devices
     .iter()
     .filter_map(|device| {
       let over = config.device_override(&device.name, &device.id);
+      let home = home_names.get(&device.id);
       (!over.hidden).then(|| Candidate {
         id: &device.id,
         model: device.model.trim(),
-        name: over.display_name,
-        fixed: over.renamed,
+        fixed: over.renamed || home.is_some(),
+        name: home.cloned().unwrap_or(over.display_name),
       })
     })
     .collect();
@@ -74,9 +83,9 @@ pub fn airplay_names(devices: &[Device], config: &Config) -> HashMap<String, Str
 struct Candidate<'a> {
   id: &'a str,
   model: &'a str,
-  /// Config display name (rename or Cast `fn`).
+  /// Home name, else config display name (rename or Cast `fn`).
   name: String,
-  /// Config rename: never suffixed.
+  /// Home name or config rename: never suffixed.
   fixed: bool,
 }
 
@@ -163,7 +172,15 @@ mod tests {
   }
 
   fn names_of(devices: &[Device], cfg: &Config) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = airplay_names(devices, cfg).into_iter().collect();
+    names_with_home(devices, cfg, &[])
+  }
+
+  fn names_with_home(devices: &[Device], cfg: &Config, home_pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let home: HashMap<String, String> = home_pairs
+      .iter()
+      .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+      .collect();
+    let mut out: Vec<(String, String)> = airplay_names(devices, cfg, &home).into_iter().collect();
     out.sort();
     out
   }
@@ -264,6 +281,38 @@ hide = true
   }
 
   #[test]
+  fn home_name_wins_over_config_rename_and_is_never_suffixed() {
+    let cfg = Config::parse_toml(
+      r#"
+[[device]]
+id = "aaaa1111"
+name = "Cook"
+
+[[device]]
+id = "cccc3333"
+hide = true
+"#,
+    )
+    .expect("parse");
+    let devices = [
+      device("aaaa1111", "Kitchen", "Nest Audio"),
+      device("bbbb2222", "Den", "Nest Mini"),
+      device("cccc3333", "Garage", "Nest Mini"),
+    ];
+    // aaaa1111's Home name "Den" beats its config rename "Cook" and is kept verbatim even
+    // though bbbb2222's Cast name is also "Den": the auto-named one is suffixed. Config
+    // hide still hides cccc3333 despite its Home name.
+    let names = names_with_home(&devices, &cfg, &[("aaaa1111", "Den"), ("cccc3333", "Garage")]);
+    assert_eq!(
+      names,
+      vec![
+        ("aaaa1111".to_owned(), "Den".to_owned()),
+        ("bbbb2222".to_owned(), "Den (Nest Mini)".to_owned()),
+      ]
+    );
+  }
+
+  #[test]
   fn model_equal_to_name_or_generated_clash_falls_back_to_id() {
     let cfg = Config::default();
     let devices = [
@@ -273,7 +322,7 @@ hide = true
       device("4444dddd", "Office", "Nest Hub"),
       device("5555eeee", "Office (Nest Hub)", "Chromecast"),
     ];
-    let names = airplay_names(&devices, &cfg);
+    let names = airplay_names(&devices, &cfg, &HashMap::new());
     assert_eq!(names.get("1111aaaa").map(String::as_str), Some("Nest Audio (1111)"));
     assert_eq!(names.get("2222bbbb").map(String::as_str), Some("Nest Audio (Nest Mini)"));
     assert_eq!(names.get("3333cccc").map(String::as_str), Some("Office (Nest Mini)"));

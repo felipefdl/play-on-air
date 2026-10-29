@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use shairplay::{AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, RaopServer, SessionGroup, TrackMetadata};
+use shairplay::{
+  AudioFormat, AudioHandler, AudioSession, MediaRemoteCommand, PairingStore as _, RaopServer, SessionGroup,
+  TrackMetadata,
+};
 use tokio::sync::mpsc;
 
 use crate::audio::PcmRing;
@@ -446,7 +449,7 @@ pub struct ReceiverOptions {
   /// an ephemeral port.
   pub ptp_ports: Option<(u16, u16)>,
   /// Persistent state directory; pairing files live in its `pairing/` subdirectory. `None`
-  /// keeps the pairing identity and controllers in memory (fresh identity per start).
+  /// keeps the pairing identity, controllers, and Home name in memory for this process.
   pub state_dir: Option<PathBuf>,
 }
 
@@ -489,11 +492,15 @@ impl std::fmt::Debug for AirPlayReceiver {
 
 impl AirPlayReceiver {
   /// Build (but do not start) an AP2-only receiver with stable per-device identity.
+  ///
+  /// `pairing` holds the `HomeKit` identity, controllers, and Home name; reuse the same
+  /// store when rebuilding a device's receiver.
   pub fn build(
     device_id: impl Into<String>,
     name: impl Into<String>,
     event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
     options: &ReceiverOptions,
+    pairing: Arc<pairing::FilePairingStore>,
   ) -> Result<Self> {
     let device_id_owned = device_id.into();
     let name_owned = name.into();
@@ -517,13 +524,10 @@ impl AirPlayReceiver {
       .output_max_channels(OUTPUT_MAX_CHANNELS)
       .audio_latency_samples(AUDIO_LATENCY_SAMPLES)
       .release_lead(CAST_READ_AHEAD)
-      .advertise(options.advertise);
+      .advertise(options.advertise)
+      .pairing_store(pairing);
     if let Some((event, general)) = options.ptp_ports {
       builder = builder.ptp_ports(event, general);
-    }
-    if let Some(state_dir) = &options.state_dir {
-      let store = pairing::FilePairingStore::open(&pairing::pairing_dir(state_dir), &device_id_owned);
-      builder = builder.pairing_store(Arc::new(store));
     }
     let server = builder
       .build(handler)
@@ -625,6 +629,8 @@ pub struct AirPlayManager {
   receivers: Mutex<HashMap<String, AirPlayReceiver>>,
   /// Device ids mid-kick: [`Self::ensure`] must not recreate them (maintain race).
   kicking: Mutex<HashSet<String>>,
+  /// Pairing state per device id, opened once and shared by every rebuild of its receiver.
+  pairing: Mutex<HashMap<String, Arc<pairing::FilePairingStore>>>,
   event_tx: Option<mpsc::UnboundedSender<AirPlaySessionEvent>>,
   options: ReceiverOptions,
 }
@@ -635,6 +641,7 @@ impl AirPlayManager {
     Self {
       receivers: Mutex::new(HashMap::new()),
       kicking: Mutex::new(HashSet::new()),
+      pairing: Mutex::new(HashMap::new()),
       event_tx,
       options: ReceiverOptions::default(),
     }
@@ -645,6 +652,34 @@ impl AirPlayManager {
   pub fn with_receiver_options(mut self, options: ReceiverOptions) -> Self {
     self.options = options;
     self
+  }
+
+  /// Pairing state for `device_id`: its file under the state directory, else memory.
+  fn pairing_store(&self, device_id: &str) -> Arc<pairing::FilePairingStore> {
+    let mut stores = self.pairing.lock();
+    let store = Arc::clone(stores.entry(device_id.to_owned()).or_insert_with(|| {
+      Arc::new(
+        self
+          .options
+          .state_dir
+          .as_deref()
+          .map_or_else(pairing::FilePairingStore::in_memory, |dir| {
+            pairing::FilePairingStore::open(&pairing::pairing_dir(dir), device_id)
+          }),
+      )
+    }));
+    drop(stores);
+    store
+  }
+
+  /// Names the Apple Home app gave these devices (`/configure` `Device_Name`), by device id.
+  ///
+  /// Only devices currently added to Home have one; it is dropped when Home removes them.
+  pub fn home_names<'a>(&self, device_ids: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+    device_ids
+      .into_iter()
+      .filter_map(|id| self.pairing_store(id).home_name().map(|name| (id.to_owned(), name)))
+      .collect()
   }
 
   /// Ensure a receiver exists for `device_id` with the given AirPlay name.
@@ -664,7 +699,13 @@ impl AirPlayManager {
 
     self.remove(device_id);
 
-    let mut rx = AirPlayReceiver::build(device_id, airplay_name, self.event_tx.clone(), &self.options)?;
+    let mut rx = AirPlayReceiver::build(
+      device_id,
+      airplay_name,
+      self.event_tx.clone(),
+      &self.options,
+      self.pairing_store(device_id),
+    )?;
     rx.start().await?;
     {
       let mut guard = self.receivers.lock();
@@ -830,7 +871,13 @@ impl AirPlayManager {
     tokio::time::sleep(KICK_WITHDRAW_HOLD).await;
 
     // Re-advertise under same name (kicking flag still set — use direct insert path).
-    let mut replacement = AirPlayReceiver::build(device_id, &airplay_name, self.event_tx.clone(), &self.options)?;
+    let mut replacement = AirPlayReceiver::build(
+      device_id,
+      &airplay_name,
+      self.event_tx.clone(),
+      &self.options,
+      self.pairing_store(device_id),
+    )?;
     replacement.start().await?;
     {
       let mut guard = self.receivers.lock();

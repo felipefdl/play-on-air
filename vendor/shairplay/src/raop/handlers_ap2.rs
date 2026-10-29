@@ -477,12 +477,18 @@ pub(crate) fn handle_pair_list(
     Some(tlv.encode())
 }
 
-/// HomeKit `/configure`: the Home app's accessory-setup step after `/pair-add`.
+/// HomeKit `/configure`: the Home app's accessory-setup step after `/pair-add`, and its
+/// rename message.
 ///
-/// The request carries the home's settings (binary plist); the reply describes the
-/// accessory's HomeKit identity, as shairport-sync answers it: pairing identifier,
-/// long-term public key, name, and HomeKit access control enabled at level 0
-/// ("everyone on the network"). Only honored on a verified connection.
+/// The request carries the home's settings (binary plist, `ConfigurationDictionary`).
+/// A non-empty `Device_Name` (the name given in the Home app; every home device sends
+/// it again after a rename) is recorded with [`PairingStore::set_home_name`]; the host
+/// decides whether to advertise it. The reply describes the accessory's HomeKit
+/// identity, as shairport-sync answers it: pairing identifier, long-term public key,
+/// name, and HomeKit access control enabled at level 0 ("everyone on the network").
+/// Only honored on a verified connection.
+///
+/// [`PairingStore::set_home_name`]: crate::raop::PairingStore::set_home_name
 pub(crate) fn handle_configure(
     conn: &mut RaopConnection,
     request: &HttpRequest,
@@ -494,14 +500,27 @@ pub(crate) fn handle_configure(
         response.add_header("CSeq", request.header("CSeq").unwrap_or("0"));
         return None;
     }
-    let keys: Vec<String> = request
+    let body = request
         .data()
         .and_then(|data| plist::from_bytes::<plist::Dictionary>(data).ok())
-        .map(|dict| dict.keys().cloned().collect())
         .unwrap_or_default();
-    tracing::info!(?keys, "configure request");
+    let settings = body
+        .get("ConfigurationDictionary")
+        .and_then(plist::Value::as_dictionary);
+    let keys: Vec<&str> = settings
+        .map(|settings| settings.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let home_name = settings
+        .and_then(|settings| settings.get("Device_Name"))
+        .and_then(plist::Value::as_string)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    tracing::info!(?keys, ?home_name, "configure request");
 
     let shared = &conn.shared;
+    if let Some(name) = home_name {
+        shared.pairing_store.set_home_name(name);
+    }
     let (_, verifying_key) = pairing_homekit::identity_keypair(&shared.identity_seed);
     let mut dict = plist::Dictionary::new();
     dict.insert("Identifier".into(), plist::Value::String(shared.pairing_id.clone()));
@@ -510,7 +529,10 @@ pub(crate) fn handle_configure(
         "PublicKey".into(),
         plist::Value::Data(verifying_key.to_bytes().to_vec()),
     );
-    dict.insert("Device_Name".into(), plist::Value::String(shared.airplay_name.clone()));
+    dict.insert(
+        "Device_Name".into(),
+        plist::Value::String(home_name.map_or_else(|| shared.airplay_name.clone(), str::to_owned)),
+    );
     dict.insert("Access_Control_Level".into(), plist::Value::Integer(0_u64.into()));
     response.set_plist_body(&dict)
 }
@@ -1351,25 +1373,44 @@ mod pairing_admin_tests {
         assert_eq!(reply.get_type(TlvType::Error), Some(&[PAIRING_ERROR_UNKNOWN][..]));
     }
 
+    /// A `/configure` request carrying `body` as its binary plist.
+    fn configure_request(body: &plist::Dictionary) -> HttpRequest {
+        let mut bytes = Vec::new();
+        plist::to_writer_binary(&mut bytes, body).unwrap();
+        let mut msg = format!(
+            "POST /configure RTSP/1.0\r\nCSeq: 3\r\nContent-Length: {}\r\n\r\n",
+            bytes.len()
+        )
+        .into_bytes();
+        msg.extend_from_slice(&bytes);
+        let mut req = HttpRequest::new();
+        req.add_data(&msg).unwrap();
+        req
+    }
+
+    /// The body the Home app sends after a rename.
+    fn rename_body(name: &str) -> plist::Dictionary {
+        let settings = plist::Dictionary::from_iter([
+            ("clientPID".to_string(), plist::Value::Integer(835_u64.into())),
+            ("Device_Name".to_string(), plist::Value::String(name.into())),
+        ]);
+        plist::Dictionary::from_iter([(
+            "ConfigurationDictionary".to_string(),
+            plist::Value::Dictionary(settings),
+        )])
+    }
+
+    fn configure(conn: &mut RaopConnection, body: &plist::Dictionary) -> plist::Dictionary {
+        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
+        let reply =
+            handle_configure(conn, &configure_request(body), &mut response).expect("configure answers with a plist");
+        plist::from_bytes(&reply).unwrap()
+    }
+
     #[test]
     fn configure_describes_the_accessory_identity() {
         let mut conn = connection(true);
-        let mut body = Vec::new();
-        let mut settings = plist::Dictionary::new();
-        settings.insert("Name".into(), plist::Value::String("Kitchen".into()));
-        plist::to_writer_binary(&mut body, &settings).unwrap();
-        let mut msg = format!(
-            "POST /configure RTSP/1.0\r\nCSeq: 3\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        msg.extend_from_slice(&body);
-        let mut req = HttpRequest::new();
-        req.add_data(&msg).unwrap();
-
-        let mut response = HttpResponse::new("RTSP/1.0", 200, "OK");
-        let reply = handle_configure(&mut conn, &req, &mut response).expect("configure answers with a plist");
-        let dict: plist::Dictionary = plist::from_bytes(&reply).unwrap();
+        let dict = configure(&mut conn, &plist::Dictionary::new());
         let (_, vk) = pairing_homekit::identity_keypair(&conn.shared.identity_seed);
         assert_eq!(
             dict.get("PublicKey").and_then(plist::Value::as_data),
@@ -1380,7 +1421,47 @@ mod pairing_admin_tests {
             Some(true)
         );
         assert!(dict.contains_key("Identifier"));
-        assert!(dict.contains_key("Device_Name"));
+        assert_eq!(
+            dict.get("Device_Name").and_then(plist::Value::as_string),
+            Some(conn.shared.airplay_name.as_str())
+        );
+        assert_eq!(conn.shared.pairing_store.home_name(), None);
+    }
+
+    #[test]
+    fn configure_records_the_home_name() {
+        let mut conn = connection(true);
+        let dict = configure(&mut conn, &rename_body("  Test speaker "));
+        assert_eq!(conn.shared.pairing_store.home_name().as_deref(), Some("Test speaker"));
+        assert_eq!(
+            dict.get("Device_Name").and_then(plist::Value::as_string),
+            Some("Test speaker")
+        );
+
+        // A blank name leaves the recorded one alone.
+        configure(&mut conn, &rename_body("  "));
+        assert_eq!(conn.shared.pairing_store.home_name().as_deref(), Some("Test speaker"));
+    }
+
+    #[test]
+    fn removing_the_last_controller_forgets_the_home_name() {
+        const OTHER: &str = "D7DE8FB4-3440-4126-9D9E-A10B5ADD9393";
+        let mut conn = connection(true);
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(CONTROLLER, &KEY));
+        call(&mut conn, handle_pair_add, "/pair-add", &add_body(OTHER, &[9; 32]));
+        configure(&mut conn, &rename_body("Office"));
+
+        let remove = |id: &str| {
+            let mut tlv = TlvValues::new();
+            tlv.add(TlvType::State as u8, &[1]);
+            tlv.add(TlvType::Method as u8, &[PAIRING_METHOD_REMOVE]);
+            tlv.add(TlvType::Identifier as u8, id.as_bytes());
+            tlv
+        };
+        call(&mut conn, handle_pair_remove, "/pair-remove", &remove(OTHER));
+        assert_eq!(conn.shared.pairing_store.home_name().as_deref(), Some("Office"));
+        call(&mut conn, handle_pair_remove, "/pair-remove", &remove(CONTROLLER));
+        assert_eq!(conn.shared.pairing_store.home_name(), None);
     }
 
     #[test]
