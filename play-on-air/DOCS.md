@@ -71,7 +71,7 @@ hide = true
 
 ## Apple Home
 
-Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room and play to it with Siri. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
+Add a speaker to the Home app (**+ → Add Accessory → More options…**, then pick the speaker) to assign it to a room. Anyone on the LAN can still AirPlay to it; Home does not restrict access.
 
 Each speaker's pairing identity and the controllers Home registers live in the app's private `/data`, so Home keeps the speakers across restarts and updates, and Home Assistant backups include them. Uninstalling the app deletes them: after reinstalling, remove the speakers from Home and add them again.
 
@@ -117,7 +117,7 @@ Use the app **Log** tab. Default level is `info` from Configuration (or `RUST_LO
 | Several PlayOnAir speakers | Selected together in the AirPlay picker, they play in sync through Google Cast multizone: the first starts the stream and the others join it. Pause, skip, and seek act on the group; volume stays per speaker; deselecting any speaker (including the first) leaves the rest playing |
 | Mixed speakers | PlayOnAir speakers selected together with HomePods or other AirPlay speakers are not in sync with them: Cast cannot take Apple multi-room timing |
 | Speaker groups | Temporary Google speaker groups (created when a stream expands to more speakers) are not shown in AirPlay; speaker groups made in the Google Home app are |
-| Apple Home status | A speaker added to Home plays from the AirPlay picker and with Siri, but its Home tile shows **No Response** (it can show what is playing while your iPhone streams to it). The home hub never connects to third-party AirPlay receivers for status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication |
+| Apple Home status | A speaker added to Home plays from the AirPlay picker, but its Home tile shows **No Response** (it can show what is playing while your iPhone streams to it), and Siri can refuse to play to it ("select the speaker from the AirPlay menu"). The home hub never connects to third-party AirPlay receivers for status, and Apple reserves Home controls for its own devices, TVs, and receivers with Apple's licensed authentication |
 
 ## Store assets
 
