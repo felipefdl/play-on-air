@@ -315,7 +315,7 @@ pub(crate) const fn load_commit_decision(abandoned: bool) -> LoadCommitDecision 
 }
 
 /// Far-future backoff so terminal devices do not reconnect every idle tick.
-const TERMINAL_RECONNECT_HOLD: Duration = Duration::from_secs(24 * 60 * 60);
+const TERMINAL_RECONNECT_HOLD: Duration = Duration::from_hours(24);
 
 /// Result of one ownership / IDLE policy evaluation (pure; unit-tested).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

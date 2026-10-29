@@ -8,7 +8,7 @@
 [![crates.io](https://img.shields.io/crates/v/shairplay.svg)](https://crates.io/crates/shairplay)
 [![docs.rs](https://docs.rs/shairplay/badge.svg)](https://docs.rs/shairplay)
 [![License: LGPL-3.0](https://img.shields.io/badge/license-LGPL--3.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.99.1%2B-orange.svg)](https://www.rust-lang.org)
 
 A complete AirPlay 2 audio receiver as a Rust library, with buffered audio, encrypted transport, HomeKit pairing, and experimental screen mirroring. `#![forbid(unsafe_code)]`.
 

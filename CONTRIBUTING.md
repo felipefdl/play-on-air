@@ -8,7 +8,7 @@ American English in code, commits, docs, comments, and PR text.
 
 ## Toolchain
 
-- **MSRV:** Rust **1.88** (`rust-version` in the workspace `Cargo.toml`)
+- **MSRV:** Rust **1.99.1** (`rust-version` in the workspace `Cargo.toml`)
 - Format: `rustfmt.toml` (width 120, 2-space indent, edition 2024)
 - Clippy: workspace deny bar (`-D warnings` in the quality gate)
 

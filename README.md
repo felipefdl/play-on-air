@@ -50,7 +50,7 @@ docker run --rm --network host \
 ### Binary (macOS / Linux)
 
 ```bash
-# From the repository root (Rust 1.88+):
+# From the repository root (Rust 1.99.1+):
 cargo run -p play-on-air
 
 # Or install the binary, then run it:

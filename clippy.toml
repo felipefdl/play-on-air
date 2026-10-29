@@ -24,7 +24,7 @@ allow-indexing-slicing-in-tests = true
 
 # Docs: crate-level rustdoc enforced via missing_docs = deny on public items.
 missing-docs-in-crate-items = true
-msrv = "1.88"
+msrv = "1.99.1"
 
 disallowed-methods = [
   { path = "std::env::set_var", reason = "process-wide env mutation is racy; inject config instead" },

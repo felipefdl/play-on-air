@@ -7,7 +7,7 @@ exclude = ["vendor/shairplay"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99.1"
 version = "0.5.0"
 license = "MIT"
 publish = false
@@ -138,6 +138,8 @@ mod_module_files = "allow"
 self_named_module_files = "allow"
 pub_without_shorthand = "deny"
 rest_pat_in_fully_bound_structs = "deny"
+unnecessary_rest_pattern = "deny"
+pointer_format = "deny"
 same_name_method = "deny"
 shadow_reuse = "deny"
 shadow_same = "deny"
@@ -163,9 +165,8 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 return_self_not_must_use = "allow"
 double_must_use = "allow"
-# MSRV 1.88 nursery scores this far above the clippy.toml threshold on ordinary
-# control-flow (Cast workers, discovery). Current clippy (1.9x) does not gate CI
-# the same way. Prefer design review over this unstable metric.
+# Nursery metric that scores ordinary control flow (Cast workers, discovery) far above the
+# clippy.toml threshold. Prefer design review over this unstable metric.
 cognitive_complexity = "allow"
 # Conflicts with unreachable_pub on items in private modules; prefer explicit pub(crate).
 redundant_pub_crate = "allow"

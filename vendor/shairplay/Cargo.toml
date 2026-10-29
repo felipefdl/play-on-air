@@ -9,7 +9,7 @@ categories = ["multimedia::audio", "network-programming"]
 readme = "README.md"
 homepage = "https://github.com/metaneutrons/shairplay-rust"
 repository = "https://github.com/fabianlindfors/shairplay"
-rust-version = "1.88"
+rust-version = "1.99.1"
 
 [dependencies]
 # Async runtime
@@ -67,7 +67,7 @@ hls = ["video"]
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serial_test = "3"
+serial_test = "4"
 cpal = "0.18"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }

@@ -29,7 +29,7 @@ Product intent: [`VISION.md`](VISION.md).
 |-------|--------|
 | Language | Rust only for product code |
 | Edition | 2024 |
-| MSRV | 1.88 (`rust-version` in workspace; required by shairplay) |
+| MSRV | 1.99.1 (`rust-version` in the workspace and `vendor/shairplay`); CI, the Docker builder, and clippy `msrv` pin the same toolchain |
 | Layout | Cargo workspace at repo root when crates exist; `crates/<name>/` with matching package name |
 | Format | `rustfmt.toml`: max width **120**, tab spaces **2**, edition 2024 |
 | Clippy | Workspace lints at **deny** (Zyrdon server bar); `clippy.toml` thresholds; `-D warnings` in CI/gate |
