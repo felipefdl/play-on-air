@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- Fix: **a speaker stops as soon as the iPhone ends the stream** (switching AirPlay to the iPhone or another speaker, deselecting the last speaker of a group, or stopping playback). PlayOnAir never actually sent Cast STOP, so the speaker played out its read-ahead for about 12 seconds.
+
 ## 0.5.2
 
 - **While a speaker is in Apple Home, the Home app owns its AirPlay name.** Adding a speaker to Home keeps the name it had, and renaming the Chromecast in Google Home no longer changes it while it is in Home: rename it in the Home app. Removing it from Home hands the name back to Google Home or the configured rename. Speakers added to Home under 0.5.1 keep their current name.

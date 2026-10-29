@@ -81,7 +81,7 @@ Each speaker's pairing identity, the controllers Home registers, and its Home na
 
 Supervisor pulls the multi-arch image from GHCR using the app version as the tag:
 
-`ghcr.io/felipefdl/play-on-air:0.5.2`
+`ghcr.io/felipefdl/play-on-air:0.5.3`
 
 Architectures: `amd64`, `aarch64`.
 
