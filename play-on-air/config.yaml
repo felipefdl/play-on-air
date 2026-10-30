@@ -2,8 +2,8 @@ name: PlayOnAir
 version: "0.5.3"
 slug: play_on_air
 description: >
-  Chromecast devices as AirPlay 2 speakers on the local network.
-  Discovers Google Cast devices and bridges AirPlay 2 audio over host networking.
+  AirPlay 2 for your Google Cast speakers: Nest speakers, Chromecasts, and Cast TVs
+  in the AirPlay picker, in sync across rooms, with Apple Home and Siri.
 url: https://github.com/felipefdl/play-on-air
 arch:
   - aarch64

@@ -23,11 +23,11 @@ Until both files exist, the store may show a generic puzzle icon. That does not 
 |------|------|
 | `logo.svg` | The logo: black art on white |
 | `mark.svg` | The logo on a rounded espresso tile (`#3d2618` → `#1e120b`, border `#5a3a24`): amber-to-orange art (`#ffc46b` → `#f0703a`), cream play button (`#fff1dc`); the README banner links to it |
+| `wordmark.svg` | `mark.svg` followed by "PlayOnAir" in Geist Bold, converted to outlines (cap height half the tile, amber-to-orange `#ffb24f` → `#ec6430`), readable on light and dark themes |
 
-`icon.png` and `logo.png` render from `mark.svg`:
+`icon.png` renders from `mark.svg`, and `logo.png` from `wordmark.svg` (the app page shows it like the Music Assistant and ESPHome logos: mark plus name, no padding):
 
 ```bash
 resvg -w 512 mark.svg icon.png
-resvg -w 180 mark.svg /tmp/mark-180.png
-magick -size 500x200 xc:none /tmp/mark-180.png -gravity center -composite logo.png
+resvg -h 256 wordmark.svg logo.png
 ```
